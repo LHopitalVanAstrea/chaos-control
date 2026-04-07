@@ -6,6 +6,7 @@
 
 ## About
 The software still is in Alpha.
+Most part of it, up until now, was vibe coded.
 
 The core idea is to combine functionalities of SuperProductivity, Obsidian and an infinite canvas for tasks.
 
