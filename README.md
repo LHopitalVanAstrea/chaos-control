@@ -1,5 +1,5 @@
 
-[Icon](assets/images/icon.png)
+![Icon](assets/images/icon.png)
 # Chaos Control
 
 ## About
