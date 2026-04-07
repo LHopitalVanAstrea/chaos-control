@@ -1,3 +1,5 @@
+
+[Icon](assets/images/icon.png)
 # Chaos Control
 
 ## About
