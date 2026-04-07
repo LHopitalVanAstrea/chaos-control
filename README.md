@@ -8,7 +8,9 @@
 The software still is in Alpha.
 Most part of it, up until now, was vibe coded.
 
-The core idea is to combine functionalities of SuperProductivity, Obsidian and an infinite canvas for tasks.
+The core idea is to combine functionalities of SuperProductivity, Obsidian and an infinite canvas for tasks. 
+
+In the future, I would like to include other aspects, such as integrating with Anki.
 
 
 ## Screenshots
