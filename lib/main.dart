@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'dart:math';
+import 'dart:math' as math;
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
@@ -3234,7 +3235,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
   Map<String, Color> _projectColors = {};
   Map<String, String> _projectIcons = {}; // projectId -> emoji/text icon
-  Map<String, Color>  _psycheColors = {}; // 'psyche_complex/$name' | 'psyche_persona/$name'
+  Map<String, Color>  _psycheColors = {}; // entity rel path (e.g. 'psyche/Myself/Complexes/-Ego') -> accent color
   Map<String, String> _psycheIcons  = {}; // same key -> emoji
   Map<String, bool> _projectBacklogEnabled = {}; // projectId -> bool
   Map<String, bool> _projectHiddenFromMenu = {}; // projectId -> bool
@@ -3403,7 +3404,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
   bool _isNotesView = false;
   bool _isVisualizerView = false;
   // Visualizer
-  String _visualizerSection = 'persons'; // 'my_psyche' | 'persons' | 'works' | 'places' | 'projects' | 'personal_memory' | 'events' | 'public_interactions'
+  String _visualizerSection = ''; // id de um tipo raiz de entidade | 'works' | 'personal_memory'
   String _visualizerPersonSearch = '';
   String _visualizerSelectedPath = '';
   Map<String, List<String>> _visualizerChildren = {};
@@ -3415,10 +3416,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
   String? _visualizerRenamingPath;
   final TextEditingController _visualizerRenameCtrl = TextEditingController();
   Set<String> _visualizerExpanded = {'Self', 'projects'};
-  // My Psyche sidebar expanded sections ('psyche_personas' | 'psyche_complexes')
-  Set<String> _psycheExpanded = {'psyche_personas', 'psyche_complexes'};
-  // Inline add for My Psyche: null | 'persona' | 'complex'
-  String? _psycheAddingType;
+  // ── Generalized entity types (generalized/.types/*.yaml) ──────────────────
+  EntityTypeRegistry _typeRegistry = EntityTypeRegistry.empty;
+  final Set<String> _entityTreeCollapsed = {}; // rel / rel/slot colapsados na árvore
+  String? _entityAddingKey; // contêiner (rel/slot) com o campo "novo" aberto
+  int _entityTabRefresh = 0; // incrementa para recarregar abas assíncronas
+  String? _typeSettingsId; // tipo cuja página de configurações está aberta na área principal
+  final Map<String, Future<dynamic>> _entityTabFutures = {}; // cache dos futures das abas
+  final Map<String, int?> _entityBadges = {}; // contagens do `badge: count` (null = calculando)
   final TextEditingController _psycheAddingCtrl = TextEditingController();
   bool _visualizerLoading = false;
   String _visualizerMdContent = '';
@@ -5242,488 +5247,48 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
   /// Scaffolds the initial directory structure for a brand-new workspace.
   /// Called once from [_showCreateWorkspaceDialog] right after the workspace
-  /// entry is registered. Does nothing if directories already exist.
+  /// entry is registered. Does nothing destructive if directories already exist.
+  ///
+  /// Layout (files/):
+  ///   generalized/.types/*.yaml    entity type definitions, created by the user
+  ///                                in the entity types designer (none by default)
+  ///   generalized/<type>/...       entity instances
+  ///   vault/works, vault/personal_memory
+  ///   projects/
   Future<void> _scaffoldNewWorkspace(String workspaceName) async {
     if (_workspaceId.isEmpty) return;
     final filesRoot = _wsFilesDir(_workspaceId);
     final metaRoot  = _wsMetaDir(_workspaceId);
-
-    final nameSafe = _fsSafe(workspaceName.isNotEmpty ? workspaceName : 'Eu');
-
     try {
-      // ── metadata/ ──────────────────────────────────────────────────────
       await Directory('$metaRoot/canvas_layouts').create(recursive: true);
       await Directory('$metaRoot/cache').create(recursive: true);
-
-      // ── files/My Psyche/ ───────────────────────────────────────────────
-      //
-      // ── My Psyche/Self/ (manifestações, símbolos, sonhos) ─────────────
-      await Directory('$filesRoot/My Psyche/Self').create(recursive: true);
-      final selfMd = File('$filesRoot/My Psyche/Self/Self.md');
-      if (!await selfMd.exists()) {
-        await selfMd.writeAsString('# $workspaceName\n');
-      }
-
-      // ── My Psyche/Complexes/-Ego/ (complexo de identidade principal) ──
-      final egoPsycheBase = '$filesRoot/My Psyche/Complexes/-Ego';
-      await Directory('$egoPsycheBase/identity/assets').create(recursive: true);
-      await Directory('$egoPsycheBase/identity/logs').create(recursive: true);
-      final egoLogsIndex = File('$egoPsycheBase/identity/logs/-Logs.md');
-      if (!await egoLogsIndex.exists()) {
-        await egoLogsIndex.writeAsString('---\ntype: logs_index\n---\n\n# Logs\n');
-      }
-      final egoView = File('$egoPsycheBase/identity/logs/ego-view.md');
-      if (!await egoView.exists()) {
-        await egoView.writeAsString('# Ego View\n');
-      }
-      final egoVoice = File('$egoPsycheBase/identity/logs/ego-voice.md');
-      if (!await egoVoice.exists()) {
-        await egoVoice.writeAsString('# Ego Voice\n');
-      }
-      final egoMd = File('$egoPsycheBase/identity/Ego.md');
-      if (!await egoMd.exists()) {
-        await egoMd.writeAsString('# $workspaceName\n');
-      }
-      await Directory('$egoPsycheBase/connections').create(recursive: true);
-      await Directory('$egoPsycheBase/strategy/pillars').create(recursive: true);
-      await Directory('$egoPsycheBase/strategy/value_goals').create(recursive: true);
-      await Directory('$egoPsycheBase/strategy/goal_outcomes').create(recursive: true);
-      await Directory('$egoPsycheBase/understanding/derived').create(recursive: true);
-      await Directory('$egoPsycheBase/understanding/ideas').create(recursive: true);
-      final egoCanvas = File('$egoPsycheBase/canvas.json');
-      if (!await egoCanvas.exists()) {
-        await egoCanvas.writeAsString(_defaultPersonCanvas(
-          personBase: egoPsycheBase, personName: 'Ego'));
-      }
-
-      // ── My Psyche/Complexes/Shadow/ ────────────────────────────────────
-      final shadowBase = '$filesRoot/My Psyche/Complexes/Shadow/logs';
-      await Directory(shadowBase).create(recursive: true);
-      final shadowLogsIndex = File('$shadowBase/-Logs.md');
-      if (!await shadowLogsIndex.exists()) {
-        await shadowLogsIndex.writeAsString('---\ntype: logs_index\n---\n\n# Logs\n');
-      }
-      final shadowEgoView = File('$shadowBase/ego-view.md');
-      if (!await shadowEgoView.exists()) {
-        await shadowEgoView.writeAsString('# Ego View\n');
-      }
-      final shadowVoice = File('$shadowBase/shadow-voice.md');
-      if (!await shadowVoice.exists()) {
-        await shadowVoice.writeAsString('# Shadow Voice\n');
-      }
-
-      // ── My Psyche/Personas/ (container — personas criadas on demand) ───
-      await Directory('$filesRoot/My Psyche/Personas').create(recursive: true);
-
-      // ── files/other_persons/ ──────────────────────────────────────────
-      // Container only — subfolders (identity/, understanding/, etc.) are
-      // created inside each person's named directory when that person is added.
-      await Directory('$filesRoot/other_persons').create(recursive: true);
-
-      // ── files/projects/ ───────────────────────────────────────────────
-      // Container only — per-project subfolders (tasks/, common/, workspace/)
-      // are created by _syncProjectDirs() once projects are registered.
       await Directory('$filesRoot/projects').create(recursive: true);
-
-      // ── files/places/ ─────────────────────────────────────────────────
-      // Container only — subfolders (identity/, etc.) are created inside
-      // each place's named directory when that place is added.
-      await Directory('$filesRoot/places').create(recursive: true);
-
-      // files/works/ -- container only
-      await Directory('$filesRoot/works').create(recursive: true);
-      await _generateWorksIndex(filesRoot);
-
-      // files/personal_memory/ -- container only
-      await Directory('$filesRoot/personal_memory').create(recursive: true);
-
-      // files/events/ -- container only
-      await Directory('$filesRoot/events').create(recursive: true);
-
-      // files/public_interactions/ -- container only
-      await Directory('$filesRoot/public_interactions').create(recursive: true);
-
+      await Directory('$filesRoot/vault/works').create(recursive: true);
+      await Directory('$filesRoot/vault/personal_memory').create(recursive: true);
+      // No entity type is generated: the user defines them in the designer.
+      await Directory('$filesRoot/generalized/.types').create(recursive: true);
+      _typeRegistry = EntityTypeRegistry.empty;
     } catch (e) {
       debugPrint('_scaffoldNewWorkspace ERROR: $e');
     }
   }
 
-  /// Creates the canonical subfolder structure for a new person under
-  /// files/other_persons/<safeName>/ and writes the identity anchor .md file.
-  Future<void> _scaffoldPersonDir(String displayName) async {
+  /// Creates an instance of the entity type [typeId] named [name], applying
+  /// the type's file pattern. [parentDir] defaults to the type's root folder;
+  /// pass `<instance>/<slot folder>` to create a nested child instance.
+  Future<void> _scaffoldEntity(String typeId, String name, {String? parentDir}) async {
     if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Person');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/other_persons/$safe';
+    final def = _typeRegistry[typeId];
+    if (def == null) return;
     try {
-      await Directory('$base/identity/assets').create(recursive: true);
-      await Directory('$base/identity/logs').create(recursive: true);
-      final logsIndex = File('$base/identity/logs/-Logs.md');
-      if (!await logsIndex.exists()) {
-        await logsIndex.writeAsString('---\ntype: logs_index\n---\n\n# Logs\n');
-      }
-      await Directory('$base/understanding/derived').create(recursive: true);
-      await Directory('$base/understanding/ideas').create(recursive: true);
-      final mdFile = File('$base/identity/$safe.md');
-      if (!await mdFile.exists()) {
-        await mdFile.writeAsString('# $displayName\n');
-      }
-      final canvasFile = File('$base/canvas.json');
-      if (!await canvasFile.exists()) {
-        await canvasFile.writeAsString(_defaultPersonCanvas(
-          personBase: base, personName: safe));
-      }
-      // connections/
-      await Directory('$base/connections').create(recursive: true);
-      final connIndex = File('$base/connections/-Connections.md');
-      if (!await connIndex.exists()) {
-        await connIndex.writeAsString(_connectionsTemplate(displayName));
-      }
-      await _generateWorksIndex(filesRoot);
+      await EntityScaffolder(
+        registry: _typeRegistry,
+        genRoot: _genRoot,
+        workspaceName: _workspaceName.isNotEmpty ? _workspaceName : 'Eu',
+      ).create(typeId, name, parentDir: parentDir ?? '$_genRoot/${def.folder}');
+      _autoExportEntities(typeId);
     } catch (e) {
-      debugPrint('_scaffoldPersonDir ERROR: $e');
-    }
-  }
-
-  /// Creates a minimal Persona directory under My Psyche/Personas/<name>/
-  /// Structure:
-  ///   <name>/
-  ///     <name>.md                     ← identity anchor
-  ///     interactions/
-  ///       -Interactions.md            ← index linking to public_interactions/
-  Future<void> _scaffoldPersonaDir(String displayName) async {
-    if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Persona');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/My Psyche/Personas/$safe';
-    try {
-      await Directory('$base/interactions').create(recursive: true);
-      final mdFile = File('$base/$safe.md');
-      if (!await mdFile.exists()) {
-        await mdFile.writeAsString('# $displayName\n');
-      }
-      final interactionsIndex = File('$base/interactions/-Interactions.md');
-      if (!await interactionsIndex.exists()) {
-        await interactionsIndex.writeAsString(_interactionsTemplate(displayName));
-      }
-    } catch (e) {
-      debugPrint('_scaffoldPersonaDir ERROR: $e');
-    }
-  }
-
-  /// Creates a minimal Complex directory under My Psyche/Complexes/<name>/
-  Future<void> _scaffoldComplexDir(String displayName) async {
-    if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Complex');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/My Psyche/Complexes/$safe';
-    try {
-      await Directory('$base/identity').create(recursive: true);
-      final mdFile = File('$base/identity/$safe.md');
-      if (!await mdFile.exists()) {
-        await mdFile.writeAsString('# $displayName\n');
-      }
-    } catch (e) {
-      debugPrint('_scaffoldComplexDir ERROR: $e');
-    }
-  }
-
-  /// Scans files/works/ and rewrites Self/identity/assets/Works.md as a
-  /// structured index grouped by file type.  Safe to call at any time —
-  /// Creates Works.md index files for Self and each other_person.
-  ///
-  /// Self: scans files/works/ and pre-populates all found files grouped by type.
-  /// other_persons: creates an empty template (never overwrites an existing file).
-  /// The comment line shows both reference path forms so the user knows how to
-  /// add entries manually after creation.
-  Future<void> _generateWorksIndex(String filesRoot) async {
-    const order = ['document', 'video', 'audio', 'image', 'other'];
-    // ── helpers ──────────────────────────────────────────────────────────
-    const groups = <String, List<String>>{
-      'video'      : ['mp4', 'mov', 'avi', 'mkv', 'webm'],
-      'audio'      : ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'],
-      'document'   : ['pdf', 'docx', 'doc', 'odt', 'txt', 'md'],
-      'image'      : ['png', 'jpg', 'jpeg', 'webp', 'svg', 'gif'],
-    };
-
-    String categoryOf(String name) {
-      final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
-      for (final entry in groups.entries) {
-        if (entry.value.contains(ext)) return entry.key;
-      }
-      return 'other';
-    }
-
-    String sizeLabel(int bytes) {
-      if (bytes < 1024) return '${bytes}B';
-      if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)}KB';
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
-    }
-
-    String emptyTemplate() {
-      final buf = StringBuffer();
-      buf.writeln('---');
-      buf.writeln('type: works_index');
-      buf.writeln('---');
-      buf.writeln();
-      buf.writeln('# Works');
-      buf.writeln();
-      for (final cat in order) {
-        buf.writeln();
-        buf.writeln('## $cat');
-      }
-      return buf.toString();
-    }
-
-    // ── Self: scan works/ and pre-populate ───────────────────────────────
-    final worksDir = Directory('$filesRoot/works');
-    final selfIndex = File('$filesRoot/My Psyche/Complexes/-Ego/identity/assets/-Works.md');
-    await selfIndex.parent.create(recursive: true);
-
-    if (!await selfIndex.exists()) {
-      if (await worksDir.exists()) {
-        final buckets = <String, List<String>>{};
-        await for (final e in worksDir.list(recursive: false, followLinks: false)) {
-          if (e is! File) continue;
-          final name = e.path.split('/').last;
-          if (name.startsWith('.')) continue;
-          final stat = await e.stat();
-          buckets
-              .putIfAbsent(categoryOf(name), () => [])
-              .add('- [[../../works/$name]] | ${sizeLabel(stat.size)}');
-        }
-        if (buckets.isNotEmpty) {
-          final buf = StringBuffer();
-          buf.writeln('---');
-          buf.writeln('type: works_index');
-          buf.writeln('---');
-          buf.writeln();
-          buf.writeln('# Works');
-          buf.writeln();
-          for (final cat in order) {
-            final entries = buckets[cat];
-            if (entries == null || entries.isEmpty) continue;
-            entries.sort();
-            buf.writeln();
-            buf.writeln('## $cat');
-            for (final line in entries) buf.writeln(line);
-          }
-          await selfIndex.writeAsString(buf.toString());
-        } else {
-          await selfIndex.writeAsString(emptyTemplate());
-        }
-      } else {
-        await selfIndex.writeAsString(emptyTemplate());
-      }
-    }
-
-    // ── Ego connections scaffold ──────────────────────────────────────────
-    final selfConnDir = Directory('$filesRoot/My Psyche/Complexes/-Ego/connections');
-    await selfConnDir.create(recursive: true);
-    final selfConnIndex = File('$filesRoot/My Psyche/Complexes/-Ego/connections/-Connections.md');
-    if (!await selfConnIndex.exists()) {
-      await selfConnIndex.writeAsString(_connectionsTemplate('Self'));
-    }
-
-    // ── other_persons: create templates only if missing ───────────────────
-    final othersDir = Directory('$filesRoot/other_persons');
-    if (!await othersDir.exists()) return;
-    await for (final e in othersDir.list(followLinks: false)) {
-      if (e is! Directory) continue;
-      final personName = e.path.split('/').last;
-      final personIndex = File('${e.path}/identity/assets/-Works.md');
-      if (!await personIndex.exists()) {
-        await personIndex.parent.create(recursive: true);
-        await personIndex.writeAsString(emptyTemplate());
-      }
-      final connDir = Directory('${e.path}/connections');
-      await connDir.create(recursive: true);
-      final connIndex = File('${e.path}/connections/-Connections.md');
-      if (!await connIndex.exists()) {
-        await connIndex.writeAsString(_connectionsTemplate(personName));
-      }
-    }
-
-    // ── Personas: create interactions/-Interactions.md if missing ─────────
-    final personasDir = Directory('$filesRoot/My Psyche/Personas');
-    if (await personasDir.exists()) {
-      await for (final e in personasDir.list(followLinks: false)) {
-        if (e is! Directory) continue;
-        final personaName = e.path.split('/').last;
-        if (personaName.startsWith('.')) continue;
-        final interDir = Directory('${e.path}/interactions');
-        await interDir.create(recursive: true);
-        final interIndex = File('${e.path}/interactions/-Interactions.md');
-        if (!await interIndex.exists()) {
-          await interIndex.writeAsString(_interactionsTemplate(personaName));
-        }
-      }
-    }
-
-    // ── events/ and public_interactions/ container dirs ───────────────────
-    await Directory('$filesRoot/events').create(recursive: true);
-    await Directory('$filesRoot/public_interactions').create(recursive: true);
-  }
-
-  /// Template for connections/-Connections.md created on scaffold.
-  String _connectionsTemplate(String personName) => '''---
-type: connections_index
----
-
-# Connections
-
-''';
-
-  /// Template for interactions/-Interactions.md created on persona scaffold.
-  /// Links use a relative path from the interactions/ folder up to files/
-  /// then into public_interactions/<name>/<name>.md  (4 levels up).
-  String _interactionsTemplate(String personaName) => '''---
-type: interactions_index
-persona: $personaName
----
-
-# Interactions
-
-<!-- Link public interactions that activate this persona, e.g.:
-- [Event Name](../../../../public_interactions/event_name/event_name.md)
--->
-
-''';
-
-  /// Returns the default canvas JSON for a person with mdFile links pre-wired.
-  /// [personBase] is the absolute path to the person's root dir
-  /// (e.g. `.../files/Self` or `.../files/other_persons/João`).
-  /// [personName] is the safe filename used for the identity .md
-  /// (e.g. `Self` or `João`).
-  String _defaultPersonCanvas({String personBase = '', String personName = ''}) {
-    String md(String rel) => personBase.isNotEmpty ? '"$personBase/$rel"' : 'null';
-    // Layout mirrors _autoAlignPersonCanvas with default padding=12px, gap=8px, canvasW=800:
-    //   padFrac = 12/800 = 0.015,  gapFrac = 8/800 = 0.01
-    //   colW    = (1.0 − 2×0.015 − 0.01) / 2 = 0.48
-    //   col0.x  = 0.015,  col1.x = 0.015 + 0.48 + 0.01 = 0.505
-    //   row1.y  = 0,      row2.y = 260 + 8 (gap px) = 268
-    return '''
-{
-  "header": { "h": 120 },
-  "blocks": [
-    { "id": "b1", "type": "about",       "x": 0.015, "y": 0,   "w": 0.48, "h": 260, "mdFile": ${md('identity/$personName.md')} },
-    { "id": "b2", "type": "works",       "x": 0.505, "y": 0,   "w": 0.48, "h": 260, "mdFile": ${md('identity/assets/-Works.md')} },
-    { "id": "b3", "type": "connections", "x": 0.015, "y": 268, "w": 0.48, "h": 260, "mdFile": ${md('connections/-Connections.md')} },
-    { "id": "b4", "type": "log",         "x": 0.505, "y": 268, "w": 0.48, "h": 260, "mdFile": ${md('identity/logs/-Logs.md')} }
-  ]
-}
-''';
-  }
-
-  /// Minimal canvas for Places, Events and Public Interactions:
-  /// a single padded "about" block pointing to the identity .md file.
-  /// Layout mirrors _autoAlignPersonCanvas for 1 block (padding=12px, canvasW=800):
-  ///   padFrac = 12/800 = 0.015
-  ///   availW  = 1.0 − 2×0.015 = 0.97   (no inter-column gap for a single column)
-  ///   x       = 0.015,  w = 0.97
-  String _defaultEntityCanvas({String entityBase = '', String entityName = ''}) {
-    final mdFile = entityBase.isNotEmpty ? '"$entityBase/identity/$entityName.md"' : 'null';
-    return '''
-{
-  "header": { "h": 120 },
-  "blocks": [
-    { "id": "b1", "type": "about", "x": 0.015, "y": 0, "w": 0.97, "h": 400, "mdFile": $mdFile }
-  ]
-}
-''';
-  }
-
-  /// Creates the canonical subfolder structure for a new place under
-  /// files/places/<safeName>/ and writes the identity anchor .md file.
-  Future<void> _scaffoldPlaceDir(String displayName) async {
-    if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Place');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/places/$safe';
-    try {
-      await _scaffoldEntityDirs(base: base, displayName: displayName, safe: safe);
-    } catch (e) {
-      debugPrint('_scaffoldPlaceDir ERROR: $e');
-    }
-  }
-
-  Future<void> _scaffoldEventDir(String displayName) async {
-    if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Event');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/events/$safe';
-    try {
-      await _scaffoldEntityDirs(base: base, displayName: displayName, safe: safe);
-    } catch (e) {
-      debugPrint('_scaffoldEventDir ERROR: $e');
-    }
-  }
-
-  Future<void> _scaffoldPublicInteractionDir(String displayName) async {
-    if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final safe = _fsSafe(displayName.isNotEmpty ? displayName : 'Interaction');
-    if (safe.isEmpty) return;
-    final base = '$filesRoot/public_interactions/$safe';
-    try {
-      await _scaffoldEntityDirs(base: base, displayName: displayName, safe: safe);
-    } catch (e) {
-      debugPrint('_scaffoldPublicInteractionDir ERROR: $e');
-    }
-  }
-
-  /// Shared scaffold logic for Place / Event / Public Interaction directories.
-  /// Mirrors the structure of other_persons/ so Profile+Files tabs work the
-  /// same way across all entity types.
-  ///
-  ///   <base>/
-  ///     identity/
-  ///       assets/
-  ///         -Works.md
-  ///       logs/
-  ///         -Logs.md
-  ///       <safe>.md          ← identity anchor
-  ///     understanding/
-  ///       derived/
-  ///       ideas/
-  ///     connections/
-  ///       -Connections.md    ← links to persons, other entities
-  ///     canvas.json          ← drives the Profile view
-  Future<void> _scaffoldEntityDirs({
-    required String base,
-    required String displayName,
-    required String safe,
-  }) async {
-    await Directory('$base/identity/assets').create(recursive: true);
-    await Directory('$base/identity/logs').create(recursive: true);
-    final logsIndex = File('$base/identity/logs/-Logs.md');
-    if (!await logsIndex.exists()) {
-      await logsIndex.writeAsString('---\ntype: logs_index\n---\n\n# Logs\n');
-    }
-    await Directory('$base/understanding/derived').create(recursive: true);
-    await Directory('$base/understanding/ideas').create(recursive: true);
-    final mdFile = File('$base/identity/$safe.md');
-    if (!await mdFile.exists()) {
-      await mdFile.writeAsString('# $displayName\n');
-    }
-    final worksIndex = File('$base/identity/assets/-Works.md');
-    if (!await worksIndex.exists()) {
-      await worksIndex.writeAsString('---\ntype: works_index\n---\n\n# Works\n');
-    }
-    await Directory('$base/connections').create(recursive: true);
-    final connIndex = File('$base/connections/-Connections.md');
-    if (!await connIndex.exists()) {
-      await connIndex.writeAsString(_connectionsTemplate(displayName));
-    }
-    final canvasFile = File('$base/canvas.json');
-    if (!await canvasFile.exists()) {
-      await canvasFile.writeAsString(
-        _defaultEntityCanvas(entityBase: base, entityName: safe));
+      debugPrint('_scaffoldEntity ERROR: $e');
     }
   }
 
@@ -10075,16 +9640,22 @@ persona: $personaName
               if (_isVisualizerView) ...[
                 const SizedBox(width: 6),
                 Builder(builder: (_) {
-                  final cat = _visualizerSelectedPath.split('/').first;
-                  final hasCanvas = cat == 'Self' || cat == 'other_persons' ||
-                      cat == 'places' || cat == 'events' ||
-                      cat == 'public_interactions' ||
-                      cat == 'psyche_complex' || cat == 'psyche_persona';
-                  final enabled = hasCanvas || _visualizerSelectedPath.isEmpty;
+                  final tbLoc = _visualizerSelectedPath.isEmpty
+                      ? null
+                      : _entityLocator.locate(_visualizerSelectedPath);
+                  final enabled = tbLoc != null || _visualizerSelectedPath.isEmpty;
+                  final tbTabs = tbLoc?.pattern.tabs ??
+                      const <TabDef>[
+                        TabDef(id: 'profile', kind: 'profile', title: 'Profile'),
+                        TabDef(id: 'files', kind: 'files', title: 'Files'),
+                      ];
                   return Row(mainAxisSize: MainAxisSize.min, children: [
-                    _personTabButton('profile', Icons.person_outline_rounded, 'Profile', enabled: enabled),
-                    const SizedBox(width: 2),
-                    _personTabButton('files', Icons.folder_outlined, 'Files', enabled: enabled),
+                    for (int i = 0; i < tbTabs.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 2),
+                      _personTabButton(tbTabs[i].id, _tabIcon(tbTabs[i]), tbTabs[i].title,
+                          enabled: enabled,
+                          badge: tbLoc == null ? null : _entityBadgeFor(tbLoc, tbTabs[i])),
+                    ],
                   ]);
                 }),
                 const SizedBox(width: 6),
@@ -15153,6 +14724,8 @@ persona: $personaName
                       );
                     },
                   ),
+                  // ── Visualizer: type settings (gear), right side ───────────
+                  if (_isVisualizerView) _buildVisualizerGearButton(),
                 ],
               ),
             ),
@@ -16894,10 +16467,9 @@ persona: $personaName
       },
       // ── Persons section wiring ──────────────────────────────────────────
       personPaths: _workspaceId.isEmpty ? const [] : [
-        'Self',
-        ...(_visualizerChildren['other_persons'] ?? []).map((e) => 'other_persons/$e'),
+        ...(_visualizerChildren['person'] ?? []).map((e) => 'person/$e'),
       ],
-      personsFilesRoot: _workspaceId.isNotEmpty ? _wsFilesDir(_workspaceId) : '',
+      personsFilesRoot: _workspaceId.isNotEmpty ? _genRoot : '',
       onOpenPersonFile: (absolutePath) async {
         // Read the file and open it as a note in Notes view.
         try {
@@ -31016,15 +30588,68 @@ persona: $personaName
   // VISUALIZER — folder-tree browser + entity description area
   // ══════════════════════════════════════════════════════════════════════════
 
+  // ── Generalized entity types: paths and registry ─────────────────────────
+
+  String get _genRoot   => '${_wsFilesDir(_workspaceId)}/generalized';
+  String get _vaultRoot => '${_wsFilesDir(_workspaceId)}/vault';
+  EntityLocator get _entityLocator => EntityLocator(_typeRegistry, _genRoot);
+  bool _isVaultCat(String cat) => cat == 'works' || cat == 'personal_memory';
+
+  /// Loads generalized/.types/*.yaml. No type is created automatically: the
+  /// user defines them in the entity types designer.
+  Future<void> _loadTypeRegistry() async {
+    if (_workspaceId.isEmpty) return;
+    try {
+      await Directory('$_genRoot/.types').create(recursive: true);
+      await Directory('$_vaultRoot/works').create(recursive: true);
+      await Directory('$_vaultRoot/personal_memory').create(recursive: true);
+      final reg = await EntityTypeRegistry.load('$_genRoot/.types');
+      for (final e in reg.errors) {
+        debugPrint('type registry: $e');
+      }
+      _typeRegistry = reg;
+    } catch (e) {
+      debugPrint('_loadTypeRegistry ERROR: $e');
+    }
+  }
+
   Future<void> _loadVisualizerChildren() async {
     if (_workspaceId.isEmpty) return;
     setState(() => _visualizerLoading = true);
+    await _loadTypeRegistry();
     final filesRoot = _wsFilesDir(_workspaceId);
     final result = <String, List<String>>{};
     final fileEntryResult = <String, List<Map<String, dynamic>>>{};
+    final locator = _entityLocator;
 
-    for (final cat in ['My Psyche', 'other_persons', 'works', 'places', 'projects', 'personal_memory', 'events', 'public_interactions']) {
-      final dir = Directory('$filesRoot/$cat');
+    // Entity types: root instances and, recursively, child containers.
+    Future<void> collect(String rel) async {
+      final loc = locator.locate(rel);
+      if (loc == null) return;
+      for (final slot in loc.def.children) {
+        if (slot.isOne) {
+          await collect('$rel/${slot.folder}');
+          continue;
+        }
+        final names = await locator.listNames('${loc.dir}/${slot.folder}');
+        result['$rel/${slot.folder}'] = names;
+        for (final n in names) {
+          await collect('$rel/${slot.folder}/$n');
+        }
+      }
+    }
+
+    for (final def in _typeRegistry.rootTypes) {
+      final names = await locator.listRoot(def);
+      result[def.folder!] = names;
+      for (final n in names) {
+        await collect('${def.folder}/$n');
+      }
+    }
+
+    // projects/ plus the Vault file-manager sections.
+    for (final cat in ['projects', 'works', 'personal_memory']) {
+      final dir = Directory(cat == 'projects' ? '$filesRoot/projects' : '$_vaultRoot/$cat');
       if (!await dir.exists()) { result[cat] = []; continue; }
       final children = <String>[];
       // For file-manager sections list BOTH files and directories.
@@ -31069,21 +30694,6 @@ persona: $personaName
         children.sort();
         result[cat] = children;
       }
-    }
-    // Load psyche sub-directories for the My Psyche sidebar tree
-    for (final subKey in ['Personas', 'Complexes']) {
-      final dir = Directory('$filesRoot/My Psyche/$subKey');
-      final mapKey = subKey == 'Personas' ? 'psyche_personas' : 'psyche_complexes';
-      if (!await dir.exists()) { result[mapKey] = []; continue; }
-      final children = <String>[];
-      await for (final e in dir.list()) {
-        if (e is Directory) {
-          final name = e.uri.pathSegments.where((s) => s.isNotEmpty).last;
-          if (!name.startsWith('.')) children.add(name);
-        }
-      }
-      children.sort();
-      result[mapKey] = children;
     }
     if (mounted) setState(() {
       _visualizerChildren = result;
@@ -31232,7 +30842,7 @@ persona: $personaName
     bool isDir,
     TapDownDetails details,
   ) async {
-    final filesRoot = _wsFilesDir(_workspaceId);
+    final filesRoot = _vaultRoot;
     final absPath = '$filesRoot/$cat/$name';
     final screenSize = MediaQuery.of(ctx).size;
     final dx = details.globalPosition.dx;
@@ -31348,23 +30958,15 @@ persona: $personaName
   /// "New Folder Here", and suppresses Rename/Delete for the built-in Self entity.
   void _showVisualizerEntityContextMenu(
     BuildContext ctx,
-    String path,   // e.g. 'events/Concert', 'places/Paris', 'other_persons/John', 'Self'
-    String cat,    // 'events' | 'public_interactions' | 'places' | 'other_persons' | 'Self'
+    String path,   // entity rel, e.g. 'person/Odorico' or 'psyche/Myself/Complexes/-Ego'
+    String cat,    // parent rel ('person', 'psyche/Myself/Complexes', ...)
     String name,   // just the entity name (last segment)
     TapDownDetails details,
   ) async {
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final isSelf = cat == 'Self';
-
-    // Resolve the absolute path of the entity's root directory.
-    final String absPath = switch (cat) {
-      'places'             => '$filesRoot/places/$name',
-      'events'             => '$filesRoot/events/$name',
-      'public_interactions'=> '$filesRoot/public_interactions/$name',
-      'other_persons'      => '$filesRoot/other_persons/$name',
-      'Self'               => '$filesRoot/My Psyche/Complexes/-Ego',
-      _                    => '$filesRoot/$cat/$name',
-    };
+    final entLoc = _entityLocator.locate(path);
+    // Structural (inline) instances such as Self cannot be renamed or deleted.
+    final isSelf = entLoc?.inline ?? false;
+    final String absPath = '$_genRoot/$path';
 
     final screenSize = MediaQuery.of(ctx).size;
     final dx = details.globalPosition.dx;
@@ -31472,30 +31074,58 @@ persona: $personaName
 
   /// Applies an inline rename after the user commits the new name.
   Future<void> _applyInlineRename(String cat, String oldName, String newName) async {
-    if (_workspaceId.isEmpty || newName.trim().isEmpty || newName == oldName) {
+    final nn = newName.trim();
+    if (_workspaceId.isEmpty || nn.isEmpty || nn == oldName) {
       setState(() => _visualizerRenamingPath = null);
       return;
     }
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final oldPath = '$filesRoot/$cat/$oldName';
-    final newPath = '$filesRoot/$cat/${newName.trim()}';
+    // [cat] is the parent: 'works' | 'personal_memory' (vault) or the rel of the
+    // parent container of an entity instance (e.g. 'person', 'psyche/Myself/Complexes').
+    final isVault = _isVaultCat(cat);
+    final root = isVault ? _vaultRoot : _genRoot;
+    final newSeg = isVault ? nn : entityFsSafe(nn);
+    final oldPath = '$root/$cat/$oldName';
+    final newPath = '$root/$cat/$newSeg';
     try {
-      final isDir = await Directory(oldPath).exists();
-      if (isDir) {
+      if (await Directory(newPath).exists() || await File(newPath).exists()) {
+        debugPrint('_applyInlineRename: "$newSeg" already exists');
+        setState(() => _visualizerRenamingPath = null);
+        return;
+      }
+      if (await Directory(oldPath).exists()) {
+        // Entity anchors are named after the instance ({safe}.md): keep them in sync.
+        final oldAnchor = isVault ? null : _entityLocator.locate('$cat/$oldName')?.anchorPath;
         await Directory(oldPath).rename(newPath);
+        if (oldAnchor != null && oldAnchor.startsWith(oldPath)) {
+          final moved = File('$newPath${oldAnchor.substring(oldPath.length)}');
+          final target = _entityLocator.locate('$cat/$newSeg')?.anchorPath;
+          if (target != null && target != moved.path &&
+              await moved.exists() && !await File(target).exists()) {
+            await moved.rename(target);
+          }
+        }
       } else {
         await File(oldPath).rename(newPath);
       }
     } catch (e) {
       debugPrint('_applyInlineRename error: $e');
     }
-    setState(() => _visualizerRenamingPath = null);
+    final oldRel = '$cat/$oldName';
+    final newRel = '$cat/$newSeg';
+    setState(() {
+      _visualizerRenamingPath = null;
+      if (_visualizerSelectedPath == oldRel) {
+        _visualizerSelectedPath = newRel;
+      } else if (_visualizerSelectedPath.startsWith('$oldRel/')) {
+        _visualizerSelectedPath =
+            newRel + _visualizerSelectedPath.substring(oldRel.length);
+      }
+    });
     await _loadVisualizerChildren();
-    // Re-select the renamed entry if it was selected
-    final oldSelectedPath = '$cat/$oldName';
-    if (_visualizerSelectedPath == oldSelectedPath) {
-      setState(() => _visualizerSelectedPath = '$cat/${newName.trim()}');
+    if (!isVault && _visualizerSelectedPath.startsWith(newRel)) {
+      await _loadPersonCanvas(_visualizerSelectedPath);
     }
+    if (!isVault) _autoExportEntities(_entityLocator.locate(newRel)?.def.id);
   }
 
   /// Shows a confirmation dialog and deletes the entry on confirmation.
@@ -31529,6 +31159,7 @@ persona: $personaName
       ),
     );
     if (confirmed != true || !mounted) return;
+    final deletedTypeId = _entityLocator.locate('$cat/$name')?.def.id;
     try {
       if (isDir) {
         await Directory(absPath).delete(recursive: true);
@@ -31539,88 +31170,34 @@ persona: $personaName
       debugPrint('_confirmDeleteVisualizerEntry error: $e');
     }
     // Deselect if the deleted entry was selected
-    if (_visualizerSelectedPath == '$cat/$name') {
+    if (_visualizerSelectedPath == '$cat/$name' ||
+        _visualizerSelectedPath.startsWith('$cat/$name/')) {
       setState(() {
         _visualizerSelectedPath = '';
         _visualizerMdContent = '';
       });
     }
     await _loadVisualizerChildren();
+    _autoExportEntities(deletedTypeId);
   }
 
   Future<void> _loadVisualizerMdContent(String relativePath) async {
     if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
     final parts = relativePath.split('/');
-    if (parts.isEmpty) { setState(() => _visualizerMdContent = ''); return; }
-    final cat  = parts[0];
+    final cat  = parts.isNotEmpty ? parts[0] : '';
     final name = parts.length > 1 ? parts[1] : '';
     String? mdPath;
-    switch (cat) {
-      case 'Self':
-        mdPath = '$filesRoot/My Psyche/Self/Self.md';
-      case 'other_persons':
-        mdPath = '$filesRoot/other_persons/$name/identity/$name.md';
-      case 'projects':
-        final safe = _fsSafe(name);
-        mdPath = '$filesRoot/projects/$safe/$safe.md';
-      case 'places':
-        final safe = _fsSafe(name);
-        mdPath = '$filesRoot/places/$safe/identity/$safe.md';
-      case 'psyche_complex':
-        // Try canonical name file inside the complex dir (e.g. -Ego/identity/Ego.md or ComplexName.md)
-        final complexBase = '$filesRoot/My Psyche/Complexes/$name';
-        final directMd = File('$complexBase/$name.md');
-        final identityMd = File('$complexBase/identity/$name.md');
-        if (await identityMd.exists()) {
-          mdPath = identityMd.path;
-        } else if (await directMd.exists()) {
-          mdPath = directMd.path;
-        } else {
-          // Fallback: look for any .md at top level of the complex dir
-          final complexDir = Directory(complexBase);
-          if (await complexDir.exists()) {
-            await for (final e in complexDir.list()) {
-              if (e is File && e.path.endsWith('.md')) { mdPath = e.path; break; }
-            }
-          }
+    if (_isVaultCat(cat) && name.isNotEmpty) {
+      // For file entries, read directly; for directories look for <n>.md or README.md
+      final absEntry = '$_vaultRoot/$cat/$name';
+      if (await File(absEntry).exists()) {
+        // Only .md files are shown as text content
+        if (absEntry.endsWith('.md')) mdPath = absEntry;
+      } else if (await Directory(absEntry).exists()) {
+        for (final c in ['$absEntry/$name.md', '$absEntry/README.md']) {
+          if (await File(c).exists()) { mdPath = c; break; }
         }
-      case 'psyche_persona':
-        final personaBase = '$filesRoot/My Psyche/Personas/$name';
-        final personaMd = File('$personaBase/$name.md');
-        if (await personaMd.exists()) {
-          mdPath = personaMd.path;
-        } else {
-          final personaDir = Directory(personaBase);
-          if (await personaDir.exists()) {
-            await for (final e in personaDir.list()) {
-              if (e is File && e.path.endsWith('.md')) { mdPath = e.path; break; }
-            }
-          }
-        }
-      case 'works':
-        // For file entries, read directly; for directories look for an index .md
-        final absEntry = '$filesRoot/works/$name';
-        if (await File(absEntry).exists()) {
-          // It's a file — only .md files are shown as text content
-          if (absEntry.endsWith('.md')) mdPath = absEntry;
-        } else if (await Directory(absEntry).exists()) {
-          // It's a directory — look for <name>.md or README.md inside
-          final candidates = ['$absEntry/$name.md', '$absEntry/README.md'];
-          for (final c in candidates) {
-            if (await File(c).exists()) { mdPath = c; break; }
-          }
-        }
-      case 'personal_memory':
-        final absEntryPm = '$filesRoot/personal_memory/$name';
-        if (await File(absEntryPm).exists()) {
-          if (absEntryPm.endsWith('.md')) mdPath = absEntryPm;
-        } else if (await Directory(absEntryPm).exists()) {
-          final candidates = ['$absEntryPm/$name.md', '$absEntryPm/README.md'];
-          for (final c in candidates) {
-            if (await File(c).exists()) { mdPath = c; break; }
-          }
-        }
+      }
     }
     String content = '';
     if (mdPath != null) {
@@ -31635,71 +31212,24 @@ persona: $personaName
 
   Future<void> _loadPersonCanvas(String relativePath) async {
     if (_workspaceId.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final parts = relativePath.split('/');
-    final cat  = parts[0];
-    final name = parts.length > 1 ? parts[1] : '';
-
-    String? canvasPath;
-    String? fallbackBase;
-    String? fallbackName;
-
-    if (cat == 'Self') {
-      canvasPath   = '$filesRoot/My Psyche/Complexes/-Ego/canvas.json';
-      fallbackBase = '$filesRoot/My Psyche/Complexes/-Ego';
-      fallbackName = 'Ego';
-    } else if (cat == 'other_persons' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/other_persons/$name/canvas.json';
-      fallbackBase = '$filesRoot/other_persons/$name';
-      fallbackName = name;
-    } else if (cat == 'places' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/places/$name/canvas.json';
-      fallbackBase = '$filesRoot/places/$name';
-      fallbackName = name;
-    } else if (cat == 'events' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/events/$name/canvas.json';
-      fallbackBase = '$filesRoot/events/$name';
-      fallbackName = name;
-    } else if (cat == 'public_interactions' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/public_interactions/$name/canvas.json';
-      fallbackBase = '$filesRoot/public_interactions/$name';
-      fallbackName = name;
-    } else if (cat == 'psyche_complex' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/My Psyche/Complexes/$name/canvas.json';
-      fallbackBase = '$filesRoot/My Psyche/Complexes/$name';
-      fallbackName = name;
-    } else if (cat == 'psyche_persona' && name.isNotEmpty) {
-      canvasPath   = '$filesRoot/My Psyche/Personas/$name/canvas.json';
-      fallbackBase = '$filesRoot/My Psyche/Personas/$name';
-      fallbackName = name;
-    }
-
-    if (canvasPath == null) { setState(() => _personCanvas = {}); return; }
+    final loc = _entityLocator.locate(relativePath);
+    if (loc == null) { setState(() => _personCanvas = {}); return; }
+    // Without a canvas.json the Profile is built from the type's `profile`
+    // definition; canvas.json is only written once the user customizes the layout.
     try {
-      final f = File(canvasPath);
+      final f = File('${loc.dir}/canvas.json');
       if (await f.exists()) {
-        final raw = await f.readAsString();
-        final decoded = jsonDecode(raw) as Map<String, dynamic>;
-        if (mounted) setState(() => _personCanvas = decoded);
+        final decoded = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        // canvas.json guarda caminhos relativos à pasta da instância.
+        final resolved = EntityLocator.canvasFromDisk(decoded, loc.dir);
+        if (mounted) setState(() => _personCanvas = resolved);
       } else {
-        // Places / Events / Public Interactions / Complexes get a single-block canvas.
-        final isSimpleEntity = cat == 'places' || cat == 'events' || cat == 'public_interactions' || cat == 'psyche_complex';
-        final defaultJson = isSimpleEntity
-            ? _defaultEntityCanvas(
-                entityBase: fallbackBase ?? '',
-                entityName: fallbackName ?? name,
-              )
-            : _defaultPersonCanvas(
-                personBase: fallbackBase ?? '',
-                personName: fallbackName ?? name,
-              );
-        await f.writeAsString(defaultJson);
-        final decoded = jsonDecode(defaultJson) as Map<String, dynamic>;
-        if (mounted) setState(() => _personCanvas = decoded);
+        final built = _entityLocator.buildCanvas(loc);
+        if (mounted) setState(() => _personCanvas = built);
       }
     } catch (e) {
       debugPrint('_loadPersonCanvas ERROR: $e');
-      if (mounted) setState(() => _personCanvas = {});
+      if (mounted) setState(() => _personCanvas = _entityLocator.buildCanvas(loc));
     }
   }
 
@@ -31775,93 +31305,44 @@ persona: $personaName
 
   Future<void> _savePersonCanvas(String relativePath) async {
     if (_workspaceId.isEmpty || _personCanvas.isEmpty) return;
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final parts = relativePath.split('/');
-    final cat  = parts[0];
-    final name = parts.length > 1 ? parts[1] : '';
-    String? canvasPath;
-    if (cat == 'Self') {
-      canvasPath = '$filesRoot/My Psyche/Complexes/-Ego/canvas.json';
-    } else if (cat == 'other_persons' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/other_persons/$name/canvas.json';
-    } else if (cat == 'places' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/places/$name/canvas.json';
-    } else if (cat == 'events' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/events/$name/canvas.json';
-    } else if (cat == 'public_interactions' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/public_interactions/$name/canvas.json';
-    } else if (cat == 'psyche_complex' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/My Psyche/Complexes/$name/canvas.json';
-    } else if (cat == 'psyche_persona' && name.isNotEmpty) {
-      canvasPath = '$filesRoot/My Psyche/Personas/$name/canvas.json';
-    }
-    if (canvasPath == null) return;
+    final loc = _entityLocator.locate(relativePath);
+    if (loc == null) return;
     try {
-      await File(canvasPath).writeAsString(jsonEncode(_personCanvas));
+      await File('${loc.dir}/canvas.json')
+          .writeAsString(jsonEncode(EntityLocator.canvasToDisk(_personCanvas, loc.dir)));
     } catch (e) {
       debugPrint('_savePersonCanvas ERROR: $e');
     }
   }
 
   Widget _buildVisualizerNavContent() {
-    const sections = [
-      ('my_psyche',            'My Psyche',          Icons.psychology_outlined),
-      ('persons',              'Persons',             Icons.group_outlined),
-      ('places',               'Places',              Icons.place_outlined),
-      ('works',                'Works',               Icons.auto_stories_outlined),
-      ('personal_memory',      'Personal Memory',     Icons.photo_library_outlined),
-      ('events',               'Events',              Icons.event_outlined),
-      ('public_interactions',  'Public Interactions', Icons.public_outlined),
+    final roots = _typeRegistry.rootTypes;
+    final List<(String, String, IconData)> sections = [
+      for (final t in roots) (t.id, t.label, _iconFromName(t.icon)),
+      ('works',           'Works',           Icons.auto_stories_outlined),
+      ('personal_memory', 'Personal Memory', Icons.photo_library_outlined),
     ];
+    final String section = sections.any((s) => s.$1 == _visualizerSection)
+        ? _visualizerSection
+        : (sections.isNotEmpty ? sections.first.$1 : '');
 
     // Whether the active section is a file-manager section (works / personal_memory).
-    final bool _isFileMgrSection =
-        _visualizerSection == 'works' || _visualizerSection == 'personal_memory';
-
-    // Derive the flat list of items for the active section
-    final List<String> allPersonItems = [
-      'Self',
-      ...(_visualizerChildren['other_persons'] ?? []).map((e) => 'other_persons/$e'),
+    final bool _isFileMgrSection = _isVaultCat(section);
+    final EntityTypeDef? sectionDef = _isFileMgrSection ? null : _typeRegistry[section];
+    // Types with child slots (e.g. Psyche) are shown as a tree; others as a flat list.
+    final bool isTree = sectionDef != null && sectionDef.children.isNotEmpty;
+    final String folderKey = _isFileMgrSection ? section : (sectionDef?.folder ?? '');
+    final String searchQ = _visualizerPersonSearch.toLowerCase();
+    final List<String> items = [
+      for (final n in (_visualizerChildren[folderKey] ?? const <String>[]))
+        if (_isFileMgrSection || searchQ.isEmpty || n.toLowerCase().contains(searchQ))
+          '$folderKey/$n',
     ];
-    final List<String> items = switch (_visualizerSection) {
-      'persons'         => _visualizerPersonSearch.isEmpty
-          ? allPersonItems
-          : allPersonItems.where((p) {
-              final name = p == 'Self' ? 'Self' : p.split('/').last;
-              return name.toLowerCase().contains(_visualizerPersonSearch.toLowerCase());
-            }).toList(),
-      'works'           => (_visualizerChildren['works'] ?? []).map((e) => 'works/$e').toList(),
-      'places'          => (_visualizerChildren['places'] ?? []).map((e) => 'places/$e').toList(),
-      'projects'        => (_visualizerChildren['projects'] ?? []).map((e) => 'projects/$e').toList(),
-      'personal_memory'      => (_visualizerChildren['personal_memory'] ?? []).map((e) => 'personal_memory/$e').toList(),
-      'events'               => (_visualizerChildren['events'] ?? []).map((e) => 'events/$e').toList(),
-      'public_interactions'  => (_visualizerChildren['public_interactions'] ?? []).map((e) => 'public_interactions/$e').toList(),
-      _                      => [],
-    };
-
-    final sectionLabel = switch (_visualizerSection) {
-      'my_psyche'            => 'My Psyche',
-      'persons'              => 'Persons',
-      'works'                => 'Works',
-      'places'               => 'Places',
-      'projects'             => 'Projects',
-      'personal_memory'      => 'Personal Memory',
-      'events'               => 'Events',
-      'public_interactions'  => 'Public Interactions',
-      _                      => _visualizerSection,
-    };
-
-    final sectionIcon = switch (_visualizerSection) {
-      'my_psyche'            => Icons.psychology_outlined,
-      'persons'              => Icons.group_outlined,
-      'works'                => Icons.auto_stories_outlined,
-      'places'               => Icons.place_outlined,
-      'projects'             => Icons.folder_copy_outlined,
-      'personal_memory'      => Icons.photo_library_outlined,
-      'events'               => Icons.event_outlined,
-      'public_interactions'  => Icons.public_outlined,
-      _                      => Icons.account_tree_outlined,
-    };
+    final String sectionLabel =
+        sections.where((s) => s.$1 == section).map((s) => s.$2).firstOrNull ?? section;
+    final IconData sectionIcon =
+        sections.where((s) => s.$1 == section).map((s) => s.$3).firstOrNull ??
+            Icons.account_tree_outlined;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -31871,6 +31352,24 @@ persona: $personaName
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // No entity types yet → invite the user to create one.
+              if (roots.isEmpty)
+                InkWell(
+                  onTap: _openEntityTypeDesigner,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+                    color: Colors.blueAccent.withOpacity(0.08),
+                    child: Row(children: const [
+                      Icon(Icons.category_outlined, size: 14, color: Colors.blueAccent),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text('No entity types yet. Create one…',
+                            style: TextStyle(color: Colors.white70, fontSize: 11.5)),
+                      ),
+                      Icon(Icons.chevron_right_rounded, size: 16, color: Colors.white38),
+                    ]),
+                  ),
+                ),
               // Section label + search (persons) + add button
               Container(
                 padding: const EdgeInsets.fromLTRB(14, 12, 8, 8),
@@ -31881,13 +31380,13 @@ persona: $personaName
                   Icon(sectionIcon, size: 13, color: Colors.white24),
                   const SizedBox(width: 7),
                   // Search field for persons, label for others
-                  if (_visualizerSection == 'persons')
+                  if (!_isFileMgrSection && !isTree)
                     Expanded(
                       child: TextField(
                         onChanged: (v) => setState(() => _visualizerPersonSearch = v),
                         style: const TextStyle(color: Colors.white, fontSize: 11),
                         decoration: InputDecoration(
-                          hintText: 'Search persons…',
+                          hintText: 'Search ${sectionLabel.toLowerCase()}…',
                           hintStyle: const TextStyle(color: Colors.white24, fontSize: 11),
                           isDense: true,
                           contentPadding: const EdgeInsets.symmetric(horizontal: 0, vertical: 2),
@@ -31917,8 +31416,7 @@ persona: $personaName
                   if (_visualizerLoading)
                     const SizedBox(width: 12, height: 12,
                       child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24)),
-                  // No add button for My Psyche (fixed structure)
-                  if (!_visualizerLoading && _visualizerSection != 'my_psyche')
+                  if (!_visualizerLoading)
                     InkWell(
                       onTap: () => setState(() {
                         _visualizerAdding = !_visualizerAdding;
@@ -31934,12 +31432,8 @@ persona: $personaName
                 ]),
               ),
 
-              // ── My Psyche hierarchical tree ──────────────────────────────
-              if (_visualizerSection == 'my_psyche')
-                Expanded(child: _buildPsycheTree()),
-
-              // Inline add-entity input (only for non-psyche sections)
-              if (_visualizerSection != 'my_psyche' && _visualizerAdding)
+                // Inline add-entity input
+                if (_visualizerAdding)
                 Container(
                   padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
                   decoration: const BoxDecoration(
@@ -31953,17 +31447,9 @@ persona: $personaName
                         autofocus: true,
                         style: const TextStyle(color: Colors.white, fontSize: 12),
                         decoration: InputDecoration(
-                          hintText: _visualizerSection == 'persons'
-                              ? 'Person name…'
-                              : _visualizerSection == 'works'
-                                  ? 'Work title…'
-                                  : _visualizerSection == 'personal_memory'
-                                      ? 'Memory title…'
-                                      : _visualizerSection == 'events'
-                                          ? 'Event name…'
-                                          : _visualizerSection == 'public_interactions'
-                                              ? 'Interaction name…'
-                                              : 'Place name…',
+                          hintText: _isFileMgrSection
+                              ? (section == 'works' ? 'Work title…' : 'Memory title…')
+                              : '${sectionDef?.label ?? 'Item'} name…',
                           hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
                           isDense: true,
                           contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
@@ -31974,71 +31460,12 @@ persona: $personaName
                             borderSide: BorderSide.none,
                           ),
                         ),
-                        onSubmitted: (value) async {
-                          final name = value.trim();
-                          if (name.isNotEmpty) {
-                            if (_visualizerSection == 'persons') {
-                              await _scaffoldPersonDir(name);
-                            } else if (_visualizerSection == 'works' ||
-                                       _visualizerSection == 'personal_memory') {
-                              final filesRoot = _wsFilesDir(_workspaceId);
-                              final targetPath =
-                                  '$filesRoot/$_visualizerSection/$name';
-                              // Name with extension → file; no extension → folder.
-                              if (name.contains('.')) {
-                                await File(targetPath).create(recursive: true);
-                              } else {
-                                await Directory(targetPath)
-                                    .create(recursive: true);
-                              }
-                            } else if (_visualizerSection == 'events') {
-                              await _scaffoldEventDir(name);
-                            } else if (_visualizerSection == 'public_interactions') {
-                              await _scaffoldPublicInteractionDir(name);
-                            } else {
-                              await _scaffoldPlaceDir(name);
-                            }
-                            await _loadVisualizerChildren();
-                          }
-                          setState(() {
-                            _visualizerAdding = false;
-                            _visualizerAddingCtrl.clear();
-                          });
-                        },
+                        onSubmitted: (value) => _submitVisualizerAdd(section, value),
                       ),
                     ),
                     const SizedBox(width: 4),
                     InkWell(
-                      onTap: () async {
-                        final name = _visualizerAddingCtrl.text.trim();
-                        if (name.isNotEmpty) {
-                          if (_visualizerSection == 'persons') {
-                            await _scaffoldPersonDir(name);
-                          } else if (_visualizerSection == 'works' ||
-                                     _visualizerSection == 'personal_memory') {
-                            final filesRoot = _wsFilesDir(_workspaceId);
-                            final targetPath =
-                                '$filesRoot/$_visualizerSection/$name';
-                            if (name.contains('.')) {
-                              await File(targetPath).create(recursive: true);
-                            } else {
-                              await Directory(targetPath)
-                                  .create(recursive: true);
-                            }
-                          } else if (_visualizerSection == 'events') {
-                            await _scaffoldEventDir(name);
-                          } else if (_visualizerSection == 'public_interactions') {
-                            await _scaffoldPublicInteractionDir(name);
-                          } else {
-                            await _scaffoldPlaceDir(name);
-                          }
-                          await _loadVisualizerChildren();
-                        }
-                        setState(() {
-                          _visualizerAdding = false;
-                          _visualizerAddingCtrl.clear();
-                        });
-                      },
+                      onTap: () => _submitVisualizerAdd(section, _visualizerAddingCtrl.text),
                       borderRadius: BorderRadius.circular(4),
                       child: const Padding(
                         padding: EdgeInsets.all(4),
@@ -32059,17 +31486,19 @@ persona: $personaName
                   ]),
                 ),
 
-              // Entity list (flat, for all sections except My Psyche)
-              if (_visualizerSection != 'my_psyche')
+              // Entity tree (types with child slots) or flat list
+              if (isTree)
+                Expanded(child: _buildEntityTree(sectionDef!))
+              else
               Expanded(
                 child: items.isEmpty && !_visualizerLoading
                     ? GestureDetector(
                         // Background right-click on empty file-manager section.
                         onSecondaryTapDown: (_isFileMgrSection)
                             ? (details) async {
-                                final filesRoot = _wsFilesDir(_workspaceId);
+                                final filesRoot = _vaultRoot;
                                 final dirPath =
-                                    '$filesRoot/$_visualizerSection';
+                                    '$filesRoot/$section';
                                 final screenSize =
                                     MediaQuery.of(context).size;
                                 final dx = details.globalPosition.dx;
@@ -32150,10 +31579,10 @@ persona: $personaName
                           final path = items[i];
                           final cat  = path.split('/').first;
                           final rawName = path.split('/').last;
-                          final isSelf = cat == 'Self';
-                          final name = isSelf ? 'Self' : rawName;
+                          final isSelf = false;
+                          final name = rawName;
                           final isSelected = _visualizerSelectedPath == path;
-                          final isFileMgr = cat == 'works' || cat == 'personal_memory';
+                          final isFileMgr = _isVaultCat(cat);
                           final isRenaming = _visualizerRenamingPath == path;
 
                           // Metadata for file-manager sections
@@ -32238,19 +31667,19 @@ persona: $personaName
                           // ── Normal list item ────────────────────────────
                           Widget tile = InkWell(
                             onTap: () {
-                              setState(() {
-                                _visualizerSelectedPath = path;
-                                _visualizerEditLayout = false;
-                                _personCanvas = {};
-                                _personFileOpenPath = null;
-                                _personFileNote = null;
-                                _visualizerRenamingPath = null;
-                              });
-                              _loadVisualizerMdContent(path);
-                              final c = path.split('/').first;
-                              if (c == 'Self' || c == 'other_persons' ||
-                                  c == 'places' || c == 'events' || c == 'public_interactions') {
-                                _loadPersonCanvas(path);
+                              if (isFileMgr) {
+                                setState(() {
+                                  _visualizerSelectedPath = path;
+                                  _visualizerEditLayout = false;
+                                  _personCanvas = {};
+                                  _personFileOpenPath = null;
+                                  _personFileNote = null;
+                                  _visualizerRenamingPath = null;
+                                  _typeSettingsId = null;
+                                });
+                                _loadVisualizerMdContent(path);
+                              } else {
+                                _navigateToEntity(path);
                               }
                               // File-manager sections: non-.md files open with
                               // the system default application on single click.
@@ -32260,7 +31689,7 @@ persona: $personaName
                                     : '';
                                 if (fileExt != '.md') {
                                   final absFilePath =
-                                      '${_wsFilesDir(_workspaceId)}/$cat/$rawName';
+                                      '$_vaultRoot/$cat/$rawName';
                                   _openWithSystemApp(absFilePath);
                                 }
                               }
@@ -32349,11 +31778,7 @@ persona: $personaName
                             );
                           }
                           // Wrap with right-click handler for entity sections
-                          if (cat == 'events' ||
-                              cat == 'public_interactions' ||
-                              cat == 'places' ||
-                              cat == 'other_persons' ||
-                              cat == 'Self') {
+                          if (!isFileMgr) {
                             return GestureDetector(
                               onSecondaryTapDown: (details) =>
                                   _showVisualizerEntityContextMenu(
@@ -32375,17 +31800,19 @@ persona: $personaName
           height: 44,
           color: const Color(0xFF1A1A1A),
           child: Row(
-            children: sections.map((s) {
+            children: [
+              ...sections.map((s) {
               final (key, label, icon) = s;
-              final isActive = _visualizerSection == key;
+              final isActive = section == key;
               return Expanded(
                 child: Tooltip(
                   message: label,
                   waitDuration: const Duration(milliseconds: 400),
                   child: InkWell(
                     onTap: () {
-                      if (_visualizerSection == key) return;
+                      if (section == key) return;
                       setState(() {
+                        _typeSettingsId = null;
                         _visualizerSection = key;
                         _visualizerSelectedPath = '';
                         _visualizerMdContent = '';
@@ -32422,312 +31849,341 @@ persona: $personaName
                   ),
                 ),
               );
-            }).toList(),
+              }),
+              SizedBox(
+                width: 44,
+                child: Tooltip(
+                  message: roots.isEmpty ? 'Create your first entity type' : 'Entity types',
+                  waitDuration: const Duration(milliseconds: 400),
+                  child: InkWell(
+                    onTap: _openEntityTypeDesigner,
+                    child: Center(
+                      child: Icon(Icons.tune_rounded, size: 16,
+                          color: roots.isEmpty ? Colors.blueAccent : Colors.white38),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  // ── My Psyche hierarchical sidebar tree ───────────────────────────────────
-  Widget _buildPsycheTree() {
-    final personas  = _visualizerChildren['psyche_personas']  ?? [];
-    final complexes = _visualizerChildren['psyche_complexes'] ?? [];
+  // ── Entity types: sidebar tree, tabs and helpers ─────────────────────────
 
-    final personasExpanded  = _psycheExpanded.contains('psyche_personas');
-    final complexesExpanded = _psycheExpanded.contains('psyche_complexes');
-
-    // Resolve display icon widget for a psyche item key
-    Widget _itemIcon(String key, IconData fallback, Color accent) {
-      final emoji = _psycheIcons[key] ?? '';
-      final color = _psycheColors[key] ?? accent;
-      if (emoji.isNotEmpty) {
-        return Text(emoji,
-            style: const TextStyle(fontSize: 13, fontFamilyFallback: [
-              'NotoColorEmoji', 'Apple Color Emoji', 'Segoe UI Emoji',
-            ]));
-      }
-      return Icon(fallback, size: 14, color: color);
+  /// Type the Visualizer is working on: the selected instance's type, otherwise
+  /// the type of the active sidebar section (null for Works / Personal Memory).
+  String? _visualizerCurrentTypeId() {
+    if (_visualizerSelectedPath.isNotEmpty) {
+      final loc = _entityLocator.locate(_visualizerSelectedPath);
+      if (loc != null) return loc.def.id;
     }
+    final roots = _typeRegistry.rootTypes;
+    if (roots.any((t) => t.id == _visualizerSection)) return _visualizerSection;
+    if (_isVaultCat(_visualizerSection)) return null;
+    return roots.isNotEmpty ? roots.first.id : null;
+  }
 
-    // Child item (indented, inside a section)
-    Widget _psycheChild(String path, String label, IconData fallback) {
-      final isSelected = _visualizerSelectedPath == path;
-      final accentColor = _psycheColors[path] ?? Colors.deepPurpleAccent;
-      return GestureDetector(
-        onSecondaryTap: () => _showPsycheItemPicker(path, label),
-        child: InkWell(
-          onTap: () {
-            setState(() {
-              _visualizerSelectedPath = path;
-              _visualizerEditLayout   = false;
-              _personCanvas           = {};
-              _personFileOpenPath     = null;
-              _personFileNote         = null;
-            });
-            _loadVisualizerMdContent(path);
-            final c = path.split('/').first;
-            if (c == 'psyche_complex' || c == 'psyche_persona') {
-              _loadPersonCanvas(path);
-            }
-          },
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 120),
-            padding: const EdgeInsets.only(left: 26, right: 10, top: 7, bottom: 7),
-            decoration: BoxDecoration(
-              color: isSelected ? accentColor.withOpacity(0.10) : Colors.transparent,
-              border: Border(
-                left: BorderSide(
-                  color: isSelected ? accentColor : Colors.transparent,
-                  width: 2,
-                ),
-              ),
-            ),
-            child: Row(children: [
-              Container(
-                width: 5, height: 5,
-                margin: const EdgeInsets.only(right: 8),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: isSelected ? accentColor : Colors.white24,
-                ),
-              ),
-              _itemIcon(path, fallback, accentColor),
-              const SizedBox(width: 7),
-              Expanded(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: isSelected ? Colors.white : Colors.white54,
-                    fontWeight: isSelected ? FontWeight.w500 : FontWeight.normal,
-                  ),
-                ),
-              ),
-              GestureDetector(
-                onTapDown: (details) async {
-                  final screenSize = MediaQuery.of(context).size;
-                  final dx = details.globalPosition.dx;
-                  final dy = details.globalPosition.dy;
-                  final choice = await showMenu<String>(
-                    context: context,
-                    position: RelativeRect.fromLTRB(
-                        dx, dy, screenSize.width - dx, screenSize.height - dy),
-                    color: const Color(0xFF1E2124),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      side: BorderSide(color: Colors.white.withOpacity(0.08)),
-                    ),
-                    items: [
-                      PopupMenuItem<String>(
-                        value: 'settings',
-                        height: 36,
-                        child: _vizFileMenuRow(
-                            Icons.tune_rounded, 'Settings', Colors.white70),
-                      ),
-                      const PopupMenuDivider(height: 1),
-                      PopupMenuItem<String>(
-                        value: 'delete',
-                        height: 36,
-                        child: _vizFileMenuRow(
-                            Icons.delete_outline_rounded, 'Delete', Colors.redAccent),
-                      ),
-                    ],
-                  );
-                  if (choice == null || !mounted) return;
-                  if (choice == 'settings') {
-                    _showPsycheItemPicker(path, label);
-                  } else if (choice == 'delete') {
-                    await _deletePsycheItem(path, label);
-                  }
-                },
-                child: Padding(
-                  padding: const EdgeInsets.only(left: 4),
-                  child: Icon(Icons.more_horiz_rounded, size: 12,
-                      color: Colors.white.withOpacity(0.15)),
-                ),
-              ),
-            ]),
-          ),
-        ),
-      );
-    }
-
-    // Section header (Personas / Complexes)
-    Widget _sectionHeader(String key, String label, IconData icon, bool expanded,
-        {VoidCallback? onAdd}) {
-      return InkWell(
-        onTap: () => setState(() {
-          if (expanded) _psycheExpanded.remove(key); else _psycheExpanded.add(key);
-        }),
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(12, 9, 10, 9),
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: Colors.white.withOpacity(0.07)),
-            ),
-          ),
-          child: Row(children: [
-            Icon(icon, size: 13, color: Colors.white30),
-            const SizedBox(width: 7),
-            Expanded(
-              child: Text(
-                label.toUpperCase(),
-                style: const TextStyle(
-                  fontSize: 9,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white30,
-                  letterSpacing: 1.1,
-                ),
-              ),
-            ),
-            if (onAdd != null)
-              InkWell(
-                onTap: onAdd,
-                borderRadius: BorderRadius.circular(3),
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 3, vertical: 2),
-                  child: Icon(Icons.add_rounded, size: 13, color: Colors.white38),
-                ),
-              ),
-            const SizedBox(width: 2),
-            Icon(
-              expanded
-                  ? Icons.keyboard_arrow_down_rounded
-                  : Icons.keyboard_arrow_right_rounded,
-              size: 14,
-              color: Colors.white24,
-            ),
-          ]),
-        ),
-      );
-    }
-
-    // Self item — pinned at bottom
-    final selfSelected = _visualizerSelectedPath == 'Self';
-    final selfWidget = GestureDetector(
-      onSecondaryTap: () => _showPsycheItemPicker('Self', 'Self'),
+  /// Gear button at the right end of the left sidebar's top bar (Visualizer).
+  /// Opens the settings page of the current type; with no type available it
+  /// opens the entity types designer so the first one can be created.
+  Widget _buildVisualizerGearButton() {
+    final typeId = _visualizerCurrentTypeId();
+    final active = typeId != null && _typeSettingsId == typeId;
+    return Tooltip(
+      message: typeId == null ? 'Entity types' : 'Type settings',
+      waitDuration: const Duration(milliseconds: 400),
       child: InkWell(
         onTap: () {
-          setState(() {
-            _visualizerSelectedPath = 'Self';
-            _visualizerEditLayout   = false;
-            _personCanvas           = {};
-            _personFileOpenPath     = null;
-            _personFileNote         = null;
-          });
-          _loadVisualizerMdContent('Self');
-          _loadPersonCanvas('Self');
+          if (typeId == null) {
+            _openEntityTypeDesigner();
+          } else {
+            _openTypeSettings(typeId);
+          }
         },
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 120),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: selfSelected
-                ? Colors.deepPurpleAccent.withOpacity(0.12)
-                : Colors.transparent,
-            border: Border(
-              top: BorderSide(color: Colors.white.withOpacity(0.07)),
-              left: BorderSide(
-                color: selfSelected ? Colors.deepPurpleAccent : Colors.transparent,
-                width: 2,
-              ),
+        borderRadius: BorderRadius.circular(4),
+        child: SizedBox(
+          width: 36,
+          height: 32,
+          child: Center(
+            child: Icon(
+              Icons.settings_outlined,
+              size: 15,
+              color: active ? Colors.blueAccent : Colors.white38,
             ),
           ),
-          child: Row(children: [
-            _itemIcon('Self', Icons.person_outline_rounded,
-                _psycheColors['Self'] ?? Colors.deepPurpleAccent),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(
-                'Self',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: selfSelected ? Colors.white : Colors.white70,
-                  fontWeight:
-                      selfSelected ? FontWeight.w500 : FontWeight.normal,
-                ),
-              ),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.deepPurpleAccent.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(3),
-              ),
-              child: const Text('core',
-                  style: TextStyle(
-                      fontSize: 9,
-                      color: Colors.deepPurpleAccent,
-                      fontWeight: FontWeight.w600)),
-            ),
-          ]),
         ),
       ),
     );
+  }
 
-    // ── Inline add row (shared for persona / complex) ────────────────────
-    Widget _psycheAddRow(String type) {
-      final hint = type == 'persona' ? 'Persona name…' : 'Complex name…';
-      Future<void> submit() async {
-        final name = _psycheAddingCtrl.text.trim();
-        if (name.isNotEmpty) {
-          if (type == 'persona') {
-            await _scaffoldPersonaDir(name);
-          } else {
-            await _scaffoldComplexDir(name);
-          }
-          await _loadVisualizerChildren();
-        }
-        setState(() {
-          _psycheAddingType = null;
-          _psycheAddingCtrl.clear();
-        });
+  /// Opens the settings page of [typeId] (name, icon and folder pattern) in the
+  /// main area of the Visualizer.
+  void _openTypeSettings(String typeId) {
+    setState(() {
+      _typeSettingsId = typeId;
+      if (_typeRegistry.rootTypes.any((t) => t.id == typeId)) _visualizerSection = typeId;
+    });
+  }
+
+  Widget _buildTypeSettingsPage(String typeId) {
+    return EntityTypeDesigner(
+      key: ValueKey('type-settings:$typeId'),
+      typesDir: '$_genRoot/.types',
+      genRoot: _genRoot,
+      focusTypeId: typeId,
+      onChanged: () {
+        _loadVisualizerChildren();
+      },
+      onClose: () => setState(() => _typeSettingsId = null),
+      onOpenFull: () => _openEntityTypeDesigner(typeId),
+    );
+  }
+
+  /// Opens the entity types designer (optionally on [typeId]).
+  Future<void> _openEntityTypeDesigner([String? typeId]) async {
+    if (_workspaceId.isEmpty) return;
+    await EntityTypeDesigner.show(
+      context,
+      typesDir: '$_genRoot/.types',
+      genRoot: _genRoot,
+      initialTypeId: typeId,
+      onChanged: () {
+        _loadVisualizerChildren();
+      },
+    );
+    if (mounted) await _loadVisualizerChildren();
+  }
+
+  IconData _iconFromName(String name) => entityIconFromName(name);
+
+  IconData _tabIcon(TabDef t) => switch (t.kind) {
+        'profile'     => Icons.person_outline_rounded,
+        'files'       => Icons.folder_outlined,
+        'works'       => Icons.auto_stories_outlined,
+        'connections' => Icons.hub_outlined,
+        'children'    => Icons.account_tree_outlined,
+        'markdown'    => Icons.notes_rounded,
+        'properties'  => Icons.tune_rounded,
+        'folder'      => t.id == 'logs' ? Icons.history_rounded : Icons.folder_open_outlined,
+        _             => Icons.tab_outlined,
+      };
+
+  /// Tab to show for [loc]: the remembered tab if the type defines it,
+  /// otherwise the first one (Profile).
+  TabDef _activeTabFor(EntityLoc? loc) {
+    final tabs = loc?.pattern.tabs ?? const <TabDef>[];
+    for (final t in tabs) {
+      if (t.id == _visualizerPersonTab) return t;
+    }
+    return tabs.isNotEmpty
+        ? tabs.first
+        : const TabDef(id: 'profile', kind: 'profile', title: 'Profile');
+  }
+
+  Future<T> _entityTabFuture<T>(String key, Future<T> Function() make) =>
+      (_entityTabFutures[key] ??= make()) as Future<T>;
+
+  /// Contagem do `badge: count` de [t] (null enquanto calcula ou se não se aplica).
+  /// Dispara o cálculo na primeira consulta e redesenha ao terminar.
+  int? _entityBadgeFor(EntityLoc loc, TabDef t) {
+    if (!t.badgeCount) return null;
+    final key = '${loc.rel}|${t.id}|$_entityTabRefresh';
+    if (_entityBadges.containsKey(key)) return _entityBadges[key];
+    _entityBadges[key] = null;
+    final worksRoot = '${_wsFilesDir(_workspaceId)}/${t.from ?? 'vault/works'}';
+    _entityLocator.badgeCount(loc, t, worksRoot: worksRoot).then((n) {
+      if (!mounted) return;
+      setState(() => _entityBadges[key] = n);
+    }).catchError((Object e) {
+      debugPrint('_entityBadgeFor ERROR: $e');
+    });
+    return null;
+  }
+
+  /// Regenera os exports `sync: one_way` do tipo [typeId] (sem bloquear a UI).
+  Future<void> _autoExportEntities(String? typeId) async {
+    if (_workspaceId.isEmpty || typeId == null) return;
+    final def = _typeRegistry[typeId];
+    if (def == null || def.exports.isEmpty) return;
+    try {
+      final res = await EntityExporter.run(
+        locator: _entityLocator,
+        def: def,
+        exportsRoot: '${_wsFilesDir(_workspaceId)}/exports',
+        autoOnly: true,
+      );
+      for (final r in res) {
+        if (!r.ok) debugPrint('export ${r.exportId}: ${r.errors.join('; ')}');
       }
+    } catch (e) {
+      debugPrint('_autoExportEntities ERROR: $e');
+    }
+  }
+
+  /// Selects an entity instance (switching sidebar section when needed).
+  void _navigateToEntity(String rel) {
+    final root = _typeRegistry.rootByFolder(rel.split('/').first);
+    _entityTabFutures.clear();
+    _entityBadges.clear();
+    setState(() {
+      _typeSettingsId = null;
+      if (root != null) _visualizerSection = root.id;
+      _visualizerSelectedPath = rel;
+      _visualizerEditLayout = false;
+      _personCanvas = {};
+      _personFileOpenPath = null;
+      _personFileNote = null;
+      _visualizerRenamingPath = null;
+    });
+    _loadPersonCanvas(rel);
+  }
+
+  Future<void> _submitVisualizerAdd(String section, String raw) async {
+    final name = raw.trim();
+    if (name.isNotEmpty) {
+      if (_isVaultCat(section)) {
+        final targetPath = '$_vaultRoot/$section/$name';
+        // Name with extension → file; no extension → folder.
+        if (name.contains('.')) {
+          await File(targetPath).create(recursive: true);
+        } else {
+          await Directory(targetPath).create(recursive: true);
+        }
+      } else {
+        await _scaffoldEntity(section, name);
+      }
+      await _loadVisualizerChildren();
+    }
+    if (!mounted) return;
+    setState(() {
+      _visualizerAdding = false;
+      _visualizerAddingCtrl.clear();
+    });
+  }
+
+  // ── Sidebar tree for types with child slots ───────────────────────────────
+
+  Widget _buildEntityTree(EntityTypeDef def) {
+    final names = _visualizerChildren[def.folder ?? ''] ?? const <String>[];
+    final rows = <Widget>[];
+    for (final n in names) {
+      rows.addAll(_entityTreeRows('${def.folder}/$n', 0));
+    }
+    if (names.isEmpty && !_visualizerLoading) {
+      rows.add(Padding(
+        padding: const EdgeInsets.all(16),
+        child: Text('No ${def.label.toLowerCase()} yet',
+            style: const TextStyle(color: Colors.white24, fontSize: 12)),
+      ));
+    }
+    return ListView(
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
+      children: rows,
+    );
+  }
+
+  List<Widget> _entityTreeRows(String rel, int depth) {
+    final loc = _entityLocator.locate(rel);
+    if (loc == null) return const <Widget>[];
+    final def = loc.def;
+    final collapsed = _entityTreeCollapsed.contains(rel);
+    final hasKids = def.children.isNotEmpty;
+    final rows = <Widget>[_entityTreeNode(rel, loc, depth, hasKids, collapsed)];
+    if (!hasKids || collapsed) return rows;
+    for (final slot in def.children) {
+      final childDef = _typeRegistry[slot.type];
+      if (childDef == null) continue;
+      if (slot.isOne) {
+        rows.addAll(_entityTreeRows('$rel/${slot.folder}', depth + 1));
+        continue;
+      }
+      final key = '$rel/${slot.folder}';
+      final names = _visualizerChildren[key] ?? const <String>[];
+      final expanded = !_entityTreeCollapsed.contains(key);
+      rows.add(_entityTreeSection(
+        key, slot.folder, _iconFromName(childDef.icon), expanded, depth + 1,
+        onAdd: () => setState(() {
+          _entityAddingKey = _entityAddingKey == key ? null : key;
+          _psycheAddingCtrl.clear();
+          _entityTreeCollapsed.remove(key);
+        }),
+      ));
+      if (_entityAddingKey == key) {
+        rows.add(_entityAddRow(slot.type, '${loc.dir}/${slot.folder}', depth + 1));
+      }
+      if (expanded) {
+        if (names.isEmpty) {
+          rows.add(Padding(
+            padding: EdgeInsets.only(left: 30.0 + (depth + 1) * 14.0, top: 8, bottom: 8),
+            child: Text('No ${childDef.label.toLowerCase()} yet',
+                style: const TextStyle(color: Colors.white24, fontSize: 11)),
+          ));
+        } else {
+          for (final n in names) {
+            rows.addAll(_entityTreeRows('$key/$n', depth + 2));
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
+  Widget _entityTreeNode(String rel, EntityLoc loc, int depth, bool hasKids, bool collapsed) {
+    final isSelected = _visualizerSelectedPath == rel;
+    final accent = _psycheColors[rel] ?? Colors.blueAccent;
+    final emoji = _psycheIcons[rel] ?? '';
+    final parentRel = rel.contains('/') ? rel.substring(0, rel.lastIndexOf('/')) : '';
+    final isRenaming = _visualizerRenamingPath == rel;
+    final indent = 10.0 + depth * 14.0;
+    final Widget leading = emoji.isNotEmpty
+        ? Text(emoji,
+            style: const TextStyle(fontSize: 13, fontFamilyFallback: [
+              'NotoColorEmoji', 'Apple Color Emoji', 'Segoe UI Emoji',
+            ]))
+        : Icon(_iconFromName(loc.def.icon), size: 14,
+            color: isSelected ? accent : Colors.white38);
+
+    if (isRenaming) {
       return Container(
-        padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-        decoration: const BoxDecoration(
-          border: Border(bottom: BorderSide(color: Color(0x1AFFFFFF))),
-          color: Color(0xFF141414),
+        padding: EdgeInsets.fromLTRB(indent, 5, 10, 5),
+        decoration: BoxDecoration(
+          color: accent.withOpacity(0.08),
+          border: Border(left: BorderSide(color: accent, width: 2)),
         ),
         child: Row(children: [
+          leading,
+          const SizedBox(width: 8),
           Expanded(
             child: TextField(
-              controller: _psycheAddingCtrl,
+              controller: _visualizerRenameCtrl,
               autofocus: true,
-              style: const TextStyle(color: Colors.white, fontSize: 12),
+              style: const TextStyle(color: Colors.white, fontSize: 13),
               decoration: InputDecoration(
-                hintText: hint,
-                hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
                 isDense: true,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 filled: true,
-                fillColor: Colors.white10,
+                fillColor: Colors.white.withOpacity(0.07),
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(5),
+                  borderRadius: BorderRadius.circular(4),
                   borderSide: BorderSide.none,
                 ),
               ),
-              onSubmitted: (_) => submit(),
+              onSubmitted: (v) => _applyInlineRename(parentRel, loc.name, v),
             ),
           ),
           const SizedBox(width: 4),
-          InkWell(
-            onTap: submit,
-            borderRadius: BorderRadius.circular(4),
+          GestureDetector(
+            onTap: () => _applyInlineRename(parentRel, loc.name, _visualizerRenameCtrl.text),
             child: const Padding(
               padding: EdgeInsets.all(4),
               child: Icon(Icons.check_rounded, size: 14, color: Colors.blueAccent),
             ),
           ),
-          InkWell(
-            onTap: () => setState(() {
-              _psycheAddingType = null;
-              _psycheAddingCtrl.clear();
-            }),
-            borderRadius: BorderRadius.circular(4),
+          GestureDetector(
+            onTap: () => setState(() => _visualizerRenamingPath = null),
             child: const Padding(
               padding: EdgeInsets.all(4),
               child: Icon(Icons.close_rounded, size: 14, color: Colors.white38),
@@ -32737,99 +32193,551 @@ persona: $personaName
       );
     }
 
-    // ── Two-stack layout ─────────────────────────────────────────────────
-    return Column(children: [
-      // TOP STACK — Personas + Complexes (scrollable, grows downward)
-      Expanded(
-        child: ListView(
-          padding: const EdgeInsets.only(top: 4, bottom: 4),
-          children: [
-            _sectionHeader('psyche_personas', 'Personas',
-                Icons.theater_comedy_outlined, personasExpanded,
-                onAdd: () => setState(() {
-                  _psycheAddingType = _psycheAddingType == 'persona' ? null : 'persona';
-                  _psycheAddingCtrl.clear();
-                  if (_psycheAddingType != null && !personasExpanded) {
-                    _psycheExpanded.add('psyche_personas');
+    return GestureDetector(
+      onSecondaryTapDown: (details) =>
+          _showVisualizerEntityContextMenu(context, rel, parentRel, loc.name, details),
+      child: InkWell(
+        onTap: () => _navigateToEntity(rel),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          padding: EdgeInsets.fromLTRB(indent, 7, 8, 7),
+          decoration: BoxDecoration(
+            color: isSelected ? accent.withOpacity(0.10) : Colors.transparent,
+            border: Border(
+              left: BorderSide(color: isSelected ? accent : Colors.transparent, width: 2),
+            ),
+          ),
+          child: Row(children: [
+            if (hasKids)
+              InkWell(
+                onTap: () => setState(() {
+                  if (collapsed) {
+                    _entityTreeCollapsed.remove(rel);
+                  } else {
+                    _entityTreeCollapsed.add(rel);
                   }
-                })),
-            if (_psycheAddingType == 'persona') _psycheAddRow('persona'),
-            if (personasExpanded) ...[
-              if (personas.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.only(left: 30, top: 8, bottom: 8),
-                  child: Text('No personas yet',
-                      style: TextStyle(color: Colors.white24, fontSize: 11)),
-                )
-              else
-                ...personas.map((p) => _psycheChild(
-                    'psyche_persona/$p', p, Icons.theater_comedy_outlined)),
-            ],
-
-            const SizedBox(height: 2),
-
-            _sectionHeader('psyche_complexes', 'Complexes',
-                Icons.blur_circular_outlined, complexesExpanded,
-                onAdd: () => setState(() {
-                  _psycheAddingType = _psycheAddingType == 'complex' ? null : 'complex';
-                  _psycheAddingCtrl.clear();
-                  if (_psycheAddingType != null && !complexesExpanded) {
-                    _psycheExpanded.add('psyche_complexes');
-                  }
-                })),
-            if (_psycheAddingType == 'complex') _psycheAddRow('complex'),
-            if (complexesExpanded) ...[
-              if (complexes.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.only(left: 30, top: 8, bottom: 8),
-                  child: Text('No complexes yet',
-                      style: TextStyle(color: Colors.white24, fontSize: 11)),
-                )
-              else
-                ...complexes.map((c) => _psycheChild(
-                    'psyche_complex/$c', c, Icons.blur_circular_outlined)),
-            ],
-          ],
+                }),
+                child: Icon(
+                  collapsed
+                      ? Icons.keyboard_arrow_right_rounded
+                      : Icons.keyboard_arrow_down_rounded,
+                  size: 14,
+                  color: Colors.white24,
+                ),
+              )
+            else
+              const SizedBox(width: 14),
+            const SizedBox(width: 4),
+            leading,
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                loc.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: isSelected ? Colors.white : Colors.white70,
+                  fontWeight: isSelected ? FontWeight.w500 : FontWeight.normal,
+                ),
+              ),
+            ),
+            GestureDetector(
+              onTapDown: (details) => _showEntityNodeMenu(details, rel, parentRel, loc),
+              child: Padding(
+                padding: const EdgeInsets.only(left: 4),
+                child: Icon(Icons.more_horiz_rounded, size: 12,
+                    color: Colors.white.withOpacity(0.15)),
+              ),
+            ),
+          ]),
         ),
       ),
+    );
+  }
 
-      // BOTTOM STACK — Self (pinned, thumb-zone, grows upward from tab bar)
-      selfWidget,
+  Future<void> _showEntityNodeMenu(
+      TapDownDetails details, String rel, String parentRel, EntityLoc loc) async {
+    final screenSize = MediaQuery.of(context).size;
+    final dx = details.globalPosition.dx;
+    final dy = details.globalPosition.dy;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+          dx, dy, screenSize.width - dx, screenSize.height - dy),
+      color: const Color(0xFF1E2124),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(color: Colors.white.withOpacity(0.08)),
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'settings',
+          height: 36,
+          child: _vizFileMenuRow(Icons.tune_rounded, 'Settings', Colors.white70),
+        ),
+        if (!loc.inline) ...[
+          const PopupMenuDivider(height: 1),
+          PopupMenuItem<String>(
+            value: 'delete',
+            height: 36,
+            child: _vizFileMenuRow(Icons.delete_outline_rounded, 'Delete', Colors.redAccent),
+          ),
+        ],
+      ],
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'settings') {
+      _showPsycheItemPicker(rel, loc.name);
+    } else if (choice == 'delete') {
+      await _confirmDeleteVisualizerEntry(parentRel, loc.name, true, '$_genRoot/$rel');
+    }
+  }
+
+  Widget _entityTreeSection(String key, String label, IconData icon, bool expanded, int depth,
+      {VoidCallback? onAdd}) {
+    return InkWell(
+      onTap: () => setState(() {
+        if (expanded) {
+          _entityTreeCollapsed.add(key);
+        } else {
+          _entityTreeCollapsed.remove(key);
+        }
+      }),
+      child: Container(
+        padding: EdgeInsets.fromLTRB(10.0 + depth * 14.0, 8, 10, 8),
+        child: Row(children: [
+          Icon(icon, size: 12, color: Colors.white30),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              label.toUpperCase(),
+              style: const TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                color: Colors.white30,
+                letterSpacing: 1.1,
+              ),
+            ),
+          ),
+          if (onAdd != null)
+            InkWell(
+              onTap: onAdd,
+              borderRadius: BorderRadius.circular(3),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 3, vertical: 2),
+                child: Icon(Icons.add_rounded, size: 13, color: Colors.white38),
+              ),
+            ),
+          const SizedBox(width: 2),
+          Icon(
+            expanded ? Icons.keyboard_arrow_down_rounded : Icons.keyboard_arrow_right_rounded,
+            size: 14,
+            color: Colors.white24,
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _entityAddRow(String typeId, String parentDir, int depth) {
+    final label = _typeRegistry[typeId]?.label ?? 'Item';
+    Future<void> submit() async {
+      final name = _psycheAddingCtrl.text.trim();
+      if (name.isNotEmpty) {
+        await _scaffoldEntity(typeId, name, parentDir: parentDir);
+        await _loadVisualizerChildren();
+      }
+      if (!mounted) return;
+      setState(() {
+        _entityAddingKey = null;
+        _psycheAddingCtrl.clear();
+      });
+    }
+
+    return Container(
+      padding: EdgeInsets.fromLTRB(10.0 + depth * 14.0, 6, 10, 6),
+      color: const Color(0xFF141414),
+      child: Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _psycheAddingCtrl,
+            autofocus: true,
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+            decoration: InputDecoration(
+              hintText: '$label name…',
+              hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              filled: true,
+              fillColor: Colors.white10,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(5),
+                borderSide: BorderSide.none,
+              ),
+            ),
+            onSubmitted: (_) => submit(),
+          ),
+        ),
+        const SizedBox(width: 4),
+        InkWell(
+          onTap: submit,
+          borderRadius: BorderRadius.circular(4),
+          child: const Padding(
+            padding: EdgeInsets.all(4),
+            child: Icon(Icons.check_rounded, size: 14, color: Colors.blueAccent),
+          ),
+        ),
+        InkWell(
+          onTap: () => setState(() {
+            _entityAddingKey = null;
+            _psycheAddingCtrl.clear();
+          }),
+          borderRadius: BorderRadius.circular(4),
+          child: const Padding(
+            padding: EdgeInsets.all(4),
+            child: Icon(Icons.close_rounded, size: 14, color: Colors.white38),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── Entity tabs (driven by the type's `tabs`) ─────────────────────────────
+
+  Future<void> _openPersonFile(String path) async {
+    if (_personFileOpenPath == path && _personFileNote != null) return;
+    var text = '';
+    try {
+      final f = File(path);
+      if (await f.exists()) text = await f.readAsString();
+    } catch (e) {
+      debugPrint('_openPersonFile ERROR: $e');
+    }
+    final fileName = path.split('/').last;
+    final title = fileName.endsWith('.md')
+        ? fileName.substring(0, fileName.length - 3)
+        : fileName;
+    if (!mounted) return;
+    setState(() {
+      _personFileOpenPath = path;
+      _personFileNote = Note(
+        id: 'person_file:${path.hashCode.abs()}',
+        type: NoteType.common,
+        title: title,
+        content: text,
+      );
+    });
+  }
+
+  Widget _buildPersonFileEditor() {
+    return _NotesEditor(
+      key: ValueKey(_personFileOpenPath),
+      note: _personFileNote,
+      projects: _projects,
+      projectIcons: _projectIcons,
+      allTasks: _allTasks,
+      onNoteChanged: (updatedNote, {String? oldTitle}) async {
+        setState(() => _personFileNote = updatedNote);
+        if (_personFileOpenPath != null) {
+          try {
+            await File(_personFileOpenPath!).writeAsString(updatedNote.content);
+          } catch (e) {
+            debugPrint('person file save error: $e');
+          }
+        }
+      },
+    );
+  }
+
+  /// File tree on the left, markdown editor on the right, rooted at [rootPath].
+  Widget _buildFilesSplit(String rootPath) {
+    return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      SizedBox(
+        width: 220,
+        child: Container(
+          decoration: const BoxDecoration(
+            border: Border(right: BorderSide(color: Color(0xFF2C2F32), width: 1)),
+          ),
+          child: _buildPersonFileBrowser(rootPath),
+        ),
+      ),
+      Expanded(
+        child: _personFileNote == null
+            ? const Center(
+                child: Text(
+                  'Select a .md file to edit',
+                  style: TextStyle(color: Colors.white24, fontSize: 13),
+                ),
+              )
+            : _buildPersonFileEditor(),
+      ),
     ]);
   }
 
-  /// Deletes a Persona or Complex directory after user confirmation.
-  /// Guards against deleting -Ego (the built-in Self complex).
-  Future<void> _deletePsycheItem(String path, String label) async {
-    final parts = path.split('/');
-    if (parts.length < 2) return;
-    final type = parts[0]; // 'psyche_persona' | 'psyche_complex'
-    final name = parts[1];
-
-    // Protect the built-in Self (-Ego) complex from deletion.
-    if (type == 'psyche_complex' && name == '-Ego') {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              '‑Ego is a protected item and cannot be deleted.',
-              style: TextStyle(fontSize: 12),
-            ),
-            duration: Duration(seconds: 3),
-            backgroundColor: Color(0xFF2A2D31),
+  Widget _entityTabEmpty(IconData icon, String text) => Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, size: 36, color: Colors.white10),
+          const SizedBox(height: 10),
+          Text(
+            text,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white24, fontSize: 13, height: 1.5),
           ),
+        ]),
+      );
+
+  Widget _entityListRow({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    String? badge,
+    Widget? trailing,
+    VoidCallback? onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      hoverColor: Colors.white.withOpacity(0.03),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        child: Row(children: [
+          Icon(icon, size: 16, color: Colors.white38),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+              if (subtitle != null && subtitle.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white30, fontSize: 11)),
+                ),
+            ]),
+          ),
+          if (badge != null && badge.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(badge,
+                  style: const TextStyle(color: Colors.white54, fontSize: 10)),
+            ),
+          if (trailing != null) ...[
+            const SizedBox(width: 8),
+            trailing,
+          ],
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildEntityTabView(EntityLoc loc, TabDef tab) {
+    switch (tab.kind) {
+      case 'folder':
+        return _buildFilesSplit('${loc.dir}/${tab.path ?? ''}');
+      case 'markdown':
+        return _buildEntityMarkdownTab(loc, tab);
+      case 'children':
+        return _buildEntityChildrenTab(loc, tab);
+      case 'connections':
+        return _buildEntityConnectionsTab(loc);
+      case 'works':
+        return _buildEntityWorksTab(loc, tab);
+      case 'properties':
+        return EntityPropertiesView(
+          key: ValueKey('props:${loc.rel}'),
+          loc: loc,
+          locator: _entityLocator,
+          exportsRoot: '${_wsFilesDir(_workspaceId)}/exports',
         );
-      }
-      return;
+      default:
+        return _entityTabEmpty(Icons.tab_outlined, 'Unsupported tab kind: ${tab.kind}');
     }
+  }
 
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final absPath = type == 'psyche_persona'
-        ? '$filesRoot/My Psyche/Personas/$name'
-        : '$filesRoot/My Psyche/Complexes/$name';
+  Widget _buildEntityMarkdownTab(EntityLoc loc, TabDef tab) {
+    final path = loc.pathOfFile(tab.bind ?? '');
+    if (path == null) {
+      return _entityTabEmpty(Icons.notes_rounded, 'No file bound to this tab.');
+    }
+    if (_personFileOpenPath != path) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _personFileOpenPath != path) _openPersonFile(path);
+      });
+    }
+    if (_personFileNote == null || _personFileOpenPath != path) {
+      return const Center(
+          child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
+    }
+    return _buildPersonFileEditor();
+  }
 
-    final typeName = type == 'psyche_persona' ? 'Persona' : 'Complex';
-    final confirmed = await showDialog<bool>(
+  Widget _buildEntityChildrenTab(EntityLoc loc, TabDef tab) {
+    final slot = loc.def.slotByFolder(tab.slot ?? '');
+    final childDef = slot == null ? null : _typeRegistry[slot.type];
+    if (slot == null || childDef == null) {
+      return _entityTabEmpty(Icons.account_tree_outlined, 'Unknown slot "${tab.slot}".');
+    }
+    final icon = _iconFromName(childDef.icon);
+    if (slot.isOne) {
+      return ListView(children: [
+        _entityListRow(
+          icon: icon,
+          title: slot.folder,
+          subtitle: childDef.label,
+          onTap: () => _navigateToEntity('${loc.rel}/${slot.folder}'),
+        ),
+      ]);
+    }
+    final key = '${loc.rel}/${slot.folder}';
+    final names = _visualizerChildren[key] ?? const <String>[];
+    if (names.isEmpty) {
+      return _entityTabEmpty(
+          icon, 'No ${childDef.label.toLowerCase()} yet.\nUse + in the sidebar tree to add one.');
+    }
+    return ListView(children: [
+      for (final n in names)
+        _entityListRow(
+          icon: icon,
+          title: n,
+          subtitle: childDef.label,
+          onTap: () => _navigateToEntity('$key/$n'),
+        ),
+    ]);
+  }
+
+  Widget _buildEntityConnectionsTab(EntityLoc loc) {
+    return FutureBuilder<List<ResolvedConnection>>(
+      key: ValueKey('conn:${loc.rel}:$_entityTabRefresh'),
+      future: _entityTabFuture<List<ResolvedConnection>>(
+        'conn:${loc.rel}:$_entityTabRefresh',
+        () => EntityIndex.build(_entityLocator).then((idx) => idx.connectionsOf(loc.rel)),
+      ),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
+        }
+        final list = snap.data ?? const <ResolvedConnection>[];
+        if (list.isEmpty) {
+          return _entityTabEmpty(
+            Icons.hub_outlined,
+            'No connections yet.\nDeclare them in this entity\'s anchor file:\nconnections: [{ref: <id>, label: ...}]',
+          );
+        }
+        return ListView(children: [
+          for (final c in list)
+            Builder(builder: (_) {
+              final other = c.other;
+              final otherDef = other == null ? null : _typeRegistry[other.typeId];
+              return _entityListRow(
+                icon: _iconFromName(otherDef?.icon ?? ''),
+                title: other?.name ?? '(missing entity)',
+                subtitle: otherDef?.label,
+                badge: c.label,
+                trailing: Icon(
+                  c.incoming ? Icons.call_received_rounded : Icons.call_made_rounded,
+                  size: 14,
+                  color: Colors.white30,
+                ),
+                onTap: other == null ? null : () => _navigateToEntity(other.rel),
+              );
+            }),
+        ]);
+      },
+    );
+  }
+
+  Widget _buildEntityWorksTab(EntityLoc loc, TabDef tab) {
+    final anchor = loc.anchorPath;
+    String? entityId;
+    if (anchor != null && File(anchor).existsSync()) {
+      entityId = readFrontmatter(File(anchor).readAsStringSync())['id']?.toString();
+    }
+    if (entityId == null || entityId.isEmpty) {
+      return _entityTabEmpty(
+          Icons.auto_stories_outlined, 'This entity has no id in its anchor file yet.');
+    }
+    final String id = entityId;
+    final worksRoot = '${_wsFilesDir(_workspaceId)}/${tab.from ?? 'vault/works'}';
+    return FutureBuilder<List<String>>(
+      key: ValueKey('works:${loc.rel}:$_entityTabRefresh'),
+      future: _entityTabFuture<List<String>>(
+        'works:${loc.rel}:$_entityTabRefresh',
+        () => WorksLinks.linkedTo(worksRoot, id),
+      ),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
+        }
+        final files = snap.data ?? const <String>[];
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 8, 12, 8),
+            decoration: const BoxDecoration(
+              border: Border(bottom: BorderSide(color: Colors.white10)),
+            ),
+            child: Row(children: [
+              Expanded(
+                child: Text(
+                  '${files.length} linked ${files.length == 1 ? 'file' : 'files'}',
+                  style: const TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+              ),
+              TextButton.icon(
+                style: TextButton.styleFrom(foregroundColor: Colors.white54),
+                onPressed: () => _showLinkWorkDialog(worksRoot, id),
+                icon: const Icon(Icons.add_rounded, size: 14),
+                label: const Text('Link file', style: TextStyle(fontSize: 12)),
+              ),
+            ]),
+          ),
+          Expanded(
+            child: files.isEmpty
+                ? _entityTabEmpty(
+                    Icons.auto_stories_outlined,
+                    'No linked works yet.\nUse "Link file" to attach files from Vault > Works.',
+                  )
+                : ListView(children: [
+                    for (final p in files)
+                      _entityListRow(
+                        icon: _visualizerEntryIcon(p.split('/').last, false),
+                        title: p.split('/').last,
+                        subtitle: p.substring(worksRoot.length + 1),
+                        onTap: () => _openWithSystemApp(p),
+                        trailing: InkWell(
+                          onTap: () async {
+                            await WorksLinks.unlink(p, id);
+                            if (mounted) setState(() => _entityTabRefresh++);
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.all(4),
+                            child: Icon(Icons.link_off_rounded, size: 15, color: Colors.white30),
+                          ),
+                        ),
+                      ),
+                  ]),
+          ),
+        ]);
+      },
+    );
+  }
+
+  Future<void> _showLinkWorkDialog(String worksRoot, String entityId) async {
+    final all = await WorksLinks.allFiles(worksRoot);
+    final linked = (await WorksLinks.linkedTo(worksRoot, entityId)).toSet();
+    if (!mounted) return;
+    final candidates = [for (final p in all) if (!linked.contains(p)) p];
+    final picked = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2124),
@@ -32837,47 +32745,45 @@ persona: $personaName
           borderRadius: BorderRadius.circular(10),
           side: BorderSide(color: Colors.white.withOpacity(0.08)),
         ),
-        title: Text(
-          'Delete $typeName',
-          style: const TextStyle(
-              color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600),
+        title: const Text(
+          'Link a file from Works',
+          style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600),
         ),
-        content: Text(
-          'Delete "$label"? This cannot be undone.',
-          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        content: SizedBox(
+          width: 440,
+          height: 340,
+          child: candidates.isEmpty
+              ? const Center(
+                  child: Text('No files to link.',
+                      style: TextStyle(color: Colors.white38, fontSize: 13)),
+                )
+              : ListView(children: [
+                  for (final p in candidates)
+                    InkWell(
+                      onTap: () => Navigator.of(ctx).pop(p),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                        child: Text(
+                          p.substring(worksRoot.length + 1),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white70, fontSize: 12.5),
+                        ),
+                      ),
+                    ),
+                ]),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
+            onPressed: () => Navigator.of(ctx).pop(),
             child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
           ),
         ],
       ),
     );
-    if (confirmed != true || !mounted) return;
-    try {
-      await Directory(absPath).delete(recursive: true);
-    } catch (e) {
-      debugPrint('_deletePsycheItem error: $e');
-    }
-    // Clear selection and cached appearance data for the deleted item.
-    if (_visualizerSelectedPath == path) {
-      setState(() {
-        _visualizerSelectedPath = '';
-        _visualizerMdContent = '';
-        _personCanvas = {};
-      });
-    }
-    setState(() {
-      _psycheIcons.remove(path);
-      _psycheColors.remove(path);
-    });
-    _saveWorkspace();
-    await _loadVisualizerChildren();
+    if (picked == null || !mounted) return;
+    await WorksLinks.link(picked, entityId);
+    if (mounted) setState(() => _entityTabRefresh++);
   }
 
   /// Lightweight icon + color picker dialog for psyche items.
@@ -32915,28 +32821,27 @@ persona: $personaName
   }
 
   Widget _buildVisualizerMainArea() {
-    final sectionLabel = switch (_visualizerSection) {
-      'my_psyche'            => 'My Psyche',
-      'persons'              => 'Persons',
-      'works'                => 'Works',
-      'places'               => 'Places',
-      'projects'             => 'Projects',
-      'personal_memory'      => 'Personal Memory',
-      'events'               => 'Events',
-      'public_interactions'  => 'Public Interactions',
-      _                      => _visualizerSection,
-    };
-    final sectionIcon = switch (_visualizerSection) {
-      'my_psyche'            => Icons.psychology_outlined,
-      'persons'              => Icons.group_outlined,
-      'works'                => Icons.auto_stories_outlined,
-      'places'               => Icons.place_outlined,
-      'projects'             => Icons.folder_copy_outlined,
-      'personal_memory'      => Icons.photo_library_outlined,
-      'events'               => Icons.event_outlined,
-      'public_interactions'  => Icons.public_outlined,
-      _                      => Icons.account_tree_outlined,
-    };
+    if (_typeSettingsId != null && _typeRegistry[_typeSettingsId!] != null) {
+      return _buildTypeSettingsPage(_typeSettingsId!);
+    }
+    final String mSection = _visualizerSelectedPath.isEmpty
+        ? _visualizerSection
+        : (_typeRegistry.rootByFolder(_visualizerSelectedPath.split('/').first)?.id ??
+            _visualizerSelectedPath.split('/').first);
+    final EntityTypeDef? mDef = _typeRegistry[mSection];
+    final String sectionLabel = mDef?.label ??
+        (mSection == 'works'
+            ? 'Works'
+            : mSection == 'personal_memory'
+                ? 'Personal Memory'
+                : mSection);
+    final IconData sectionIcon = mDef != null
+        ? _iconFromName(mDef.icon)
+        : (mSection == 'works'
+            ? Icons.auto_stories_outlined
+            : mSection == 'personal_memory'
+                ? Icons.photo_library_outlined
+                : Icons.account_tree_outlined);
 
     // ── Compute content widget ─────────────────────────────────────────────
     final Widget content;
@@ -32950,9 +32855,7 @@ persona: $personaName
             Icon(sectionIcon, size: 48, color: Colors.white10),
             const SizedBox(height: 14),
             Text(
-              _visualizerSection == 'my_psyche'
-                  ? 'Select a part of your psyche'
-                  : 'Select a ${sectionLabel.toLowerCase().replaceAll('s', '').trim()} from the list',
+              'Select an item from $sectionLabel',
               style: const TextStyle(color: Colors.white24, fontSize: 13),
             ),
           ]),
@@ -32961,9 +32864,7 @@ persona: $personaName
     } else {
       final cat = _visualizerSelectedPath.split('/').first;
 
-      if (cat == 'Self' || cat == 'other_persons' ||
-          cat == 'places' || cat == 'events' || cat == 'public_interactions' ||
-          cat == 'psyche_complex' || cat == 'psyche_persona') {
+      if (!_isVaultCat(cat) && _entityLocator.locate(_visualizerSelectedPath) != null) {
         // Person/entity canvas view — tab routing happens inside _buildPersonCanvas()
         content = _buildPersonCanvas();
       } else if (cat == 'works' || cat == 'personal_memory') {
@@ -33034,7 +32935,7 @@ persona: $personaName
   /// Detail pane for a selected Works or Personal Memory entry.
   Widget _buildFileMgrDetailView(String cat, IconData sectionIcon) {
     final itemName = _visualizerSelectedPath.split('/').last;
-    final filesRoot = _wsFilesDir(_workspaceId);
+    final filesRoot = _vaultRoot;
     final absPath = '$filesRoot/$cat/$itemName';
 
     // Determine entry type from metadata
@@ -33420,29 +33321,10 @@ persona: $personaName
 
   // ── Person canvas ──────────────────────────────────────────────────────────
 
-  Widget _buildPersonFileBrowser() {
-    if (_workspaceId.isEmpty || _visualizerSelectedPath.isEmpty) {
-      return const Center(child: Text('No person selected.', style: TextStyle(color: Colors.white24, fontSize: 13)));
+  Widget _buildPersonFileBrowser(String rootPath) {
+    if (_workspaceId.isEmpty || rootPath.isEmpty) {
+      return const Center(child: Text('Nothing selected.', style: TextStyle(color: Colors.white24, fontSize: 13)));
     }
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final parts = _visualizerSelectedPath.split('/');
-    final cat  = parts[0];
-    final name = parts.length > 1 ? parts[1] : '';
-    final rootPath = cat == 'Self'
-        ? '$filesRoot/My Psyche'
-        : cat == 'other_persons'
-            ? '$filesRoot/other_persons/$name'
-            : cat == 'places'
-                ? '$filesRoot/places/$name'
-                : cat == 'events'
-                    ? '$filesRoot/events/$name'
-                    : cat == 'public_interactions'
-                        ? '$filesRoot/public_interactions/$name'
-                        : cat == 'psyche_complex'
-                            ? '$filesRoot/My Psyche/Complexes/$name'
-                            : cat == 'psyche_persona'
-                                ? '$filesRoot/My Psyche/Personas/$name'
-                                : '$filesRoot/other_persons/$name';
 
     return FutureBuilder<_FsNode>(
       future: _buildFsTree(rootPath),
@@ -33458,22 +33340,7 @@ persona: $personaName
           nodes: tree.children,
           selectedPath: _personFileOpenPath,
           onOpenMd: (path) async {
-            if (_personFileOpenPath == path) return; // already open
-            final text = await File(path).readAsString();
-            final fileName = path.split('/').last;
-            final title = fileName.endsWith('.md')
-                ? fileName.substring(0, fileName.length - 3)
-                : fileName;
-            final noteId = 'person_file:${path.hashCode.abs()}';
-            setState(() {
-              _personFileOpenPath = path;
-              _personFileNote = Note(
-                id: noteId,
-                type: NoteType.common,
-                title: title,
-                content: text,
-              );
-            });
+            await _openPersonFile(path);
           },
         );
       },
@@ -33488,15 +33355,16 @@ persona: $personaName
     return Icons.insert_drive_file_outlined;
   }
 
-  Widget _personTabButton(String tab, IconData icon, String label, {bool enabled = true}) {
-    final active = _visualizerPersonTab == tab;
+  Widget _personTabButton(String tab, IconData icon, String label,
+      {bool enabled = true, int? badge}) {
+    final active = _activeTabFor(_visualizerSelectedPath.isEmpty ? null : _entityLocator.locate(_visualizerSelectedPath)).id == tab;
     final fg = !enabled
         ? Colors.white24
         : active
             ? Colors.blueAccent
             : Colors.white38;
     return GestureDetector(
-      onTap: enabled ? () => setState(() => _visualizerPersonTab = tab) : null,
+      onTap: enabled ? () => setState(() { _typeSettingsId = null; _visualizerPersonTab = tab; _personFileOpenPath = null; _personFileNote = null; }) : null,
       child: MouseRegion(
         cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
         child: AnimatedContainer(
@@ -33520,6 +33388,18 @@ persona: $personaName
               overflow: TextOverflow.visible,
               softWrap: false,
             ),
+            if (badge != null && badge > 0) ...[
+              const SizedBox(width: 5),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text('$badge',
+                    style: TextStyle(fontSize: 9.5, color: fg, fontWeight: FontWeight.w600)),
+              ),
+            ],
           ]),
         ),
       ),
@@ -33528,7 +33408,9 @@ persona: $personaName
 
   Widget _buildPersonCanvas() {
     final itemName = _visualizerSelectedPath.split('/').last;
-    final isSelf   = _visualizerSelectedPath.startsWith('Self/');
+    final isSelf   = false;
+    final pcLoc    = _entityLocator.locate(_visualizerSelectedPath);
+    final pcTab    = _activeTabFor(pcLoc);
     final blocks   = (_personCanvas['blocks'] as List<dynamic>?) ?? [];
     final headerH  = ((_personCanvas['header'] as Map?)?['h'] as num?)?.toDouble() ?? 120.0;
 
@@ -33537,48 +33419,10 @@ persona: $personaName
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
 
         // ── Tab content ───────────────────────────────────────────────────
-        if (_visualizerPersonTab == 'files')
-          Expanded(
-            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              // ── Left: file tree ──────────────────────────────────────────
-              SizedBox(
-                width: 220,
-                child: Container(
-                  decoration: const BoxDecoration(
-                    border: Border(right: BorderSide(color: Color(0xFF2C2F32), width: 1)),
-                  ),
-                  child: _buildPersonFileBrowser(),
-                ),
-              ),
-              // ── Right: editor (or placeholder) ───────────────────────────
-              Expanded(
-                child: _personFileNote == null
-                    ? const Center(
-                        child: Text(
-                          'Select a .md file to edit',
-                          style: TextStyle(color: Colors.white24, fontSize: 13),
-                        ),
-                      )
-                    : _NotesEditor(
-                        key: ValueKey(_personFileOpenPath),
-                        note: _personFileNote,
-                        projects: _projects,
-                        projectIcons: _projectIcons,
-                        allTasks: _allTasks,
-                        onNoteChanged: (updatedNote, {String? oldTitle}) async {
-                          setState(() => _personFileNote = updatedNote);
-                          if (_personFileOpenPath != null) {
-                            try {
-                              await File(_personFileOpenPath!).writeAsString(updatedNote.content);
-                            } catch (e) {
-                              debugPrint('person file save error: $e');
-                            }
-                          }
-                        },
-                      ),
-              ),
-            ]),
-          )
+        if (pcTab.kind == 'files')
+          Expanded(child: _buildFilesSplit(pcLoc?.dir ?? ''))
+        else if (pcTab.kind != 'profile' && pcLoc != null)
+          Expanded(child: _buildEntityTabView(pcLoc, pcTab))
         else
         Expanded(
           child: _personCanvas.isEmpty
@@ -33694,41 +33538,11 @@ persona: $personaName
 
   Widget _buildPersonHeaderBlock(String name, bool isSelf, double headerH, double canvasW) {
     final avatarPath = ''; // future: load from identity/assets/avatar.*
-    final pathCat = _visualizerSelectedPath.split('/').first;
-    final isPsycheComplex = pathCat == 'psyche_complex';
-    final isPsychePersona = pathCat == 'psyche_persona';
-    final isPsycheItem    = isPsycheComplex || isPsychePersona;
-    final isPlace         = pathCat == 'places';
-    final isEvent         = pathCat == 'events';
-    final isPI            = pathCat == 'public_interactions';
-
-    final avatarIcon = isPsycheComplex
-        ? Icons.blur_circular_outlined
-        : isPsychePersona
-            ? Icons.theater_comedy_outlined
-            : isSelf
-                ? Icons.self_improvement_rounded
-                : isPlace
-                    ? Icons.place_rounded
-                    : isEvent
-                        ? Icons.event_rounded
-                        : isPI
-                            ? Icons.public_rounded
-                            : Icons.person_rounded;
-
-    final subLabel = isSelf
-        ? 'You'
-        : isPsycheComplex
-            ? 'Complex'
-            : isPsychePersona
-                ? 'Persona'
-                : isPlace
-                    ? 'Place'
-                    : isEvent
-                        ? 'Event'
-                        : isPI
-                            ? 'Public Interaction'
-                            : 'Person';
+    final hdrLoc = _entityLocator.locate(_visualizerSelectedPath);
+    // Nested types (children of another type) keep the purple accent.
+    final isPsycheItem = hdrLoc != null && hdrLoc.rel.split('/').length > 2;
+    final avatarIcon = _iconFromName(hdrLoc?.def.icon ?? 'person_outline');
+    final subLabel = hdrLoc?.def.label ?? 'Person';
 
     return GestureDetector(
       onVerticalDragUpdate: _visualizerEditLayout ? (details) {
@@ -34227,25 +34041,7 @@ persona: $personaName
   Future<void> _pickBlockMdFile(String bid) async {
     // Derive the item's root folder so the picker opens there directly.
     // Mirrors the rootPath logic in _buildPersonFileBrowser().
-    final filesRoot = _wsFilesDir(_workspaceId);
-    final parts    = _visualizerSelectedPath.split('/');
-    final cat      = parts[0];
-    final name     = parts.length > 1 ? parts[1] : '';
-    final rootPath = cat == 'Self'
-        ? '$filesRoot/My Psyche'
-        : cat == 'other_persons'
-            ? '$filesRoot/other_persons/$name'
-            : cat == 'places'
-                ? '$filesRoot/places/$name'
-                : cat == 'events'
-                    ? '$filesRoot/events/$name'
-                    : cat == 'public_interactions'
-                        ? '$filesRoot/public_interactions/$name'
-                        : cat == 'psyche_complex'
-                            ? '$filesRoot/My Psyche/Complexes/$name'
-                            : cat == 'psyche_persona'
-                                ? '$filesRoot/My Psyche/Personas/$name'
-                                : '$filesRoot/other_persons/$name';
+    final rootPath = _entityLocator.locate(_visualizerSelectedPath)?.dir ?? '';
 
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -55632,7 +55428,7 @@ class _NotesSidebar extends StatefulWidget {
   final void Function(String noteId)? onDeleteNote;
 
   // ── Persons section (mirrors Visualizer > Persons > Files) ───────────────
-  /// Flat list of person entries: 'Self' or 'other_persons/<name>'
+  /// Flat list of person entries: 'person/<name>' (relative to generalized/)
   final List<String> personPaths;
   /// filesRoot used to resolve the absolute path of a person's .md file
   final String personsFilesRoot;
@@ -58372,9 +58168,7 @@ class _NotesSidebarState extends State<_NotesSidebar> {
                               if (nowExpanded && !_personTreeCache.containsKey(personPath)) {
                                 // Load and build tree for this person
                                 final root = widget.personsFilesRoot;
-                                final absPath = isSelf
-                                    ? '$root/My Psyche'
-                                    : '$root/other_persons/$personName';
+                                final absPath = '$root/$personPath';
                                 final tree = await _buildFsTree(absPath);
                                 if (mounted) setState(() => _personTreeCache[personPath] = tree);
                               }
@@ -79280,6 +79074,5499 @@ class _InternalClockCardState extends State<_InternalClockCard> {
           ],
         ],
       ),
+    );
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Entity types: registry, scaffold, locator, index, store, YAML writer
+// (antes em entity_types.dart)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// entity_types.dart
+//
+// Registro de tipos de entidade do Chaos Control: modelo, carga dos
+// `.types/*.yaml`, aplicador de padrão (scaffold), localizador de instâncias,
+// índice de conexões e vínculos de Works. Dart puro (sem Flutter).
+//
+// Layout em disco (relativo a files/):
+//   generalized/.types/<id>.yaml        definições dos tipos
+//   generalized/<folder>/<Instância>/   instâncias de tipos raiz
+//   generalized/<folder>/<I>/<slot>/…   instâncias de tipos filhos (aninhados)
+//
+// Um "rel" é o caminho de uma instância relativo a generalized/,
+// por exemplo `person/Odorico` ou `psyche/Myself/Complexes/-Ego`.
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilidades
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Mesma regra de `_fsSafe` do main.dart.
+String entityFsSafe(String s) => s
+    .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+    .trim()
+    .replaceAll(RegExp(r'\s+'), ' ');
+
+String newEntityId() {
+  final r = Random.secure();
+  return List.generate(16, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+}
+
+dynamic _plain(dynamic v) {
+  if (v is Map) return {for (final e in v.entries) e.key.toString(): _plain(e.value)};
+  if (v is List) return [for (final e in v) _plain(e)];
+  return v;
+}
+
+Map<String, dynamic> _asMap(dynamic v) =>
+    v is Map ? Map<String, dynamic>.from(_plain(v) as Map) : <String, dynamic>{};
+
+List<dynamic> _asList(dynamic v) => v is List ? List<dynamic>.from(_plain(v) as List) : <dynamic>[];
+
+String? _str(dynamic v) => v == null ? null : v.toString();
+
+String _cap(String s) => s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+
+/// Lê o frontmatter YAML (entre `---` e `---`) de um texto markdown.
+Map<String, dynamic> readFrontmatter(String text) {
+  final t = text.replaceAll('\r\n', '\n');
+  if (!t.startsWith('---\n')) return {};
+  final end = t.indexOf('\n---', 3);
+  if (end < 0) return {};
+  try {
+    return _asMap(loadYaml(t.substring(4, end)));
+  } catch (_) {
+    return {};
+  }
+}
+
+/// Corpo do markdown depois do frontmatter.
+String _bodyAfterFrontmatter(String text) {
+  final t = text.replaceAll('\r\n', '\n');
+  if (!t.startsWith('---\n')) return t;
+  final end = t.indexOf('\n---', 3);
+  if (end < 0) return t;
+  var rest = t.substring(end + 4);
+  if (rest.startsWith('\n')) rest = rest.substring(1);
+  return rest;
+}
+
+/// Frontmatter serializado em YAML de fluxo (JSON é YAML válido).
+String _writeFrontmatter(Map<String, dynamic> fm) {
+  final b = StringBuffer('---\n');
+  for (final e in fm.entries) {
+    b.writeln('${e.key}: ${jsonEncode(e.value)}');
+  }
+  b.write('---\n');
+  return b.toString();
+}
+
+/// Atualiza (ou remove, se [value] for null) uma chave do frontmatter de
+/// [path], preservando o corpo do markdown. Cria o arquivo se não existir.
+Future<void> updateFrontmatterKey(String path, String key, dynamic value) async {
+  final f = File(path);
+  var fm = <String, dynamic>{};
+  var body = '';
+  if (await f.exists()) {
+    final text = await f.readAsString();
+    fm = readFrontmatter(text);
+    body = _bodyAfterFrontmatter(text);
+  }
+  if (value == null) {
+    fm.remove(key);
+  } else {
+    fm[key] = value;
+  }
+  await f.parent.create(recursive: true);
+  await f.writeAsString('${_writeFrontmatter(fm)}$body');
+}
+
+/// Uma propriedade aparece no editor da aba Properties? `connections` e
+/// `ref_list` têm aba própria; fórmulas só aparecem (somente leitura) se
+/// tiverem `label`.
+bool propertyIsEditable(Map<String, dynamic> p) {
+  final key = _str(p['key']) ?? '';
+  final type = _str(p['type']) ?? 'text';
+  if (key.isEmpty || key == 'connections' || type == 'ref_list') return false;
+  if (type == 'formula') return (_str(p['label']) ?? '').isNotEmpty;
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modelo
+// ─────────────────────────────────────────────────────────────────────────────
+
+class TabDef {
+  final String id;
+  final String kind; // profile | files | folder | works | connections | children | markdown
+  final String title;
+  final String? path, perspective, from, linkedTo, bind, slot;
+  final List<String> source;
+  final bool badgeCount;
+  const TabDef({
+    required this.id,
+    required this.kind,
+    required this.title,
+    this.path,
+    this.perspective,
+    this.from,
+    this.linkedTo,
+    this.bind,
+    this.slot,
+    this.source = const [],
+    this.badgeCount = false,
+  });
+
+  factory TabDef.fromMap(Map<String, dynamic> m) {
+    final id = _str(m['id']) ?? _str(m['kind']) ?? 'tab';
+    final kind = _str(m['kind']) ?? id;
+    return TabDef(
+      id: id,
+      kind: kind,
+      title: _str(m['title']) ?? _cap(id),
+      path: _str(m['path']),
+      perspective: _str(m['perspective']),
+      from: _str(m['from']),
+      linkedTo: _str(m['linked_to']),
+      bind: _str(m['bind']),
+      slot: _str(m['slot']),
+      source: [for (final s in _asList(m['source'])) s.toString()],
+      badgeCount: _str(m['badge']) == 'count',
+    );
+  }
+}
+
+class FileDef {
+  final String? id, role;
+  final String path, content;
+  const FileDef({this.id, this.role, required this.path, this.content = ''});
+  factory FileDef.fromMap(Map<String, dynamic> m) => FileDef(
+        id: _str(m['id']),
+        role: _str(m['role']),
+        path: _str(m['path']) ?? '',
+        content: _str(m['content']) ?? '',
+      );
+}
+
+class BlockDef {
+  final String id, kind, title;
+  final String? bind;
+  final double x, y, w, h;
+  const BlockDef({
+    required this.id,
+    required this.kind,
+    required this.title,
+    this.bind,
+    this.x = 0.015,
+    this.y = 0,
+    this.w = 0.97,
+    this.h = 400,
+  });
+  factory BlockDef.fromMap(Map<String, dynamic> m) {
+    final l = _asMap(m['layout']);
+    double d(dynamic v, double def) => v is num ? v.toDouble() : def;
+    return BlockDef(
+      id: _str(m['id']) ?? 'b',
+      kind: _str(m['kind']) ?? 'markdown',
+      title: _str(m['title']) ?? '',
+      bind: _str(m['bind']),
+      x: d(l['x'], 0.015),
+      y: d(l['y'], 0),
+      w: d(l['w'], 0.97),
+      h: d(l['h'], 400),
+    );
+  }
+}
+
+class PatternDef {
+  final List<String> dirs;
+  final List<FileDef> files;
+  final List<TabDef> tabs;
+  final List<BlockDef> blocks;
+  final double headerH;
+  const PatternDef({
+    this.dirs = const [],
+    this.files = const [],
+    this.tabs = const [],
+    this.blocks = const [],
+    this.headerH = 120,
+  });
+
+  static const List<Map<String, dynamic>> _universal = [
+    {'id': 'profile', 'kind': 'profile'},
+    {'id': 'files', 'kind': 'files'},
+  ];
+
+  factory PatternDef.fromMap(Map<String, dynamic> m, {Map<String, dynamic>? profileOverride, List<dynamic>? tabsOverride}) {
+    final profile = _asMap(profileOverride ?? m['profile']);
+    final rawTabs = tabsOverride ?? _asList(m['tabs']);
+    final others = <TabDef>[];
+    for (final t in rawTabs) {
+      final td = TabDef.fromMap(_asMap(t));
+      if (td.kind == 'profile' || td.kind == 'files') continue;
+      others.add(td);
+    }
+    final tabs = <TabDef>[
+      for (final u in _universal) TabDef.fromMap(Map<String, dynamic>.from(u)),
+      ...others,
+    ];
+    final h = _asMap(profile['header'])['h'];
+    return PatternDef(
+      dirs: [for (final d in _asList(m['dirs'])) d.toString()],
+      files: [for (final f in _asList(m['files'])) FileDef.fromMap(_asMap(f))],
+      tabs: tabs,
+      blocks: [for (final b in _asList(profile['blocks'])) BlockDef.fromMap(_asMap(b))],
+      headerH: h is num ? h.toDouble() : 120,
+    );
+  }
+
+  FileDef? fileById(String id) {
+    for (final f in files) {
+      if (f.id == id) return f;
+    }
+    return null;
+  }
+
+  FileDef? get anchor {
+    for (final f in files) {
+      if (f.role == 'anchor' || f.id == 'anchor') return f;
+    }
+    return null;
+  }
+}
+
+class ChildSlot {
+  final String type, folder, cardinality;
+  const ChildSlot({required this.type, required this.folder, this.cardinality = 'many'});
+  bool get isOne => cardinality == 'one';
+}
+
+class EntityTypeDef {
+  final String id, label, icon, description;
+  final String? folder;
+  final bool isAbstract;
+  final Map<String, PatternDef> patterns; // 'default' + variantes
+  final List<Map<String, dynamic>> properties;
+  final List<Map<String, dynamic>> exports;
+  final List<ChildSlot> children;
+  const EntityTypeDef({
+    required this.id,
+    required this.label,
+    required this.icon,
+    this.description = '',
+    this.folder,
+    this.isAbstract = false,
+    this.patterns = const {},
+    this.properties = const [],
+    this.exports = const [],
+    this.children = const [],
+  });
+
+  PatternDef get defaultPattern => patterns['default'] ?? const PatternDef();
+  PatternDef patternFor(String variant) => patterns[variant] ?? defaultPattern;
+  ChildSlot? slotByFolder(String folder) {
+    for (final s in children) {
+      if (s.folder == folder) return s;
+    }
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registro
+// ─────────────────────────────────────────────────────────────────────────────
+
+class EntityTypeRegistry {
+  final Map<String, EntityTypeDef> types;
+  final List<String> errors;
+  const EntityTypeRegistry(this.types, [this.errors = const []]);
+  static const EntityTypeRegistry empty = EntityTypeRegistry({});
+
+  bool get isEmpty => types.isEmpty;
+  EntityTypeDef? operator [](String id) => types[id];
+
+  Set<String> get _childTypeIds => {
+        for (final t in types.values) for (final c in t.children) c.type,
+      };
+
+  /// Tipos que aparecem como seção da barra lateral (têm pasta própria e não
+  /// são filhos de nenhum outro tipo), ordenados por rótulo.
+  List<EntityTypeDef> get rootTypes {
+    final child = _childTypeIds;
+    final list = [
+      for (final t in types.values)
+        if (!t.isAbstract && t.folder != null && !child.contains(t.id)) t,
+    ];
+    list.sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
+    return list;
+  }
+
+  EntityTypeDef? rootByFolder(String folder) {
+    for (final t in rootTypes) {
+      if (t.folder == folder) return t;
+    }
+    return null;
+  }
+
+  static Future<EntityTypeRegistry> load(String typesDir) async {
+    final raws = <String, Map<String, dynamic>>{};
+    final errors = <String>[];
+    final dir = Directory(typesDir);
+    if (!await dir.exists()) return const EntityTypeRegistry({});
+    await for (final e in dir.list()) {
+      if (e is! File || !e.path.endsWith('.yaml')) continue;
+      try {
+        final m = _asMap(loadYaml(await e.readAsString()));
+        final id = _str(m['id']);
+        if (id == null || id.isEmpty) throw FormatException('sem id');
+        raws[id] = m;
+      } catch (err) {
+        errors.add('${e.path}: $err');
+      }
+    }
+    return fromRaws(raws, errors);
+  }
+
+  /// Constrói o registro a partir de definições cruas (id → mapa YAML).
+  static EntityTypeRegistry fromRaws(Map<String, Map<String, dynamic>> raws,
+      [List<String> errors = const []]) {
+    final errs = <String>[...errors];
+    final out = <String, EntityTypeDef>{};
+    for (final id in raws.keys) {
+      try {
+        out[id] = _build(id, raws, {});
+      } catch (err) {
+        errs.add('$id: $err');
+      }
+    }
+    return EntityTypeRegistry(out, errs);
+  }
+
+  // ── resolução de `extends` ────────────────────────────────────────────────
+
+  static Map<String, dynamic> _flatten(String id, Map<String, Map<String, dynamic>> raws, Set<String> stack) {
+    if (stack.contains(id)) throw StateError('ciclo em extends: $id');
+    final raw = raws[id];
+    if (raw == null) throw StateError('tipo inexistente: $id');
+    final parentId = _str(raw['extends']);
+    if (parentId == null) return raw;
+    final base = _flatten(parentId, raws, {...stack, id});
+    return _merge(base, raw);
+  }
+
+  static Map<String, dynamic> _merge(Map<String, dynamic> base, Map<String, dynamic> child) {
+    final m = <String, dynamic>{...base, ...child};
+    m.remove('extends');
+    // pattern: dirs em união, files mesclados por id
+    final pb = _asMap(base['pattern']), pc = _asMap(child['pattern']);
+    final dirs = <String>{
+      for (final d in _asList(pb['dirs'])) d.toString(),
+      for (final d in _asList(pc['dirs'])) d.toString(),
+    }.toList();
+    final files = <Map<String, dynamic>>[];
+    void addFile(Map<String, dynamic> f) {
+      final id = _str(f['id']);
+      if (id != null) {
+        final i = files.indexWhere((x) => _str(x['id']) == id);
+        if (i >= 0) {
+          files[i] = f;
+          return;
+        }
+      }
+      files.add(f);
+    }
+
+    for (final f in _asList(pb['files'])) addFile(_asMap(f));
+    for (final f in _asList(pc['files'])) addFile(_asMap(f));
+    m['pattern'] = {'dirs': dirs, 'files': files};
+    // properties por key
+    final props = <Map<String, dynamic>>[];
+    for (final p in [..._asList(base['properties']), ..._asList(child['properties'])]) {
+      final pm = _asMap(p);
+      final i = props.indexWhere((x) => x['key'] == pm['key']);
+      if (i >= 0) {
+        props[i] = pm;
+      } else {
+        props.add(pm);
+      }
+    }
+    m['properties'] = props;
+    m['exports'] = [..._asList(base['exports']), ..._asList(child['exports'])];
+    // abstract não é herdado
+    m['abstract'] = child['abstract'] ?? false;
+    return m;
+  }
+
+  static EntityTypeDef _build(String id, Map<String, Map<String, dynamic>> raws, Set<String> stack) {
+    final m = _flatten(id, raws, stack);
+    final patterns = <String, PatternDef>{};
+    if (m['patterns'] is Map) {
+      for (final e in _asMap(m['patterns']).entries) {
+        patterns[e.key] = PatternDef.fromMap(_asMap(e.value));
+      }
+      patterns.putIfAbsent('default', () => const PatternDef(tabs: []));
+    } else {
+      patterns['default'] = PatternDef.fromMap(_asMap(m['pattern']),
+          profileOverride: _asMap(m['profile']), tabsOverride: _asList(m['tabs']));
+    }
+    // garante abas universais em padrões sem `tabs`
+    final fixed = <String, PatternDef>{};
+    patterns.forEach((k, p) {
+      fixed[k] = p.tabs.isEmpty
+          ? PatternDef(
+              dirs: p.dirs,
+              files: p.files,
+              tabs: PatternDef.fromMap(const {}).tabs,
+              blocks: p.blocks,
+              headerH: p.headerH)
+          : p;
+    });
+    // Tipos com propriedades editáveis ganham a aba Properties (depois de
+    // Profile e Files), salvo se o YAML já declarar uma aba `kind: properties`.
+    if (_asList(m['properties']).any((p) => propertyIsEditable(_asMap(p)))) {
+      fixed.updateAll((k, p) {
+        if (p.tabs.any((t) => t.kind == 'properties')) return p;
+        final tabs = <TabDef>[...p.tabs];
+        final at = tabs.length < 2 ? tabs.length : 2;
+        tabs.insert(at, const TabDef(id: 'properties', kind: 'properties', title: 'Properties'));
+        return PatternDef(
+            dirs: p.dirs, files: p.files, tabs: tabs, blocks: p.blocks, headerH: p.headerH);
+      });
+    }
+    return EntityTypeDef(
+      id: id,
+      label: _str(m['label']) ?? _cap(id),
+      icon: _str(m['icon']) ?? 'category_outlined',
+      description: _str(m['description']) ?? '',
+      folder: _str(m['folder']),
+      isAbstract: m['abstract'] == true,
+      patterns: fixed,
+      properties: [for (final p in _asList(m['properties'])) _asMap(p)],
+      exports: [for (final p in _asList(m['exports'])) _asMap(p)],
+      children: [
+        for (final c in _asList(m['children']))
+          ChildSlot(
+            type: _str(_asMap(c)['type']) ?? '',
+            folder: _str(_asMap(c)['folder']) ?? '',
+            cardinality: _str(_asMap(c)['cardinality']) ?? 'many',
+          ),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Localizador de instâncias
+// ─────────────────────────────────────────────────────────────────────────────
+
+class EntityLoc {
+  final EntityTypeDef def;
+  final String dir; // caminho absoluto da instância
+  final String name; // nome de exibição (segmento da pasta)
+  final String rel; // relativo a generalized/
+  final String variant;
+  final bool inline; // true quando a pasta do slot (cardinality one) é a própria instância
+  const EntityLoc({
+    required this.def,
+    required this.dir,
+    required this.name,
+    required this.rel,
+    required this.variant,
+    this.inline = false,
+  });
+
+  PatternDef get pattern => def.patternFor(variant);
+  String get safe => entityFsSafe(name);
+
+  String _sub(String s) => s.replaceAll('{safe}', safe).replaceAll('{name}', name);
+
+  /// Caminho absoluto do arquivo do padrão com este [fileId] (ex.: `anchor`).
+  String? pathOfFile(String fileId) {
+    final f = pattern.fileById(fileId);
+    return f == null ? null : '$dir/${_sub(f.path)}';
+  }
+
+  String? get anchorPath {
+    final f = pattern.anchor;
+    return f == null ? null : '$dir/${_sub(f.path)}';
+  }
+
+  String get typeId => def.id;
+}
+
+class EntityLocator {
+  final EntityTypeRegistry registry;
+  final String genRoot; // .../files/generalized
+  const EntityLocator(this.registry, this.genRoot);
+
+  String get typesDir => '$genRoot/.types';
+
+  /// Variante da instância, lida do `variant:` do frontmatter da âncora.
+  String detectVariant(EntityTypeDef def, String dir, String name) {
+    if (def.patterns.length <= 1) return 'default';
+    final loc = EntityLoc(def: def, dir: dir, name: name, rel: '', variant: 'default');
+    for (final v in def.patterns.keys) {
+      final probe = EntityLoc(def: def, dir: dir, name: name, rel: '', variant: v);
+      final a = probe.anchorPath;
+      if (a == null) continue;
+      final f = File(a);
+      if (!f.existsSync()) continue;
+      final fm = readFrontmatter(f.readAsStringSync());
+      final fv = _str(fm['variant']) ?? 'default';
+      if (fv == v) return v;
+    }
+    return loc.variant;
+  }
+
+  /// Resolve um [rel] (ex.: `psyche/Myself/Complexes/-Ego`) para uma instância.
+  EntityLoc? locate(String rel) {
+    final segs = rel.split('/').where((s) => s.isNotEmpty).toList();
+    if (segs.length < 2) return null;
+    var def = registry.rootByFolder(segs[0]);
+    if (def == null) return null;
+    var dir = '$genRoot/${segs[0]}/${segs[1]}';
+    var name = segs[1];
+    var inline = false;
+    var i = 2;
+    while (i < segs.length) {
+      final slot = def!.slotByFolder(segs[i]);
+      if (slot == null) return null;
+      final child = registry[slot.type];
+      if (child == null) return null;
+      if (slot.isOne) {
+        dir = '$dir/${segs[i]}';
+        name = segs[i];
+        inline = true;
+        i += 1;
+      } else {
+        if (i + 1 >= segs.length) return null;
+        dir = '$dir/${segs[i]}/${segs[i + 1]}';
+        name = segs[i + 1];
+        inline = false;
+        i += 2;
+      }
+      def = child;
+    }
+    return EntityLoc(
+      def: def!,
+      dir: dir,
+      name: name,
+      rel: rel,
+      variant: detectVariant(def, dir, name),
+      inline: inline,
+    );
+  }
+
+  /// Nomes das instâncias dentro de um contêiner (pastas não ocultas).
+  Future<List<String>> listNames(String containerDir) async {
+    final d = Directory(containerDir);
+    if (!await d.exists()) return [];
+    final out = <String>[];
+    await for (final e in d.list()) {
+      if (e is! Directory) continue;
+      final n = e.uri.pathSegments.where((s) => s.isNotEmpty).last;
+      if (!n.startsWith('.')) out.add(n);
+    }
+    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return out;
+  }
+
+  /// Instâncias raiz de um tipo.
+  Future<List<String>> listRoot(EntityTypeDef def) =>
+      listNames('$genRoot/${def.folder}');
+
+  /// Cópia do canvas com os `mdFile` dentro de [dir] gravados como caminho
+  /// relativo (para `canvas.json` sobreviver a mover/renomear a pasta).
+  static Map<String, dynamic> canvasToDisk(Map<String, dynamic> canvas, String dir) =>
+      _mapCanvasPaths(canvas, (p) => p.startsWith('$dir/') ? p.substring(dir.length + 1) : p);
+
+  /// Inverso de [canvasToDisk]: caminhos relativos viram absolutos sob [dir].
+  /// Caminhos absolutos antigos continuam valendo como estão.
+  static Map<String, dynamic> canvasFromDisk(Map<String, dynamic> canvas, String dir) =>
+      _mapCanvasPaths(canvas, (p) => p.startsWith('/') ? p : '$dir/$p');
+
+  static Map<String, dynamic> _mapCanvasPaths(
+      Map<String, dynamic> canvas, String Function(String) f) {
+    final out = Map<String, dynamic>.from(canvas);
+    final blocks = canvas['blocks'];
+    if (blocks is List) {
+      final mapped = <dynamic>[];
+      for (final b in blocks) {
+        if (b is Map) {
+          final m = Map<String, dynamic>.from(b);
+          final p = m['mdFile'];
+          if (p is String && p.isNotEmpty) m['mdFile'] = f(p);
+          mapped.add(m);
+        } else {
+          mapped.add(b);
+        }
+      }
+      out['blocks'] = mapped;
+    }
+    return out;
+  }
+
+  /// Contagem para o `badge: count` de uma aba; null quando não se aplica.
+  Future<int?> badgeCount(EntityLoc loc, TabDef tab, {required String worksRoot}) async {
+    switch (tab.kind) {
+      case 'folder':
+        final d = Directory('${loc.dir}/${tab.path ?? ''}');
+        if (!await d.exists()) return 0;
+        var n = 0;
+        await for (final e in d.list(recursive: true, followLinks: false)) {
+          if (e is! File) continue;
+          final rel = e.path.substring(d.path.length + 1);
+          if (rel.split('/').any((s) => s.startsWith('.'))) continue;
+          n++;
+        }
+        return n;
+      case 'children':
+        final slot = loc.def.slotByFolder(tab.slot ?? '');
+        if (slot == null) return null;
+        if (slot.isOne) return 1;
+        return (await listNames('${loc.dir}/${slot.folder}')).length;
+      case 'connections':
+        final idx = await EntityIndex.build(this);
+        return idx.connectionsOf(loc.rel).length;
+      case 'works':
+        final a = loc.anchorPath;
+        if (a == null || !File(a).existsSync()) return null;
+        final id = _str(readFrontmatter(await File(a).readAsString())['id']);
+        if (id == null || id.isEmpty) return null;
+        return (await WorksLinks.linkedTo(worksRoot, id)).length;
+      default:
+        return null;
+    }
+  }
+
+  /// Canvas padrão (blocos do perfil do tipo) para uma instância.
+  Map<String, dynamic> buildCanvas(EntityLoc loc) {
+    final p = loc.pattern;
+    final blocks = <dynamic>[];
+    for (final b in p.blocks) {
+      blocks.add(<String, dynamic>{
+        'id': b.id,
+        'type': b.kind == 'markdown' ? 'about' : b.kind,
+        if (b.title.isNotEmpty) 'label': b.title,
+        'x': b.x,
+        'y': b.y,
+        'w': b.w,
+        'h': b.h,
+        'mdFile': b.bind == null ? null : loc.pathOfFile(b.bind!),
+      });
+    }
+    return <String, dynamic>{
+      'header': <String, dynamic>{'h': p.headerH},
+      'blocks': blocks,
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Aplicador de padrão (scaffold)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class EntityScaffolder {
+  final EntityTypeRegistry registry;
+  final String genRoot;
+  final String workspaceName;
+  const EntityScaffolder({required this.registry, required this.genRoot, required this.workspaceName});
+
+  String _sub(String s, Map<String, String> v) => s.replaceAllMapped(
+      RegExp(r'\{(name|safe|type|uuid|workspace)\}'), (m) => v[m[1]!] ?? m[0]!);
+
+  /// Insere `variant: <v>` no frontmatter (se existir) de [content].
+  String _withVariant(String content, String variant) {
+    if (variant == 'default' || !content.startsWith('---\n')) return content;
+    return '---\nvariant: $variant\n${content.substring(4)}';
+  }
+
+  /// Cria uma instância de [typeId]. [parentDir] é a pasta que conterá a
+  /// pasta da instância (ou a própria pasta, se [inline]). Retorna o caminho
+  /// absoluto da instância.
+  Future<String> create(
+    String typeId,
+    String name, {
+    required String parentDir,
+    String variant = 'default',
+    bool inline = false,
+  }) async {
+    final def = registry[typeId];
+    if (def == null) throw ArgumentError('tipo desconhecido: $typeId');
+    final safe = entityFsSafe(name);
+    if (safe.isEmpty) throw ArgumentError('nome vazio');
+    final dir = inline ? parentDir : '$parentDir/$safe';
+    await Directory(dir).create(recursive: true);
+    final pat = def.patternFor(variant);
+    final anchorId = pat.anchor?.id ?? 'anchor';
+    final vars = {
+      'name': name,
+      'safe': safe,
+      'type': typeId,
+      'uuid': newEntityId(),
+      'workspace': workspaceName,
+    };
+    for (final d in pat.dirs) {
+      await Directory('$dir/${_sub(d, vars)}').create(recursive: true);
+    }
+    for (final f in pat.files) {
+      final file = File('$dir/${_sub(f.path, vars)}');
+      if (await file.exists()) continue;
+      await file.parent.create(recursive: true);
+      var content = _sub(f.content, vars);
+      if (f.id == anchorId || f.role == 'anchor') content = _withVariant(content, variant);
+      await file.writeAsString(content);
+    }
+    for (final slot in def.children) {
+      final slotDir = '$dir/${slot.folder}';
+      await Directory(slotDir).create(recursive: true);
+      if (slot.isOne) {
+        await create(slot.type, slot.folder, parentDir: slotDir, inline: true);
+      }
+    }
+    return dir;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Índice de entidades (ids, conexões, backlinks)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class EntityIndexEntry {
+  final String id, name, rel, typeId, anchorPath;
+  final List<ConnectionRef> connections;
+  const EntityIndexEntry({
+    required this.id,
+    required this.name,
+    required this.rel,
+    required this.typeId,
+    required this.anchorPath,
+    required this.connections,
+  });
+}
+
+class ConnectionRef {
+  final String ref; // id da entidade alvo
+  final String label;
+  const ConnectionRef(this.ref, this.label);
+}
+
+class ResolvedConnection {
+  final EntityIndexEntry? other; // null se o alvo não existe mais
+  final String ref, label;
+  final bool incoming; // true = veio de um backlink
+  const ResolvedConnection({this.other, required this.ref, required this.label, required this.incoming});
+}
+
+class EntityIndex {
+  final List<EntityIndexEntry> entries;
+  const EntityIndex(this.entries);
+
+  static Future<EntityIndex> build(EntityLocator loc) async {
+    final out = <EntityIndexEntry>[];
+    for (final def in loc.registry.rootTypes) {
+      for (final n in await loc.listRoot(def)) {
+        await _walk(loc, '${def.folder}/$n', out);
+      }
+    }
+    return EntityIndex(out);
+  }
+
+  static Future<void> _walk(EntityLocator loc, String rel, List<EntityIndexEntry> out) async {
+    final l = loc.locate(rel);
+    if (l == null) return;
+    final a = l.anchorPath;
+    if (a != null && File(a).existsSync()) {
+      final fm = readFrontmatter(await File(a).readAsString());
+      final id = _str(fm['id']);
+      if (id != null && id.isNotEmpty) {
+        out.add(EntityIndexEntry(
+          id: id,
+          name: l.name,
+          rel: rel,
+          typeId: l.def.id,
+          anchorPath: a,
+          connections: [
+            for (final c in _asList(fm['connections']))
+              if (c is Map && c['ref'] != null)
+                ConnectionRef(c['ref'].toString(), _str(c['label']) ?? '')
+              else if (c is String)
+                ConnectionRef(c, ''),
+          ],
+        ));
+      }
+    }
+    for (final slot in l.def.children) {
+      if (slot.isOne) {
+        await _walk(loc, '$rel/${slot.folder}', out);
+      } else {
+        for (final n in await loc.listNames('${l.dir}/${slot.folder}')) {
+          await _walk(loc, '$rel/${slot.folder}/$n', out);
+        }
+      }
+    }
+  }
+
+  EntityIndexEntry? byId(String id) {
+    for (final e in entries) {
+      if (e.id == id) return e;
+    }
+    return null;
+  }
+
+  EntityIndexEntry? byRel(String rel) {
+    for (final e in entries) {
+      if (e.rel == rel) return e;
+    }
+    return null;
+  }
+
+  /// Conexões de [rel]: as declaradas por ele (saída) mais os backlinks (entrada).
+  List<ResolvedConnection> connectionsOf(String rel) {
+    final me = byRel(rel);
+    if (me == null) return [];
+    final out = <ResolvedConnection>[
+      for (final c in me.connections)
+        ResolvedConnection(other: byId(c.ref), ref: c.ref, label: c.label, incoming: false),
+    ];
+    for (final e in entries) {
+      if (e.id == me.id) continue;
+      for (final c in e.connections) {
+        if (c.ref == me.id) {
+          // evita duplicar quando a relação é declarada nos dois lados
+          if (out.any((o) => o.other?.id == e.id)) continue;
+          out.add(ResolvedConnection(other: e, ref: e.id, label: c.label, incoming: true));
+        }
+      }
+    }
+    return out;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Works: vínculos arquivo ↔ entidade (companheiros .cc/<arquivo>.md)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class WorksLinks {
+  /// Arquivos de [worksRoot] cujo companheiro lista [entityId] em `refs`.
+  static Future<List<String>> linkedTo(String worksRoot, String entityId) async {
+    final root = Directory(worksRoot);
+    if (!await root.exists()) return [];
+    final out = <String>[];
+    await for (final e in root.list(recursive: true, followLinks: false)) {
+      if (e is! File || !e.path.endsWith('.md')) continue;
+      final parent = e.parent;
+      if (parent.uri.pathSegments.where((s) => s.isNotEmpty).last != '.cc') continue;
+      final fm = readFrontmatter(await e.readAsString());
+      final refs = _asList(fm['refs']).map((x) => x.toString()).toList();
+      if (!refs.contains(entityId)) continue;
+      final target = File('${parent.parent.path}/${_str(fm['file']) ?? ''}');
+      if (await target.exists()) out.add(target.path);
+    }
+    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return out;
+  }
+
+  /// Todos os arquivos (não ocultos) sob [worksRoot], para escolher o que vincular.
+  static Future<List<String>> allFiles(String worksRoot) async {
+    final root = Directory(worksRoot);
+    if (!await root.exists()) return [];
+    final out = <String>[];
+    await for (final e in root.list(recursive: true, followLinks: false)) {
+      if (e is! File) continue;
+      final rel = e.path.substring(worksRoot.length + 1);
+      if (rel.split('/').any((s) => s.startsWith('.'))) continue;
+      out.add(e.path);
+    }
+    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return out;
+  }
+
+  static File _companion(String absFile) {
+    final f = File(absFile);
+    final base = f.uri.pathSegments.where((s) => s.isNotEmpty).last;
+    return File('${f.parent.path}/.cc/$base.md');
+  }
+
+  static Future<void> link(String absFile, String entityId) async {
+    final c = _companion(absFile);
+    var fm = <String, dynamic>{};
+    var body = '';
+    if (await c.exists()) {
+      final text = await c.readAsString();
+      fm = readFrontmatter(text);
+      body = _bodyAfterFrontmatter(text);
+    }
+    final base = absFile.split('/').last;
+    fm['id'] = fm['id'] ?? newEntityId();
+    fm['file'] = base;
+    fm['size'] = await File(absFile).length();
+    fm['tags'] = fm['tags'] ?? <dynamic>[];
+    final refs = _asList(fm['refs']).map((x) => x.toString()).toList();
+    if (!refs.contains(entityId)) refs.add(entityId);
+    fm['refs'] = refs;
+    await c.parent.create(recursive: true);
+    await c.writeAsString('${_writeFrontmatter(fm)}$body');
+  }
+
+  static Future<void> unlink(String absFile, String entityId) async {
+    final c = _companion(absFile);
+    if (!await c.exists()) return;
+    final text = await c.readAsString();
+    final fm = readFrontmatter(text);
+    final refs = _asList(fm['refs']).map((x) => x.toString()).toList()..remove(entityId);
+    fm['refs'] = refs;
+    await c.writeAsString('${_writeFrontmatter(fm)}${_bodyAfterFrontmatter(text)}');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edição de definições de tipo (usado pelo Designer de Tipo)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// "Meu Tipo Novo!" → `meu_tipo_novo` (minúsculas, a-z, 0-9 e `_`; começa com letra).
+String entitySlug(String s) {
+  const from = 'áàâãäéèêëíìîïóòôõöúùûüçñ';
+  const to = 'aaaaaeeeeiiiiooooouuuucn';
+  final b = StringBuffer();
+  for (final r in s.toLowerCase().runes) {
+    final ch = String.fromCharCode(r);
+    final i = from.indexOf(ch);
+    b.write(i >= 0 ? to[i] : ch);
+  }
+  var t = b.toString().replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+$'), '');
+  if (t.isEmpty) t = 'type';
+  if (!RegExp(r'^[a-z]').hasMatch(t)) t = 't_$t';
+  return t;
+}
+
+/// Gera um id único (entre [taken]) a partir de [label].
+String uniqueTypeId(String label, Iterable<String> taken) {
+  final used = taken.toSet();
+  final base = entitySlug(label);
+  var id = base;
+  var n = 2;
+  while (used.contains(id)) {
+    id = '${base}_$n';
+    n++;
+  }
+  return id;
+}
+
+/// Definição crua de um tipo novo: só a âncora (`{safe}.md`) e o Profile "About".
+/// O usuário monta o resto (pastas, abas, filhos…) no Designer.
+Map<String, dynamic> newTypeRaw({
+  required String id,
+  required String label,
+  String? folder,
+  String icon = 'category_outlined',
+}) =>
+    <String, dynamic>{
+      'schema': 1,
+      'id': id,
+      'label': label,
+      'icon': icon,
+      if (folder != null && folder.isNotEmpty) 'folder': folder,
+      'pattern': <String, dynamic>{
+        'dirs': <dynamic>[],
+        'files': <dynamic>[
+          <String, dynamic>{
+            'id': 'anchor',
+            'path': '{safe}.md',
+            'role': 'anchor',
+            'content': '---\nid: {uuid}\ntype: {type}\ntags: []\n---\n\n# {name}\n',
+          },
+        ],
+      },
+      'tabs': <dynamic>[
+        <String, dynamic>{'id': 'profile', 'kind': 'profile'},
+        <String, dynamic>{'id': 'files', 'kind': 'files'},
+      ],
+      'profile': <String, dynamic>{
+        'header': <String, dynamic>{'h': 120},
+        'blocks': <dynamic>[
+          <String, dynamic>{
+            'id': 'b1',
+            'kind': 'markdown',
+            'bind': 'anchor',
+            'title': 'About',
+            'layout': <String, dynamic>{'x': 0.015, 'y': 0, 'w': 0.97, 'h': 400},
+          },
+        ],
+      },
+    };
+
+/// Cópia profunda de uma definição crua (mapas/listas mutáveis).
+Map<String, dynamic> cloneRaw(Map<String, dynamic> m) => _asMap(m);
+
+/// Lê o texto YAML de um tipo para um mapa mutável; lança [FormatException] se inválido.
+Map<String, dynamic> parseTypeYaml(String text) {
+  final dynamic y;
+  try {
+    y = loadYaml(text);
+  } catch (e) {
+    throw FormatException(e.toString().split('\n').first);
+  }
+  if (y is! Map) throw const FormatException('The YAML must be a mapping (key: value).');
+  return _asMap(y);
+}
+
+const Set<String> kTabKinds = {
+  'profile', 'files', 'folder', 'works', 'connections', 'properties', 'children', 'markdown',
+};
+const Set<String> kPropertyTypes = {'text', 'bool', 'phone_list', 'ref', 'ref_list', 'formula'};
+
+/// Diretórios (explícitos e implícitos) de um padrão cru: `dirs` + pais de cada `dirs`/`files`.
+Set<String> patternDirSet(Map<String, dynamic> raw) {
+  final pat = _asMap(raw['pattern']);
+  final out = <String>{};
+  void addWithParents(String path) {
+    final segs = path.split('/');
+    for (var i = 1; i <= segs.length; i++) {
+      out.add(segs.sublist(0, i).join('/'));
+    }
+  }
+
+  for (final d in _asList(pat['dirs'])) {
+    final s = d.toString();
+    if (s.isNotEmpty) addWithParents(s);
+  }
+  for (final f in _asList(pat['files'])) {
+    final p = _str(_asMap(f)['path']) ?? '';
+    final i = p.lastIndexOf('/');
+    if (i > 0) addWithParents(p.substring(0, i));
+  }
+  return out;
+}
+
+/// Valida uma definição crua. [others] são as definições dos demais tipos.
+/// Devolve mensagens de erro (vazia = válida). Fórmulas são validadas à parte (no Designer).
+List<String> validateTypeRaw(Map<String, dynamic> raw, Map<String, Map<String, dynamic>> others) {
+  final errs = <String>[];
+  final id = _str(raw['id']) ?? '';
+  if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(id)) {
+    errs.add('Id must start with a lowercase letter and use only a-z, 0-9 and _.');
+  }
+  if ((_str(raw['label']) ?? '').trim().isEmpty) errs.add('Name is required.');
+
+  final folder = _str(raw['folder']) ?? '';
+  if (folder.isNotEmpty) {
+    if (RegExp(r'[<>:"/\\|?*\x00-\x1F]').hasMatch(folder) || folder.startsWith('.')) {
+      errs.add('Root folder "$folder" has invalid characters.');
+    }
+    for (final e in others.entries) {
+      if (e.key != id && (_str(e.value['folder']) ?? '') == folder) {
+        errs.add('Root folder "$folder" is already used by type "${e.key}".');
+      }
+    }
+  }
+
+  // ── padrão de pastas ───────────────────────────────────────────────────────
+  final pat = _asMap(raw['pattern']);
+  final dirs = [for (final d in _asList(pat['dirs'])) d.toString()];
+  final files = [for (final f in _asList(pat['files'])) _asMap(f)];
+  bool badPath(String p) =>
+      p.isEmpty ||
+      p.startsWith('/') ||
+      p.contains('\\') ||
+      p.split('/').any((s) => s.isEmpty || s == '..' || s == '.');
+  for (final d in dirs) {
+    if (badPath(d)) errs.add('Invalid folder path "$d".');
+  }
+  final filePaths = <String>{};
+  final fileIds = <String>{};
+  var anchors = 0;
+  for (final f in files) {
+    final path = _str(f['path']) ?? '';
+    if (badPath(path)) {
+      errs.add('Invalid file path "$path".');
+    } else if (!filePaths.add(path)) {
+      errs.add('Duplicate file path "$path".');
+    }
+    final fid = _str(f['id']) ?? '';
+    if (fid.isNotEmpty) {
+      if (!RegExp(r'^[A-Za-z][A-Za-z0-9_]*$').hasMatch(fid)) {
+        errs.add('File id "$fid" is invalid (letters, digits and _ only).');
+      } else if (!fileIds.add(fid)) {
+        errs.add('Duplicate file id "$fid".');
+      }
+    }
+    if (_str(f['role']) == 'anchor') anchors++;
+  }
+  if (anchors > 1) errs.add('Only one file can be the anchor.');
+  final dirSet = patternDirSet(raw);
+  for (final p in filePaths) {
+    if (dirSet.contains(p)) errs.add('"$p" is used as both a file and a folder.');
+  }
+
+  // ── filhos (tipos aninhados) ───────────────────────────────────────────────
+  final slots = [for (final c in _asList(raw['children'])) _asMap(c)];
+  final slotFolders = <String>{};
+  final topNames = <String>{
+    for (final p in [...dirs, ...filePaths]) p.split('/').first,
+  };
+  for (final s in slots) {
+    final t = _str(s['type']) ?? '';
+    final f = _str(s['folder']) ?? '';
+    if (t.isEmpty || (t != id && !others.containsKey(t))) errs.add('Child slot "$f": unknown type "$t".');
+    if (f.isEmpty || f.contains('/') || f.startsWith('.')) {
+      errs.add('Child slot needs a valid folder name (got "$f").');
+    } else {
+      if (!slotFolders.add(f)) errs.add('Duplicate child folder "$f".');
+      if (topNames.contains(f)) errs.add('Child folder "$f" collides with a folder/file of the pattern.');
+    }
+    final c = _str(s['cardinality']) ?? 'many';
+    if (c != 'one' && c != 'many') errs.add('Child slot "$f": cardinality must be one or many.');
+  }
+
+  // ── propriedades ───────────────────────────────────────────────────────────
+  final props = [for (final p in _asList(raw['properties'])) _asMap(p)];
+  final propKeys = <String>{};
+  for (final p in props) {
+    final k = _str(p['key']) ?? '';
+    if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(k)) {
+      errs.add('Property key "$k" is invalid (lowercase letters, digits and _).');
+    } else if (!propKeys.add(k)) {
+      errs.add('Duplicate property key "$k".');
+    }
+    final t = _str(p['type']) ?? 'text';
+    if (!kPropertyTypes.contains(t)) errs.add('Property "$k": unknown type "$t".');
+    if (t == 'ref' || t == 'ref_list') {
+      final target = _str(p['target']) ?? '';
+      if (target.isEmpty || (target != 'any' && target != id && !others.containsKey(target))) {
+        errs.add('Property "$k": choose a valid target type.');
+      }
+    }
+    if (t == 'formula' && (_str(p['formula']) ?? '').trim().isEmpty) {
+      errs.add('Property "$k": formula is empty.');
+    }
+  }
+
+  // ── abas e perfil ──────────────────────────────────────────────────────────
+  final tabIds = <String>{};
+  for (final t in [for (final x in _asList(raw['tabs'])) _asMap(x)]) {
+    final tid = _str(t['id']) ?? '';
+    final kind = _str(t['kind']) ?? '';
+    if (tid.isEmpty) {
+      errs.add('A tab has no id.');
+    } else if (!tabIds.add(tid)) {
+      errs.add('Duplicate tab id "$tid".');
+    }
+    if (!kTabKinds.contains(kind)) errs.add('Tab "$tid": unknown kind "$kind".');
+    if (kind == 'folder' && !dirSet.contains(_str(t['path']) ?? '')) {
+      errs.add('Tab "$tid": folder "${_str(t['path']) ?? ''}" is not in the pattern.');
+    }
+    if (kind == 'markdown' && !fileIds.contains(_str(t['bind']) ?? '')) {
+      errs.add('Tab "$tid": choose a file from the pattern.');
+    }
+    if (kind == 'children' && !slotFolders.contains(_str(t['slot']) ?? '')) {
+      errs.add('Tab "$tid": choose a child slot.');
+    }
+  }
+  for (final b in [for (final x in _asList(_asMap(raw['profile'])['blocks'])) _asMap(x)]) {
+    final bind = _str(b['bind']) ?? '';
+    if (bind.isNotEmpty && !fileIds.contains(bind)) {
+      errs.add('Profile block "${_str(b['title']) ?? _str(b['id']) ?? ''}" uses a file that no longer exists.');
+    }
+  }
+
+  // ── exports ────────────────────────────────────────────────────────────────
+  final exportIds = <String>{};
+  final listProps = <String>{
+    for (final p in props)
+      if ((_str(p['type']) ?? '').endsWith('list')) _str(p['key']) ?? '',
+  };
+  for (final e in [for (final x in _asList(raw['exports'])) _asMap(x)]) {
+    final eid = _str(e['id']) ?? '';
+    if (eid.isEmpty) {
+      errs.add('An export has no id.');
+    } else if (!exportIds.add(eid)) {
+      errs.add('Duplicate export id "$eid".');
+    }
+    if (!{'csv', 'xlsx'}.contains(_str(e['format']) ?? 'csv')) errs.add('Export "$eid": format must be csv or xlsx.');
+    if (!{'manual', 'one_way'}.contains(_str(e['sync']) ?? 'manual')) errs.add('Export "$eid": sync must be manual or one_way.');
+    if ((_str(e['file']) ?? '').trim().isEmpty) errs.add('Export "$eid": file name is required.');
+    final each = _str(e['each']);
+    if (each != null && each.trim().isNotEmpty) {
+      final src = each.split(' as ').first.trim();
+      if (!listProps.contains(src)) errs.add('Export "$eid": "$src" is not a list property.');
+    }
+    final cols = _asList(e['columns']);
+    if (cols.isEmpty) errs.add('Export "$eid": add at least one column.');
+    for (final c in cols) {
+      final cm = _asMap(c);
+      if ((_str(cm['header']) ?? '').trim().isEmpty) errs.add('Export "$eid": a column has no header.');
+      if ((_str(cm['formula']) ?? '').trim().isEmpty) errs.add('Export "$eid": column "${_str(cm['header']) ?? ''}" has no formula.');
+    }
+  }
+
+  // ── extends / ciclos ───────────────────────────────────────────────────────
+  final parent = _str(raw['extends']) ?? '';
+  if (parent.isNotEmpty) {
+    if (parent == id) {
+      errs.add('A type cannot extend itself.');
+    } else if (!others.containsKey(parent)) {
+      errs.add('Extends: unknown type "$parent".');
+    } else {
+      final reg = EntityTypeRegistry.fromRaws({...others, id: raw});
+      for (final e in reg.errors) {
+        if (e.startsWith('$id:')) errs.add(e.substring(id.length + 1).trim());
+      }
+    }
+  }
+  return errs;
+}
+
+/// Lê, grava e apaga as definições em `generalized/.types/<id>.yaml`.
+class EntityTypeStore {
+  final String typesDir;
+  const EntityTypeStore(this.typesDir);
+
+  String fileOf(String id) => '$typesDir/$id.yaml';
+
+  /// Todas as definições cruas (id → mapa), na ordem do nome do arquivo.
+  Future<Map<String, Map<String, dynamic>>> loadRaw() async {
+    final out = <String, Map<String, dynamic>>{};
+    final dir = Directory(typesDir);
+    if (!await dir.exists()) return out;
+    final files = <File>[
+      await for (final e in dir.list())
+        if (e is File && e.path.endsWith('.yaml')) e,
+    ]..sort((a, b) => a.path.compareTo(b.path));
+    for (final f in files) {
+      try {
+        final m = _asMap(loadYaml(await f.readAsString()));
+        final id = _str(m['id']);
+        if (id != null && id.isNotEmpty) out[id] = m;
+      } catch (_) {
+        // arquivo ilegível: o registro já reporta o erro
+      }
+    }
+    return out;
+  }
+
+  /// Grava [raw] como `<id>.yaml` (escrita atômica).
+  Future<void> save(Map<String, dynamic> raw) async {
+    final id = _str(raw['id']) ?? '';
+    if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(id)) {
+      throw FormatException('Invalid type id "$id"');
+    }
+    await Directory(typesDir).create(recursive: true);
+    final f = File(fileOf(id));
+    final tmp = File('${f.path}.tmp');
+    await tmp.writeAsString(yamlEmit(raw));
+    await tmp.rename(f.path);
+  }
+
+  Future<void> delete(String id) async {
+    final f = File(fileOf(id));
+    if (await f.exists()) await f.delete();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gravador de YAML (mapas/listas/escalares; blocos `|` para textos com quebras)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Serializa [m] em YAML legível. O resultado volta idêntico por `loadYaml`.
+String yamlEmit(Map<String, dynamic> m) {
+  final b = StringBuffer();
+  _yMap(b, m, 0);
+  return b.toString();
+}
+
+final RegExp _yPlainKey = RegExp(r'^[A-Za-z_][A-Za-z0-9_\-]*$');
+final RegExp _yPlainStr = RegExp(r'^[A-Za-z_][A-Za-z0-9_ .\-/]*$');
+const Set<String> _yReserved = {'true', 'false', 'null', 'yes', 'no', 'on', 'off', 'y', 'n', '~'};
+
+String _yKey(String k) => _yPlainKey.hasMatch(k) && !_yReserved.contains(k.toLowerCase()) ? k : jsonEncode(k);
+
+String _yStr(String s) {
+  if (s.isNotEmpty &&
+      _yPlainStr.hasMatch(s) &&
+      !_yReserved.contains(s.toLowerCase()) &&
+      !s.endsWith(' ') &&
+      !s.contains(' #')) {
+    return s;
+  }
+  return jsonEncode(s);
+}
+
+String _yScalar(dynamic v) {
+  if (v == null) return 'null';
+  if (v is bool) return v ? 'true' : 'false';
+  if (v is num) return v.toString();
+  return _yStr(v.toString());
+}
+
+/// Bloco `|` / `|-` com [indent] espaços; null quando o texto não cabe com segurança.
+String? _yBlock(String s, int indent) {
+  if (s.contains('\r') || s.contains('\t')) return null;
+  String header;
+  String body;
+  if (s.endsWith('\n') && !s.endsWith('\n\n')) {
+    header = '|';
+    body = s.substring(0, s.length - 1);
+  } else if (!s.endsWith('\n')) {
+    header = '|-';
+    body = s;
+  } else {
+    return null;
+  }
+  final lines = body.split('\n');
+  if (lines.first.isEmpty || lines.first.startsWith(' ')) return null;
+  final pad = ' ' * indent;
+  final b = StringBuffer('$header\n');
+  for (final l in lines) {
+    b.write(l.isEmpty ? '\n' : '$pad$l\n');
+  }
+  return b.toString();
+}
+
+void _yAfterKey(StringBuffer b, dynamic v, int ind) {
+  if (v is Map) {
+    if (v.isEmpty) {
+      b.write(' {}\n');
+    } else {
+      b.write('\n');
+      _yMap(b, v, ind + 2);
+    }
+  } else if (v is List) {
+    if (v.isEmpty) {
+      b.write(' []\n');
+    } else {
+      b.write('\n');
+      _yList(b, v, ind + 2);
+    }
+  } else if (v is String && v.contains('\n')) {
+    final blk = _yBlock(v, ind + 2);
+    b.write(blk != null ? ' $blk' : ' ${jsonEncode(v)}\n');
+  } else {
+    b.write(' ${_yScalar(v)}\n');
+  }
+}
+
+void _yMap(StringBuffer b, Map m, int ind) {
+  final pad = ' ' * ind;
+  m.forEach((k, v) {
+    b.write('$pad${_yKey(k.toString())}:');
+    _yAfterKey(b, v, ind);
+  });
+}
+
+void _yList(StringBuffer b, List l, int ind) {
+  final pad = ' ' * ind;
+  for (final it in l) {
+    if (it is Map && it.isNotEmpty) {
+      var first = true;
+      it.forEach((k, v) {
+        b.write(first ? '$pad- ' : '$pad  ');
+        first = false;
+        b.write('${_yKey(k.toString())}:');
+        _yAfterKey(b, v, ind + 2);
+      });
+    } else if (it is Map) {
+      b.write('$pad- {}\n');
+    } else if (it is List) {
+      b.write('$pad- ${jsonEncode(it)}\n');
+    } else if (it is String && it.contains('\n')) {
+      final blk = _yBlock(it, ind + 2);
+      b.write(blk != null ? '$pad- $blk' : '$pad- ${jsonEncode(it)}\n');
+    } else {
+      b.write('$pad- ${_yScalar(it)}\n');
+    }
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Formulas, properties, exports (CSV / XLSX)
+// (antes em entity_formula.dart)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// entity_formula.dart
+//
+// Propriedades das entidades, motor de fórmulas e exports (CSV e XLSX).
+// Dart puro (sem Flutter). Depende de entity_types.dart.
+//
+// Valores de propriedades vivem no frontmatter do arquivo âncora da instância:
+//   text / number / date  -> texto (ou número)
+//   bool                  -> true/false
+//   ref                   -> id (uuid) de outra entidade
+//   phone_list            -> lista de {label, number, primary}
+//   formula               -> não é gravada; calculada na hora
+//
+// Fórmulas (usadas em `type: formula` e nas colunas dos exports):
+//   $campo            valor de uma propriedade da entidade (ou `$name`, `$id`, `$type`)
+//   $ref.name         campo de outra entidade apontada por uma propriedade `ref`
+//   $alias.campo      campo do item corrente em `each: lista as alias`
+//   "texto"           literal (também 'texto'); números; true/false/null
+//   + - * / %         + concatena quando um dos lados não é número
+//   == != < > <= >=   comparações;  && || !  lógicos
+//   IF(c, a, b)  COUNT_SAME(expr)  COALESCE(...)  AND  OR  NOT  LOWER  UPPER
+//   TRIM  LEN  CONCAT  JOIN(lista, sep)  CONTAINS(a, b)  REPLACE(s, a, b)
+//   LEFT(s, n)  ISEMPTY(x)  FIRST(lista)  COUNT(lista)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Leitura e gravação de propriedades
+// ─────────────────────────────────────────────────────────────────────────────
+
+class EntityProps {
+  /// Frontmatter completo da âncora da instância (vazio se não houver).
+  static Map<String, dynamic> read(EntityLoc loc) {
+    final a = loc.anchorPath;
+    if (a == null) return <String, dynamic>{};
+    final f = File(a);
+    if (!f.existsSync()) return <String, dynamic>{};
+    return readFrontmatter(f.readAsStringSync());
+  }
+
+  /// Grava [key] no frontmatter da âncora; [value] null remove a chave.
+  static Future<void> write(EntityLoc loc, String key, dynamic value) async {
+    final a = loc.anchorPath;
+    if (a == null) throw StateError('o tipo ${loc.def.id} não tem arquivo âncora');
+    await updateFrontmatterKey(a, key, value);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fórmulas: valores
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FormulaError implements Exception {
+  final String message;
+  FormulaError(this.message);
+  @override
+  String toString() => 'FormulaError: $message';
+}
+
+bool formulaTruthy(dynamic v) {
+  if (v == null) return false;
+  if (v is bool) return v;
+  if (v is num) return v != 0;
+  if (v is String) return v.isNotEmpty;
+  if (v is List) return v.isNotEmpty;
+  if (v is Map) return v.isNotEmpty;
+  return true;
+}
+
+String formulaStr(dynamic v) {
+  if (v == null) return '';
+  if (v is double && v == v.truncateToDouble()) return v.toInt().toString();
+  if (v is List) return v.map(formulaStr).join(', ');
+  return v.toString();
+}
+
+num? _toNum(dynamic v) {
+  if (v is num) return v;
+  if (v is String) return num.tryParse(v.trim());
+  return null;
+}
+
+bool _looseEq(dynamic x, dynamic y) {
+  if (x is num && y is num) return x == y;
+  return formulaStr(x) == formulaStr(y);
+}
+
+int _cmp(dynamic x, dynamic y) {
+  final nx = _toNum(x), ny = _toNum(y);
+  if (nx != null && ny != null) return nx.compareTo(ny);
+  return formulaStr(x).compareTo(formulaStr(y));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fórmulas: árvore de sintaxe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Contexto em que uma fórmula é avaliada.
+abstract class FormulaScope {
+  /// Valor de `$a.b.c` (caminho já separado por ponto).
+  dynamic variable(List<String> path);
+
+  /// Quantas entidades do mesmo tipo têm, para [arg], o mesmo valor que esta.
+  int countSame(FNode arg);
+}
+
+int _nodeSeq = 0;
+
+abstract class FNode {
+  final int uid = _nodeSeq++;
+  dynamic eval(FormulaScope s);
+}
+
+class FLit extends FNode {
+  final dynamic value;
+  FLit(this.value);
+  @override
+  dynamic eval(FormulaScope s) => value;
+}
+
+class FVar extends FNode {
+  final List<String> path;
+  FVar(this.path);
+  @override
+  dynamic eval(FormulaScope s) => s.variable(path);
+}
+
+class FUnary extends FNode {
+  final String op;
+  final FNode e;
+  FUnary(this.op, this.e);
+  @override
+  dynamic eval(FormulaScope s) {
+    final v = e.eval(s);
+    if (op == '!') return !formulaTruthy(v);
+    final n = _toNum(v);
+    if (n == null) throw FormulaError('"-" precisa de um número');
+    return -n;
+  }
+}
+
+class FBin extends FNode {
+  final String op;
+  final FNode a, b;
+  FBin(this.op, this.a, this.b);
+
+  @override
+  dynamic eval(FormulaScope s) {
+    if (op == '&&') return formulaTruthy(a.eval(s)) && formulaTruthy(b.eval(s));
+    if (op == '||') return formulaTruthy(a.eval(s)) || formulaTruthy(b.eval(s));
+    final x = a.eval(s);
+    final y = b.eval(s);
+    switch (op) {
+      case '+':
+        if (x is num && y is num) return x + y;
+        return formulaStr(x) + formulaStr(y);
+      case '==':
+        return _looseEq(x, y);
+      case '!=':
+        return !_looseEq(x, y);
+      case '<':
+        return _cmp(x, y) < 0;
+      case '>':
+        return _cmp(x, y) > 0;
+      case '<=':
+        return _cmp(x, y) <= 0;
+      case '>=':
+        return _cmp(x, y) >= 0;
+    }
+    final nx = _toNum(x), ny = _toNum(y);
+    if (nx == null || ny == null) throw FormulaError('"$op" precisa de números');
+    switch (op) {
+      case '-':
+        return nx - ny;
+      case '*':
+        return nx * ny;
+      case '/':
+        if (ny == 0) throw FormulaError('divisão por zero');
+        return nx / ny;
+      case '%':
+        if (ny == 0) throw FormulaError('divisão por zero');
+        return nx % ny;
+    }
+    throw FormulaError('operador desconhecido: $op');
+  }
+}
+
+class FCall extends FNode {
+  final String name;
+  final List<FNode> args;
+  FCall(this.name, this.args);
+
+  void _need(int min, [int? max]) {
+    final hi = max ?? min;
+    if (args.length < min || args.length > hi) {
+      throw FormulaError('$name espera ${min == hi ? '$min' : '$min a $hi'} argumento(s)');
+    }
+  }
+
+  @override
+  dynamic eval(FormulaScope s) {
+    // Funções preguiçosas: só avaliam o que usam.
+    switch (name) {
+      case 'IF':
+        _need(2, 3);
+        if (formulaTruthy(args[0].eval(s))) return args[1].eval(s);
+        return args.length == 3 ? args[2].eval(s) : null;
+      case 'COUNT_SAME':
+        _need(1);
+        return s.countSame(args[0]);
+      case 'COALESCE':
+        for (final a in args) {
+          final v = a.eval(s);
+          if (v != null && !(v is String && v.isEmpty)) return v;
+        }
+        return null;
+      case 'AND':
+        for (final a in args) {
+          if (!formulaTruthy(a.eval(s))) return false;
+        }
+        return true;
+      case 'OR':
+        for (final a in args) {
+          if (formulaTruthy(a.eval(s))) return true;
+        }
+        return false;
+    }
+    final v = <dynamic>[for (final a in args) a.eval(s)];
+    dynamic arg(int i) => i < v.length ? v[i] : null;
+    switch (name) {
+      case 'NOT':
+        _need(1);
+        return !formulaTruthy(arg(0));
+      case 'LOWER':
+        _need(1);
+        return formulaStr(arg(0)).toLowerCase();
+      case 'UPPER':
+        _need(1);
+        return formulaStr(arg(0)).toUpperCase();
+      case 'TRIM':
+        _need(1);
+        return formulaStr(arg(0)).trim();
+      case 'LEN':
+        {
+        _need(1);
+        final x = arg(0);
+        return x is List ? x.length : formulaStr(x).length;
+        }
+      case 'COUNT':
+        {
+        _need(1);
+        final x = arg(0);
+        return x is List ? x.length : (x == null ? 0 : 1);
+        }
+      case 'CONCAT':
+        return v.map(formulaStr).join();
+      case 'JOIN':
+        {
+        _need(1, 2);
+        final x = arg(0);
+        final sep = v.length > 1 ? formulaStr(v[1]) : ', ';
+        return x is List ? x.map(formulaStr).join(sep) : formulaStr(x);
+        }
+      case 'CONTAINS':
+        {
+        _need(2);
+        final x = arg(0);
+        if (x is List) return x.any((e) => _looseEq(e, arg(1)));
+        return formulaStr(x).contains(formulaStr(arg(1)));
+        }
+      case 'REPLACE':
+        _need(3);
+        return formulaStr(arg(0)).replaceAll(formulaStr(arg(1)), formulaStr(arg(2)));
+      case 'LEFT':
+        {
+        _need(2);
+        final str = formulaStr(arg(0));
+        final n = (_toNum(arg(1)) ?? 0).toInt();
+        return str.length <= n ? str : str.substring(0, n < 0 ? 0 : n);
+        }
+      case 'ISEMPTY':
+        _need(1);
+        return !formulaTruthy(arg(0));
+      case 'FIRST':
+        {
+        _need(1);
+        final x = arg(0);
+        return x is List && x.isNotEmpty ? x.first : null;
+        }
+    }
+    throw FormulaError('função desconhecida: $name');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fórmulas: analisador
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum _T { num, str, variable, ident, op, lparen, rparen, comma, end }
+
+class _Token {
+  final _T type;
+  final String text;
+  final int pos;
+  const _Token(this.type, this.text, this.pos);
+}
+
+bool _isIdStart(int c) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+bool _isDigit(int c) => c >= 48 && c <= 57;
+bool _isIdPart(int c) => _isIdStart(c) || _isDigit(c);
+
+List<_Token> _tokenize(String src) {
+  final out = <_Token>[];
+  var i = 0;
+  while (i < src.length) {
+    final c = src.codeUnitAt(i);
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      i++;
+      continue;
+    }
+    final start = i;
+    if (_isDigit(c) || (c == 46 && i + 1 < src.length && _isDigit(src.codeUnitAt(i + 1)))) {
+      while (i < src.length && (_isDigit(src.codeUnitAt(i)) || src.codeUnitAt(i) == 46)) {
+        i++;
+      }
+      out.add(_Token(_T.num, src.substring(start, i), start));
+      continue;
+    }
+    if (c == 34 || c == 39) {
+      final q = c;
+      i++;
+      final b = StringBuffer();
+      var closed = false;
+      while (i < src.length) {
+        final d = src.codeUnitAt(i);
+        if (d == 92 && i + 1 < src.length) {
+          final n = src[i + 1];
+          b.write(n == 'n' ? '\n' : (n == 't' ? '\t' : n));
+          i += 2;
+          continue;
+        }
+        if (d == q) {
+          closed = true;
+          i++;
+          break;
+        }
+        b.writeCharCode(d);
+        i++;
+      }
+      if (!closed) throw FormulaError('texto sem fechar na posição $start');
+      out.add(_Token(_T.str, b.toString(), start));
+      continue;
+    }
+    if (c == 36) {
+      i++;
+      final s = i;
+      while (i < src.length) {
+        final d = src.codeUnitAt(i);
+        final dotThenId = d == 46 && i + 1 < src.length && _isIdStart(src.codeUnitAt(i + 1));
+        if (_isIdPart(d) || dotThenId) {
+          i++;
+        } else {
+          break;
+        }
+      }
+      if (i == s) throw FormulaError('"\$" sem nome na posição $start');
+      out.add(_Token(_T.variable, src.substring(s, i), start));
+      continue;
+    }
+    if (_isIdStart(c)) {
+      while (i < src.length && _isIdPart(src.codeUnitAt(i))) {
+        i++;
+      }
+      out.add(_Token(_T.ident, src.substring(start, i), start));
+      continue;
+    }
+    if (c == 40) {
+      out.add(_Token(_T.lparen, '(', i));
+      i++;
+      continue;
+    }
+    if (c == 41) {
+      out.add(_Token(_T.rparen, ')', i));
+      i++;
+      continue;
+    }
+    if (c == 44) {
+      out.add(_Token(_T.comma, ',', i));
+      i++;
+      continue;
+    }
+    final two = i + 1 < src.length ? src.substring(i, i + 2) : '';
+    if (const ['==', '!=', '<=', '>=', '&&', '||'].contains(two)) {
+      out.add(_Token(_T.op, two, i));
+      i += 2;
+      continue;
+    }
+    final one = src[i];
+    if (one == '=') {
+      out.add(_Token(_T.op, '==', i));
+      i++;
+      continue;
+    }
+    if ('+-*/%<>!'.contains(one)) {
+      out.add(_Token(_T.op, one, i));
+      i++;
+      continue;
+    }
+    throw FormulaError('caractere inesperado "$one" na posição $i');
+  }
+  out.add(_Token(_T.end, '', src.length));
+  return out;
+}
+
+class _Parser {
+  final List<_Token> toks;
+  int p = 0;
+  _Parser(this.toks);
+
+  _Token get cur => toks[p];
+  bool _isOp(String s) => cur.type == _T.op && cur.text == s;
+
+  FNode parseAll() {
+    final n = _or();
+    if (cur.type != _T.end) throw FormulaError('sobrou "${cur.text}" na posição ${cur.pos}');
+    return n;
+  }
+
+  FNode _or() {
+    var l = _and();
+    while (_isOp('||')) {
+      p++;
+      l = FBin('||', l, _and());
+    }
+    return l;
+  }
+
+  FNode _and() {
+    var l = _eq();
+    while (_isOp('&&')) {
+      p++;
+      l = FBin('&&', l, _eq());
+    }
+    return l;
+  }
+
+  FNode _eq() {
+    var l = _rel();
+    while (_isOp('==') || _isOp('!=')) {
+      final op = cur.text;
+      p++;
+      l = FBin(op, l, _rel());
+    }
+    return l;
+  }
+
+  FNode _rel() {
+    var l = _add();
+    while (_isOp('<') || _isOp('>') || _isOp('<=') || _isOp('>=')) {
+      final op = cur.text;
+      p++;
+      l = FBin(op, l, _add());
+    }
+    return l;
+  }
+
+  FNode _add() {
+    var l = _mul();
+    while (_isOp('+') || _isOp('-')) {
+      final op = cur.text;
+      p++;
+      l = FBin(op, l, _mul());
+    }
+    return l;
+  }
+
+  FNode _mul() {
+    var l = _unary();
+    while (_isOp('*') || _isOp('/') || _isOp('%')) {
+      final op = cur.text;
+      p++;
+      l = FBin(op, l, _unary());
+    }
+    return l;
+  }
+
+  FNode _unary() {
+    if (_isOp('!') || _isOp('-')) {
+      final op = cur.text;
+      p++;
+      return FUnary(op, _unary());
+    }
+    return _primary();
+  }
+
+  FNode _primary() {
+    final t = cur;
+    switch (t.type) {
+      case _T.num:
+        {
+          p++;
+          final n = num.tryParse(t.text);
+          if (n == null) throw FormulaError('número inválido "${t.text}"');
+          return FLit(n);
+        }
+      case _T.str:
+        p++;
+        return FLit(t.text);
+      case _T.variable:
+        p++;
+        return FVar(t.text.split('.'));
+      case _T.lparen:
+        {
+          p++;
+          final e = _or();
+          if (cur.type != _T.rparen) throw FormulaError('faltou ")" na posição ${cur.pos}');
+          p++;
+          return e;
+        }
+      case _T.ident:
+        {
+          p++;
+          final up = t.text.toUpperCase();
+          if (cur.type == _T.lparen) {
+            p++;
+            final args = <FNode>[];
+            if (cur.type != _T.rparen) {
+              args.add(_or());
+              while (cur.type == _T.comma) {
+                p++;
+                args.add(_or());
+              }
+            }
+            if (cur.type != _T.rparen) throw FormulaError('faltou ")" na posição ${cur.pos}');
+            p++;
+            return FCall(up, args);
+          }
+          if (up == 'TRUE') return FLit(true);
+          if (up == 'FALSE') return FLit(false);
+          if (up == 'NULL') return FLit(null);
+          throw FormulaError('"${t.text}" não é função nem valor (campos começam com \$)');
+        }
+      default:
+        throw FormulaError('esperava um valor na posição ${t.pos}');
+    }
+  }
+}
+
+/// Compila uma fórmula. Lança [FormulaError] se a sintaxe for inválida.
+FNode parseFormula(String src) => _Parser(_tokenize(src)).parseAll();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fórmulas: ambiente (lote de avaliações sobre o mesmo índice)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FormulaEnv {
+  final EntityTypeRegistry registry;
+  final EntityIndex index;
+  final Map<String, FNode> _parsed = {};
+  final Map<String, Map<String, int>> _sameCache = {};
+  final Map<String, Map<String, dynamic>> _fmCache = {};
+  FormulaEnv(this.registry, this.index);
+
+  FNode parse(String src) => _parsed[src] ??= parseFormula(src);
+
+  /// Frontmatter da âncora de [e] (lido uma vez por ambiente).
+  Map<String, dynamic> frontmatterOf(EntityIndexEntry e) {
+    final cached = _fmCache[e.id];
+    if (cached != null) return cached;
+    Map<String, dynamic> fm;
+    try {
+      fm = readFrontmatter(File(e.anchorPath).readAsStringSync());
+    } catch (_) {
+      fm = <String, dynamic>{};
+    }
+    _fmCache[e.id] = fm;
+    return fm;
+  }
+
+  EntityScope scopeFor(EntityIndexEntry e, {Map<String, dynamic> extra = const {}}) =>
+      EntityScope(this, e, extra);
+
+  /// Avalia [src] para a entidade [e].
+  dynamic evaluate(String src, EntityIndexEntry e, {Map<String, dynamic> extra = const {}}) =>
+      parse(src).eval(scopeFor(e, extra: extra));
+}
+
+class EntityScope implements FormulaScope {
+  final FormulaEnv env;
+  final EntityIndexEntry entry;
+  final Map<String, dynamic> extra;
+  final Map<String, dynamic> _cache = {};
+  final Set<String> _busy = {};
+  EntityScope(this.env, this.entry, this.extra);
+
+  @override
+  dynamic variable(List<String> path) {
+    if (path.isEmpty) return null;
+    dynamic v = _root(path.first);
+    for (var i = 1; i < path.length; i++) {
+      v = _member(v, path[i]);
+    }
+    return v;
+  }
+
+  dynamic _root(String key) {
+    if (extra.containsKey(key)) return extra[key];
+    switch (key) {
+      case 'name':
+        return entry.name;
+      case 'id':
+        return entry.id;
+      case 'type':
+        return entry.typeId;
+      case 'rel':
+        return entry.rel;
+    }
+    final def = env.registry[entry.typeId];
+    Map<String, dynamic>? prop;
+    if (def != null) {
+      for (final p in def.properties) {
+        if (p['key'] == key) {
+          prop = p;
+          break;
+        }
+      }
+    }
+    if (prop != null && prop['type'] == 'formula') {
+      if (_cache.containsKey(key)) return _cache[key];
+      if (!_busy.add(key)) throw FormulaError('fórmula "$key" depende dela mesma');
+      try {
+        final v = env.parse(prop['formula']?.toString() ?? '').eval(this);
+        _cache[key] = v;
+        return v;
+      } finally {
+        _busy.remove(key);
+      }
+    }
+    return env.frontmatterOf(entry)[key];
+  }
+
+  dynamic _member(dynamic v, String field) {
+    if (v == null) return null;
+    if (v is Map) return v[field];
+    if (v is String) {
+      final other = env.index.byId(v);
+      if (other == null) return null;
+      switch (field) {
+        case 'name':
+          return other.name;
+        case 'id':
+          return other.id;
+        case 'type':
+          return other.typeId;
+        case 'rel':
+          return other.rel;
+      }
+      return env.frontmatterOf(other)[field];
+    }
+    return null;
+  }
+
+  @override
+  int countSame(FNode arg) {
+    final mine = formulaStr(arg.eval(this));
+    final key = '${entry.typeId}|${arg.uid}';
+    final counts = env._sameCache.putIfAbsent(key, () {
+      final m = <String, int>{};
+      for (final e in env.index.entries) {
+        if (e.typeId != entry.typeId) continue;
+        final v = formulaStr(arg.eval(env.scopeFor(e)));
+        m[v] = (m[v] ?? 0) + 1;
+      }
+      return m;
+    });
+    return counts[mine] ?? 0;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ExportColumn {
+  final String header, formula;
+  const ExportColumn(this.header, this.formula);
+}
+
+class ExportDef {
+  final String id, format, file, sync;
+  final String? each; // "lista as alias"
+  final String? where; // fórmula de filtro (opcional)
+  final List<ExportColumn> columns;
+  const ExportDef({
+    required this.id,
+    required this.format,
+    required this.file,
+    required this.sync,
+    this.each,
+    this.where,
+    this.columns = const [],
+  });
+
+  factory ExportDef.fromMap(Map<String, dynamic> m) {
+    final id = m['id']?.toString() ?? 'export';
+    final format = (m['format']?.toString() ?? 'csv').toLowerCase();
+    final cols = <ExportColumn>[];
+    final rawCols = m['columns'];
+    if (rawCols is List) {
+      for (final c in rawCols) {
+        if (c is Map) {
+          cols.add(ExportColumn(
+              c['header']?.toString() ?? '', c['formula']?.toString().trim() ?? ''));
+        }
+      }
+    }
+    return ExportDef(
+      id: id,
+      format: format,
+      file: m['file']?.toString() ?? '$id.$format',
+      sync: m['sync']?.toString() ?? 'manual',
+      each: m['each']?.toString(),
+      where: m['where']?.toString(),
+      columns: cols,
+    );
+  }
+}
+
+class ExportResult {
+  final String exportId, path;
+  final int rows;
+  final List<String> errors;
+  const ExportResult(this.exportId, this.path, this.rows, [this.errors = const []]);
+  bool get ok => errors.isEmpty;
+}
+
+class EntityExporter {
+  /// Roda os exports de [def] (todos, ou só os `sync: one_way` se [autoOnly]).
+  /// Os arquivos vão para `<exportsRoot>/<pasta do tipo>/<file>`.
+  static Future<List<ExportResult>> run({
+    required EntityLocator locator,
+    required EntityTypeDef def,
+    required String exportsRoot,
+    bool autoOnly = false,
+    String? onlyId,
+  }) async {
+    final results = <ExportResult>[];
+    if (def.exports.isEmpty) return results;
+    final index = await EntityIndex.build(locator);
+    final env = FormulaEnv(locator.registry, index);
+    for (final raw in def.exports) {
+      final ed = ExportDef.fromMap(raw);
+      if (onlyId != null && ed.id != onlyId) continue;
+      if (autoOnly && ed.sync != 'one_way') continue;
+      final path = '$exportsRoot/${def.folder ?? def.id}/${ed.file}';
+      try {
+        results.add(await _runOne(env, def, ed, path));
+      } catch (e) {
+        results.add(ExportResult(ed.id, path, 0, ['$e']));
+      }
+    }
+    return results;
+  }
+
+  static Future<ExportResult> _runOne(
+      FormulaEnv env, EntityTypeDef def, ExportDef ed, String path) async {
+    if (ed.format != 'csv' && ed.format != 'xlsx') {
+      return ExportResult(ed.id, path, 0, ['formato não suportado: ${ed.format}']);
+    }
+    final errors = <String>[];
+    // Compila tudo antes de tocar no disco.
+    final compiled = <FNode>[];
+    try {
+      for (final c in ed.columns) {
+        compiled.add(env.parse(c.formula));
+      }
+    } on FormulaError catch (e) {
+      return ExportResult(ed.id, path, 0, ['coluna com fórmula inválida: ${e.message}']);
+    }
+    FNode? whereParsed;
+    if (ed.where != null && ed.where!.trim().isNotEmpty) {
+      try {
+        whereParsed = env.parse(ed.where!);
+      } on FormulaError catch (e) {
+        return ExportResult(ed.id, path, 0, ['where inválido: ${e.message}']);
+      }
+    }
+    final FNode? whereNode = whereParsed;
+
+    // each: "lista as alias"  (ou só "lista", e o alias é o próprio nome)
+    String? listKey, alias;
+    if (ed.each != null && ed.each!.trim().isNotEmpty) {
+      final m = RegExp(r'^\s*(\w+)(?:\s+as\s+(\w+))?\s*$').firstMatch(ed.each!);
+      if (m == null) {
+        return ExportResult(ed.id, path, 0, ['each inválido: "${ed.each}"']);
+      }
+      listKey = m.group(1);
+      alias = m.group(2) ?? m.group(1);
+    }
+
+    final rows = <List<String>>[
+      [for (final c in ed.columns) c.header],
+    ];
+    final reported = <int>{};
+
+    void addRow(EntityIndexEntry e, Map<String, dynamic> extra) {
+      final scope = env.scopeFor(e, extra: extra);
+      final w = whereNode;
+      if (w != null) {
+        try {
+          if (!formulaTruthy(w.eval(scope))) return;
+        } on FormulaError catch (err) {
+          errors.add('${e.name}: where: ${err.message}');
+          return;
+        }
+      }
+      final cells = <String>[];
+      for (var i = 0; i < compiled.length; i++) {
+        try {
+          cells.add(formulaStr(compiled[i].eval(scope)));
+        } on FormulaError catch (err) {
+          cells.add('#ERRO');
+          if (reported.add(i)) {
+            errors.add('coluna "${ed.columns[i].header}" (${e.name}): ${err.message}');
+          }
+        }
+      }
+      rows.add(cells);
+    }
+
+    for (final e in env.index.entries) {
+      if (e.typeId != def.id) continue;
+      if (listKey == null) {
+        addRow(e, const {});
+      } else {
+        final items = env.frontmatterOf(e)[listKey];
+        if (items is List) {
+          // Entidade sem itens não gera linha.
+          for (final it in items) {
+            addRow(e, {alias!: it});
+          }
+        }
+      }
+    }
+
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    if (ed.format == 'csv') {
+      await file.writeAsString(csvEncode(rows));
+    } else {
+      await file.writeAsBytes(xlsxEncode(rows));
+    }
+    return ExportResult(ed.id, path, rows.length - 1, errors);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV
+// ─────────────────────────────────────────────────────────────────────────────
+
+String _csvCell(String s) {
+  final needs = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
+  return needs ? '"${s.replaceAll('"', '""')}"' : s;
+}
+
+/// CSV (RFC 4180, linhas terminadas em CRLF, UTF-8 sem BOM).
+String csvEncode(List<List<String>> rows) =>
+    rows.map((r) => r.map(_csvCell).join(',')).join('\r\n') + (rows.isEmpty ? '' : '\r\n');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// XLSX (mínimo: uma planilha, textos em linha, ZIP sem compressão)
+// ─────────────────────────────────────────────────────────────────────────────
+
+String _xmlEscape(String s) {
+  final b = StringBuffer();
+  for (final r in s.runes) {
+    // Caracteres de controle (exceto tab, LF, CR) não existem em XML 1.0.
+    if (r < 0x20 && r != 9 && r != 10 && r != 13) continue;
+    switch (r) {
+      case 38:
+        b.write('&amp;');
+        break;
+      case 60:
+        b.write('&lt;');
+        break;
+      case 62:
+        b.write('&gt;');
+        break;
+      case 34:
+        b.write('&quot;');
+        break;
+      default:
+        b.writeCharCode(r);
+    }
+  }
+  return b.toString();
+}
+
+String _colName(int i) {
+  var n = i + 1;
+  final b = <int>[];
+  while (n > 0) {
+    final r = (n - 1) % 26;
+    b.add(65 + r);
+    n = (n - 1) ~/ 26;
+  }
+  return String.fromCharCodes(b.reversed);
+}
+
+List<int>? _crcTable;
+
+int _crc32(List<int> data) {
+  var table = _crcTable;
+  if (table == null) {
+    table = List<int>.filled(256, 0);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) {
+        c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+      }
+      table[n] = c;
+    }
+    _crcTable = table;
+  }
+  var crc = 0xFFFFFFFF;
+  for (final byte in data) {
+    crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+/// ZIP com entradas "stored" (sem compressão).
+Uint8List _zipStored(Map<String, List<int>> files) {
+  final out = BytesBuilder();
+  final central = BytesBuilder();
+  var count = 0;
+
+  void u16(BytesBuilder b, int v) => b.add([v & 0xFF, (v >> 8) & 0xFF]);
+  void u32(BytesBuilder b, int v) =>
+      b.add([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]);
+
+  files.forEach((name, data) {
+    final nameBytes = utf8.encode(name);
+    final crc = _crc32(data);
+    final offset = out.length;
+
+    u32(out, 0x04034b50);
+    u16(out, 20); // versão necessária
+    u16(out, 0x0800); // flag: nomes em UTF-8
+    u16(out, 0); // método: stored
+    u16(out, 0); // hora
+    u16(out, 0x0021); // data: 1980-01-01
+    u32(out, crc);
+    u32(out, data.length);
+    u32(out, data.length);
+    u16(out, nameBytes.length);
+    u16(out, 0);
+    out.add(nameBytes);
+    out.add(data);
+
+    u32(central, 0x02014b50);
+    u16(central, 20); // versão de criação
+    u16(central, 20); // versão necessária
+    u16(central, 0x0800);
+    u16(central, 0);
+    u16(central, 0);
+    u16(central, 0x0021);
+    u32(central, crc);
+    u32(central, data.length);
+    u32(central, data.length);
+    u16(central, nameBytes.length);
+    u16(central, 0); // extra
+    u16(central, 0); // comentário
+    u16(central, 0); // disco
+    u16(central, 0); // atributos internos
+    u32(central, 0); // atributos externos
+    u32(central, offset);
+    central.add(nameBytes);
+    count++;
+  });
+
+  final cdOffset = out.length;
+  final cd = central.toBytes();
+  out.add(cd);
+  u32(out, 0x06054b50);
+  u16(out, 0);
+  u16(out, 0);
+  u16(out, count);
+  u16(out, count);
+  u32(out, cd.length);
+  u32(out, cdOffset);
+  u16(out, 0);
+  return out.toBytes();
+}
+
+/// Gera um .xlsx de uma planilha ("Sheet1") com [rows] como texto.
+Uint8List xlsxEncode(List<List<String>> rows, {String sheetName = 'Sheet1'}) {
+  const xmlHead = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  final sheet = StringBuffer(xmlHead)
+    ..write('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    ..write('<sheetData>');
+  for (var r = 0; r < rows.length; r++) {
+    sheet.write('<row r="${r + 1}">');
+    for (var c = 0; c < rows[r].length; c++) {
+      final v = rows[r][c];
+      if (v.isEmpty) continue;
+      sheet.write('<c r="${_colName(c)}${r + 1}" t="inlineStr"><is>'
+          '<t xml:space="preserve">${_xmlEscape(v)}</t></is></c>');
+    }
+    sheet.write('</row>');
+  }
+  sheet.write('</sheetData></worksheet>');
+
+  const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  final files = <String, List<int>>{
+    '[Content_Types].xml': utf8.encode('$xmlHead'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'),
+    '_rels/.rels': utf8.encode('$xmlHead'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="$rel/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'),
+    'xl/workbook.xml': utf8.encode('$xmlHead'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="$rel">'
+        '<sheets><sheet name="${_xmlEscape(sheetName)}" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'),
+    'xl/_rels/workbook.xml.rels': utf8.encode('$xmlHead'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="$rel/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'),
+    'xl/worksheets/sheet1.xml': utf8.encode(sheet.toString()),
+  };
+  return _zipStored(files);
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Properties tab widget
+// (antes em entity_properties_view.dart)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// entity_properties_view.dart
+//
+// Aba "Properties" de uma instância: edita os valores das `properties` do tipo
+// (gravados no frontmatter da âncora), mostra fórmulas calculadas e roda os
+// exports do tipo (automaticamente após cada edição, para `sync: one_way`, e
+// sob demanda pelo botão).
+
+
+const Color _kLabel = Colors.white54;
+const Color _kText = Colors.white70;
+
+InputDecoration _fieldDeco(String hint) => InputDecoration(
+      isDense: true,
+      hintText: hint,
+      hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
+      filled: true,
+      fillColor: Colors.white.withOpacity(0.04),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.white10),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.white10),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.blueAccent),
+      ),
+    );
+
+class EntityPropertiesView extends StatefulWidget {
+  final EntityLoc loc;
+  final EntityLocator locator;
+
+  /// Pasta raiz dos exports (`<files>/exports`).
+  final String exportsRoot;
+
+  const EntityPropertiesView({
+    super.key,
+    required this.loc,
+    required this.locator,
+    required this.exportsRoot,
+  });
+
+  @override
+  State<EntityPropertiesView> createState() => _EntityPropertiesViewState();
+}
+
+class _EntityPropertiesViewState extends State<EntityPropertiesView> {
+  Map<String, dynamic> _values = {};
+  final Map<String, String> _computed = {};
+  final Map<String, String> _computedErr = {};
+  final Map<String, TextEditingController> _ctrl = {};
+  EntityIndex? _index;
+  bool _loading = true;
+  String? _error;
+  List<String> _exportStatus = const [];
+  bool _exporting = false;
+
+  List<Map<String, dynamic>> get _props => [
+        for (final p in widget.loc.def.properties)
+          if (propertyIsEditable(p)) p,
+      ];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant EntityPropertiesView old) {
+    super.didUpdateWidget(old);
+    if (old.loc.rel != widget.loc.rel) {
+      _disposeControllers();
+      _exportStatus = const [];
+      _load().then((_) {});
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeControllers();
+    super.dispose();
+  }
+
+  void _disposeControllers() {
+    for (final c in _ctrl.values) {
+      c.dispose();
+    }
+    _ctrl.clear();
+  }
+
+  Future<void> _load() async {
+    _loading = true;
+    _error = null;
+    try {
+      final values = EntityProps.read(widget.loc);
+      final index = await EntityIndex.build(widget.locator);
+      if (!mounted) return;
+      _values = values;
+      _index = index;
+      _recompute();
+      setState(() => _loading = false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '$e';
+      });
+    }
+  }
+
+  /// Recalcula as propriedades `formula` visíveis.
+  void _recompute() {
+    _computed.clear();
+    _computedErr.clear();
+    final index = _index;
+    if (index == null) return;
+    final me = index.byRel(widget.loc.rel);
+    if (me == null) return;
+    final env = FormulaEnv(widget.locator.registry, index);
+    for (final p in _props) {
+      if (p['type'] != 'formula') continue;
+      final key = p['key'].toString();
+      try {
+        _computed[key] = formulaStr(env.scopeFor(me).variable([key]));
+      } catch (e) {
+        _computedErr[key] = e is FormulaError ? e.message : '$e';
+      }
+    }
+  }
+
+  Future<void> _save(String key, dynamic value) async {
+    try {
+      await EntityProps.write(widget.loc, key, value);
+      if (!mounted) return;
+      _values = EntityProps.read(widget.loc);
+      // O índice guarda só ids/conexões; releia para fórmulas com $ref.
+      _index = await EntityIndex.build(widget.locator);
+      if (!mounted) return;
+      _recompute();
+      setState(() => _error = null);
+      await _runExports(autoOnly: true);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Não foi possível salvar "$key": $e');
+    }
+  }
+
+  Future<void> _runExports({required bool autoOnly}) async {
+    if (widget.loc.def.exports.isEmpty) return;
+    if (mounted) setState(() => _exporting = true);
+    try {
+      final results = await EntityExporter.run(
+        locator: widget.locator,
+        def: widget.loc.def,
+        exportsRoot: widget.exportsRoot,
+        autoOnly: autoOnly,
+      );
+      if (!mounted) return;
+      setState(() {
+        _exportStatus = [
+          for (final r in results)
+            if (r.ok)
+              '${r.path.split('/').last}: ${r.rows} linha(s)'
+            else
+              '${r.path.split('/').last}: ${r.errors.join('; ')}',
+        ];
+      });
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
+  TextEditingController _controllerFor(String key) {
+    return _ctrl.putIfAbsent(key, () {
+      final v = _values[key];
+      return TextEditingController(text: v == null ? '' : formulaStr(v));
+    });
+  }
+
+  dynamic _parseText(String type, String text) {
+    final t = text.trim();
+    if (t.isEmpty) return null;
+    if (type == 'number') return num.tryParse(t) ?? t;
+    return t;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Center(
+          child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
+    }
+    final props = _props;
+    final exports = widget.loc.def.exports;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 28),
+      children: [
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Text(_error!,
+                style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+          ),
+        for (final p in props) _row(p),
+        if (exports.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          const Divider(color: Colors.white10, height: 1),
+          const SizedBox(height: 12),
+          Row(children: [
+            const Expanded(
+              child: Text('Exports',
+                  style: TextStyle(
+                      color: _kLabel, fontSize: 12, fontWeight: FontWeight.w600)),
+            ),
+            TextButton.icon(
+              style: TextButton.styleFrom(foregroundColor: Colors.white54),
+              onPressed: _exporting ? null : () => _runExports(autoOnly: false),
+              icon: _exporting
+                  ? const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 1.5))
+                  : const Icon(Icons.file_download_outlined, size: 14),
+              label: const Text('Export now', style: TextStyle(fontSize: 12)),
+            ),
+          ]),
+          for (final raw in exports)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '${ExportDef.fromMap(raw).file}  ·  ${ExportDef.fromMap(raw).sync == 'one_way' ? 'automatic' : 'manual'}',
+                style: const TextStyle(color: Colors.white30, fontSize: 11.5),
+              ),
+            ),
+          for (final s in _exportStatus)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(s, style: const TextStyle(color: Colors.white38, fontSize: 11.5)),
+            ),
+        ],
+      ],
+    );
+  }
+
+  Widget _row(Map<String, dynamic> p) {
+    final key = p['key'].toString();
+    final type = (p['type'] ?? 'text').toString();
+    final label = (p['label'] ?? key).toString();
+    final multi = type == 'phone_list';
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Row(
+        crossAxisAlignment: multi ? CrossAxisAlignment.start : CrossAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 130,
+            child: Padding(
+              padding: EdgeInsets.only(top: multi ? 10 : 0),
+              child: Text(label, style: const TextStyle(color: _kLabel, fontSize: 12.5)),
+            ),
+          ),
+          Expanded(child: _field(p, key, type)),
+        ],
+      ),
+    );
+  }
+
+  Widget _field(Map<String, dynamic> p, String key, String type) {
+    switch (type) {
+      case 'bool':
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: Switch(
+            value: _values[key] == true,
+            onChanged: (v) {
+              setState(() => _values[key] = v);
+              _save(key, v ? true : null);
+            },
+          ),
+        );
+      case 'formula':
+        final err = _computedErr[key];
+        return Text(
+          err != null ? '#ERRO: $err' : (_computed[key] ?? ''),
+          style: TextStyle(color: err != null ? Colors.redAccent : Colors.white38, fontSize: 13),
+        );
+      case 'ref':
+        return _refField(p, key);
+      case 'phone_list':
+        return _PhoneListField(
+          key: ValueKey('phones:${widget.loc.rel}'),
+          initial: [
+            for (final e in (_values[key] is List ? _values[key] as List : const []))
+              if (e is Map) Map<String, dynamic>.from(e),
+          ],
+          onChanged: (list) {
+            _values[key] = list;
+            _save(key, list.isEmpty ? null : list);
+          },
+        );
+      default:
+        final ctrl = _controllerFor(key);
+        return Focus(
+          onFocusChange: (has) {
+            if (has) return;
+            final next = _parseText(type, ctrl.text);
+            if (formulaStr(next) != formulaStr(_values[key])) {
+              _values[key] = next;
+              _save(key, next);
+            }
+          },
+          child: TextField(
+            controller: ctrl,
+            style: const TextStyle(color: _kText, fontSize: 13),
+            keyboardType: type == 'number' ? TextInputType.number : TextInputType.text,
+            decoration: _fieldDeco(''),
+            onSubmitted: (t) {
+              final next = _parseText(type, t);
+              if (formulaStr(next) != formulaStr(_values[key])) {
+                _values[key] = next;
+                _save(key, next);
+              }
+            },
+          ),
+        );
+    }
+  }
+
+  Widget _refField(Map<String, dynamic> p, String key) {
+    final id = _values[key]?.toString();
+    final target = p['target']?.toString();
+    final other = (id == null || id.isEmpty) ? null : _index?.byId(id);
+    final text = other?.name ?? (id == null || id.isEmpty ? 'None' : '(missing entity)');
+    return Row(children: [
+      Expanded(
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => _pickRef(key, target),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.04),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: Text(text,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: other == null ? Colors.white30 : _kText, fontSize: 13)),
+          ),
+        ),
+      ),
+      if (other != null)
+        IconButton(
+          tooltip: 'Clear',
+          icon: const Icon(Icons.close_rounded, size: 15, color: Colors.white30),
+          onPressed: () {
+            setState(() => _values.remove(key));
+            _save(key, null);
+          },
+        ),
+    ]);
+  }
+
+  Future<void> _pickRef(String key, String? target) async {
+    final index = _index;
+    if (index == null) return;
+    final candidates = [
+      for (final e in index.entries)
+        if (e.rel != widget.loc.rel && (target == null || target == 'any' || e.typeId == target))
+          e,
+    ];
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2124),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: BorderSide(color: Colors.white.withOpacity(0.08)),
+        ),
+        title: const Text('Choose',
+            style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 380,
+          height: 320,
+          child: candidates.isEmpty
+              ? const Center(
+                  child: Text('Nothing to choose from.',
+                      style: TextStyle(color: Colors.white38, fontSize: 13)))
+              : ListView(children: [
+                  for (final e in candidates)
+                    InkWell(
+                      onTap: () => Navigator.of(ctx).pop(e.id),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                        child: Text(e.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                      ),
+                    ),
+                ]),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+        ],
+      ),
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _values[key] = picked);
+    await _save(key, picked);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lista de telefones: [{label, number, primary}]
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _PhoneRow {
+  final TextEditingController label;
+  final TextEditingController number;
+  bool primary;
+  _PhoneRow(String l, String n, this.primary)
+      : label = TextEditingController(text: l),
+        number = TextEditingController(text: n);
+  void dispose() {
+    label.dispose();
+    number.dispose();
+  }
+}
+
+class _PhoneListField extends StatefulWidget {
+  final List<Map<String, dynamic>> initial;
+  final void Function(List<Map<String, dynamic>>) onChanged;
+  const _PhoneListField({super.key, required this.initial, required this.onChanged});
+
+  @override
+  State<_PhoneListField> createState() => _PhoneListFieldState();
+}
+
+class _PhoneListFieldState extends State<_PhoneListField> {
+  late final List<_PhoneRow> _rows;
+
+  @override
+  void initState() {
+    super.initState();
+    _rows = [
+      for (final m in widget.initial)
+        _PhoneRow(
+            formulaStr(m['label']), formulaStr(m['number']), m['primary'] == true),
+    ];
+  }
+
+  @override
+  void dispose() {
+    for (final r in _rows) {
+      r.dispose();
+    }
+    super.dispose();
+  }
+
+  /// Linhas sem número não são gravadas (continuam na tela até serem preenchidas).
+  void _emit() {
+    widget.onChanged([
+      for (final r in _rows)
+        if (r.number.text.trim().isNotEmpty)
+          <String, dynamic>{
+            'label': r.label.text.trim(),
+            'number': r.number.text.trim(),
+            'primary': r.primary,
+          },
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      for (int i = 0; i < _rows.length; i++)
+        Padding(
+          key: ObjectKey(_rows[i]),
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(children: [
+            SizedBox(
+              width: 110,
+              child: Focus(
+                onFocusChange: (has) {
+                  if (!has) _emit();
+                },
+                child: TextField(
+                  controller: _rows[i].label,
+                  style: const TextStyle(color: _kText, fontSize: 13),
+                  decoration: _fieldDeco('Label'),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Focus(
+                onFocusChange: (has) {
+                  if (!has) _emit();
+                },
+                child: TextField(
+                  controller: _rows[i].number,
+                  style: const TextStyle(color: _kText, fontSize: 13),
+                  keyboardType: TextInputType.phone,
+                  decoration: _fieldDeco('Number'),
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Primary',
+              icon: Icon(
+                _rows[i].primary ? Icons.star_rounded : Icons.star_outline_rounded,
+                size: 17,
+                color: _rows[i].primary ? Colors.amberAccent : Colors.white30,
+              ),
+              onPressed: () {
+                setState(() => _rows[i].primary = !_rows[i].primary);
+                _emit();
+              },
+            ),
+            IconButton(
+              tooltip: 'Remove',
+              icon: const Icon(Icons.delete_outline_rounded, size: 17, color: Colors.white30),
+              onPressed: () {
+                final gone = _rows.removeAt(i);
+                setState(() {});
+                // Descarta depois do frame: os TextFields antigos ainda referenciam o controller.
+                WidgetsBinding.instance.addPostFrameCallback((_) => gone.dispose());
+                _emit();
+              },
+            ),
+          ]),
+        ),
+      Align(
+        alignment: Alignment.centerLeft,
+        child: TextButton.icon(
+          style: TextButton.styleFrom(foregroundColor: Colors.white54),
+          onPressed: () => setState(() => _rows.add(_PhoneRow('', '', false))),
+          icon: const Icon(Icons.add_rounded, size: 14),
+          label: const Text('Add phone', style: TextStyle(fontSize: 12)),
+        ),
+      ),
+    ]);
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Entity types designer (create / edit types, folder pattern)
+// (antes em entity_type_designer.dart)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// entity_type_designer.dart
+//
+// Designer de Tipo: interface para criar, editar e apagar os tipos de entidade
+// (generalized/.types/<id>.yaml) sem escrever YAML — identidade, padrão de
+// pastas/arquivos, abas, filhos, propriedades e exports. A aba "YAML" mostra e
+// aceita o arquivo cru para tudo que a interface ainda não cobre.
+
+
+const Color _kBg = Color(0xFF1E2124);
+const Color _kPanel = Color(0xFF181A1C);
+const Color _kLine = Color(0xFF2C2F32);
+const Color _kAccent = Colors.blueAccent;
+
+/// Ícones disponíveis para os tipos (nome gravado no YAML → ícone).
+const Map<String, IconData> kEntityIconChoices = {
+  'category_outlined': Icons.category_outlined,
+  'person_outline': Icons.person_outline_rounded,
+  'group_outlined': Icons.group_outlined,
+  'place_outlined': Icons.place_outlined,
+  'event_outlined': Icons.event_outlined,
+  'public_outlined': Icons.public_outlined,
+  'psychology_outlined': Icons.psychology_outlined,
+  'self_improvement_outlined': Icons.self_improvement_outlined,
+  'hub_outlined': Icons.hub_outlined,
+  'theater_comedy_outlined': Icons.theater_comedy_outlined,
+  'folder_outlined': Icons.folder_outlined,
+  'star_outline': Icons.star_outline,
+  'book_outlined': Icons.book_outlined,
+  'work_outline': Icons.work_outline,
+  'home_outlined': Icons.home_outlined,
+  'school_outlined': Icons.school_outlined,
+  'business_outlined': Icons.business_outlined,
+  'phone_outlined': Icons.phone_outlined,
+  'pets_outlined': Icons.pets_outlined,
+  'label_outline': Icons.label_outline,
+  'bookmark_outline': Icons.bookmark_outline,
+  'lightbulb_outline': Icons.lightbulb_outline,
+  'science_outlined': Icons.science_outlined,
+  'movie_outlined': Icons.movie_outlined,
+  'music_note_outlined': Icons.music_note_outlined,
+  'restaurant_outlined': Icons.restaurant_outlined,
+  'directions_car_outlined': Icons.directions_car_outlined,
+  'shopping_bag_outlined': Icons.shopping_bag_outlined,
+  'favorite_border': Icons.favorite_border,
+  'account_balance_outlined': Icons.account_balance_outlined,
+  'fitness_center_outlined': Icons.fitness_center_outlined,
+  'build_outlined': Icons.build_outlined,
+  'inventory_2_outlined': Icons.inventory_2_outlined,
+  'article_outlined': Icons.article_outlined,
+  'task_alt_outlined': Icons.task_alt_outlined,
+  'code_rounded': Icons.code_rounded,
+};
+
+IconData entityIconFromName(String name) => kEntityIconChoices[name] ?? Icons.category_outlined;
+
+const List<String> _kPlaceholders = ['{name}', '{safe}', '{type}', '{uuid}', '{workspace}'];
+
+InputDecoration _deco(String label, {String? hint, String? helper, String? error}) => InputDecoration(
+      labelText: label,
+      hintText: hint,
+      helperText: helper,
+      errorText: error,
+      helperMaxLines: 3,
+      errorMaxLines: 3,
+      isDense: true,
+      labelStyle: const TextStyle(color: Colors.white38, fontSize: 12),
+      hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
+      helperStyle: const TextStyle(color: Colors.white24, fontSize: 11),
+      filled: true,
+      fillColor: Colors.white.withOpacity(0.04),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.white10),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.white10),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: _kAccent),
+      ),
+      disabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: Colors.white10),
+      ),
+    );
+
+class _TNode {
+  final String path;
+  final bool isDir;
+  final int depth;
+  const _TNode(this.path, this.isDir, this.depth);
+  String get name => path.contains('/') ? path.substring(path.lastIndexOf('/') + 1) : path;
+}
+
+class EntityTypeDesigner extends StatefulWidget {
+  /// `<files>/generalized/.types`
+  final String typesDir;
+
+  /// `<files>/generalized` (para contar instâncias existentes).
+  final String genRoot;
+  final String? initialTypeId;
+
+  /// Chamado depois de salvar ou apagar um tipo (recarregue o registro).
+  final VoidCallback onChanged;
+  final VoidCallback? onClose;
+
+  /// Modo "página de configurações do tipo": edita só o tipo [focusTypeId]
+  /// (nome, ícone e padrão de pastas), sem lista de tipos, e [onClose] volta.
+  final String? focusTypeId;
+
+  /// No modo focado, abre o designer completo (todas as abas e todos os tipos).
+  final VoidCallback? onOpenFull;
+
+  const EntityTypeDesigner({
+    super.key,
+    required this.typesDir,
+    required this.genRoot,
+    required this.onChanged,
+    this.initialTypeId,
+    this.onClose,
+    this.focusTypeId,
+    this.onOpenFull,
+  });
+
+  /// Abre o designer em um diálogo grande.
+  static Future<void> show(
+    BuildContext context, {
+    required String typesDir,
+    required String genRoot,
+    required VoidCallback onChanged,
+    String? initialTypeId,
+  }) {
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        final size = MediaQuery.of(ctx).size;
+        return Dialog(
+          backgroundColor: _kBg,
+          insetPadding: const EdgeInsets.all(24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: SizedBox(
+            width: math.min(1180, size.width - 48),
+            height: math.min(800, size.height - 48),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: EntityTypeDesigner(
+                typesDir: typesDir,
+                genRoot: genRoot,
+                initialTypeId: initialTypeId,
+                onChanged: onChanged,
+                onClose: () => Navigator.of(ctx).pop(),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  State<EntityTypeDesigner> createState() => _EntityTypeDesignerState();
+}
+
+class _EntityTypeDesignerState extends State<EntityTypeDesigner> {
+  late final EntityTypeStore _store = EntityTypeStore(widget.typesDir);
+  Map<String, Map<String, dynamic>> _saved = {};
+  Map<String, dynamic>? _draft;
+  bool _isNew = false;
+  bool _loading = true;
+  String _section = 'general';
+  List<String> _errors = [];
+  String _status = '';
+
+  // editor de padrão de pastas
+  String? _selPath;
+  bool _selIsDir = true;
+  final TextEditingController _fileCtrl = TextEditingController();
+
+  // aba YAML
+  final TextEditingController _yamlCtrl = TextEditingController();
+  String? _yamlError;
+
+  bool get _focused => widget.focusTypeId != null;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload(select: widget.focusTypeId ?? widget.initialTypeId);
+  }
+
+  @override
+  void dispose() {
+    _fileCtrl.dispose();
+    _yamlCtrl.dispose();
+    super.dispose();
+  }
+
+  // ── dados ──────────────────────────────────────────────────────────────────
+
+  Future<void> _reload({String? select}) async {
+    final raws = await _store.loadRaw();
+    if (!mounted) return;
+    setState(() {
+      _saved = raws;
+      _loading = false;
+      final pick = select ?? (raws.isNotEmpty ? (_sortedIds().isNotEmpty ? _sortedIds().first : null) : null);
+      if (pick != null && raws.containsKey(pick)) {
+        _draft = cloneRaw(raws[pick]!);
+        _isNew = false;
+      } else if (!(_isNew && _draft != null)) {
+        _draft = null;
+      }
+      _errors = [];
+      _selPath = null;
+      _selIsDir = true;
+      _fileCtrl.text = '';
+      _yamlError = null;
+    });
+  }
+
+  List<String> _sortedIds() {
+    final ids = _saved.keys.toList();
+    ids.sort((a, b) => _labelOf(_saved[a]!, a).toLowerCase().compareTo(_labelOf(_saved[b]!, b).toLowerCase()));
+    return ids;
+  }
+
+  String _labelOf(Map<String, dynamic> raw, String id) {
+    final l = raw['label']?.toString() ?? '';
+    return l.isEmpty ? id : l;
+  }
+
+  String get _id => _draft?['id']?.toString() ?? '';
+
+  /// Cópia sem listas/mapas vazios: é o que vai para o arquivo e o que se compara
+  /// para saber se há alterações (abrir uma seção não deve "sujar" o rascunho).
+  Map<String, dynamic> _canon(Map<String, dynamic> m) {
+    dynamic strip(dynamic v) {
+      if (v is Map) {
+        final o = <String, dynamic>{};
+        v.forEach((k, x) {
+          final sx = strip(x);
+          if (!(sx is List && sx.isEmpty) && !(sx is Map && sx.isEmpty)) o[k.toString()] = sx;
+        });
+        return o;
+      }
+      if (v is List) return <dynamic>[for (final x in v) strip(x)];
+      return v;
+    }
+
+    return strip(m) as Map<String, dynamic>;
+  }
+
+  bool get _dirty {
+    final d = _draft;
+    if (d == null) return false;
+    if (_isNew) return true;
+    final s = _saved[_id];
+    return s == null || yamlEmit(_canon(d)) != yamlEmit(_canon(s));
+  }
+
+  Map<String, Map<String, dynamic>> get _others {
+    final o = {..._saved};
+    o.remove(_id);
+    return o;
+  }
+
+  int _instanceCount(String? folder) {
+    if (folder == null || folder.isEmpty) return 0;
+    final d = Directory('${widget.genRoot}/$folder');
+    if (!d.existsSync()) return 0;
+    var n = 0;
+    for (final e in d.listSync()) {
+      if (e is Directory && !e.uri.pathSegments.where((s) => s.isNotEmpty).last.startsWith('.')) n++;
+    }
+    return n;
+  }
+
+  // ── pequenos helpers de dados do rascunho ───────────────────────────────────
+
+  Map<String, dynamic> get _pat {
+    final d = _draft!;
+    if (d['pattern'] is! Map) d['pattern'] = <String, dynamic>{};
+    return d['pattern'] as Map<String, dynamic>;
+  }
+
+  List<dynamic> get _dirs {
+    if (_pat['dirs'] is! List) _pat['dirs'] = <dynamic>[];
+    return _pat['dirs'] as List<dynamic>;
+  }
+
+  List<dynamic> get _files {
+    if (_pat['files'] is! List) _pat['files'] = <dynamic>[];
+    return _pat['files'] as List<dynamic>;
+  }
+
+  List<dynamic> _list(String key) {
+    final d = _draft!;
+    if (d[key] is! List) d[key] = <dynamic>[];
+    return d[key] as List<dynamic>;
+  }
+
+  Map<String, dynamic> _profile() {
+    final d = _draft!;
+    if (d['profile'] is! Map) d['profile'] = <String, dynamic>{'header': <String, dynamic>{'h': 120}};
+    return d['profile'] as Map<String, dynamic>;
+  }
+
+  List<dynamic> get _blocks {
+    final p = _profile();
+    if (p['blocks'] is! List) p['blocks'] = <dynamic>[];
+    return p['blocks'] as List<dynamic>;
+  }
+
+  Map<String, dynamic>? _fileAt(String path) {
+    for (final f in _files) {
+      final m = f as Map<String, dynamic>;
+      if (m['path']?.toString() == path) return m;
+    }
+    return null;
+  }
+
+  List<Map<String, dynamic>> get _fileMaps => [for (final f in _files) f as Map<String, dynamic>];
+
+  String _uniqueFileId(String base) {
+    final used = {for (final f in _fileMaps) f['id']?.toString() ?? ''};
+    var id = base.isEmpty ? 'file' : base;
+    id = id.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '_');
+    if (!RegExp(r'^[A-Za-z]').hasMatch(id)) id = 'f_$id';
+    var out = id;
+    var n = 2;
+    while (used.contains(out)) {
+      out = '${id}_$n';
+      n++;
+    }
+    return out;
+  }
+
+  String _uniqueTabId(String base) {
+    final used = {for (final t in _list('tabs')) (t as Map<String, dynamic>)['id']?.toString() ?? ''};
+    var out = base;
+    var n = 2;
+    while (used.contains(out)) {
+      out = '${base}_$n';
+      n++;
+    }
+    return out;
+  }
+
+  void _touch() => setState(() {
+        _status = '';
+        _errors = [];
+      });
+
+  // ── diálogos ───────────────────────────────────────────────────────────────
+
+  Future<String?> _prompt(String title, {String initial = '', String hint = '', String? helper}) {
+    final ctrl = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _kBg,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 380,
+          child: TextField(
+            controller: ctrl,
+            autofocus: true,
+            style: const TextStyle(color: Colors.white, fontSize: 13),
+            decoration: _deco('', hint: hint, helper: helper),
+            onSubmitted: (v) => Navigator.of(ctx).pop(v),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<bool> _confirm(String title, String message, {String okLabel = 'OK', bool danger = false}) async {
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _kBg,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 400,
+          child: Text(message, style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: Text(okLabel, style: TextStyle(color: danger ? Colors.redAccent : _kAccent)),
+          ),
+        ],
+      ),
+    );
+    return r ?? false;
+  }
+
+  Future<bool> _discardOk() async {
+    if (!_dirty) return true;
+    return _confirm('Discard changes?', 'The type "${_labelOf(_draft!, _id)}" has unsaved changes.',
+        okLabel: 'Discard', danger: true);
+  }
+
+  // ── ações de nível de tipo ──────────────────────────────────────────────────
+
+  Future<void> _selectType(String id) async {
+    if (id == _id && !_isNew) return;
+    if (!await _discardOk()) return;
+    if (!mounted) return;
+    setState(() {
+      _draft = cloneRaw(_saved[id]!);
+      _isNew = false;
+      _errors = [];
+      _status = '';
+      _selPath = null;
+      _selIsDir = true;
+      _fileCtrl.text = '';
+      _yamlError = null;
+      if (_section == 'yaml') _yamlCtrl.text = yamlEmit(_canon(_draft!));
+    });
+  }
+
+  Future<void> _newType() async {
+    if (!await _discardOk()) return;
+    if (!mounted) return;
+    final nameCtrl = TextEditingController();
+    final folderCtrl = TextEditingController();
+    var root = true;
+    var folderTouched = false;
+    String? copyFrom;
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          backgroundColor: _kBg,
+          title: const Text('New entity type',
+              style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+          content: SizedBox(
+            width: 420,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              TextField(
+                controller: nameCtrl,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: _deco('Name', hint: 'e.g. Books, Companies, Dreams'),
+                onChanged: (v) {
+                  if (!folderTouched) folderCtrl.text = entitySlug(v);
+                  setS(() {});
+                },
+              ),
+              const SizedBox(height: 14),
+              Wrap(spacing: 8, children: [
+                ChoiceChip(
+                  label: const Text('Root type'),
+                  selected: root,
+                  onSelected: (_) => setS(() => root = true),
+                ),
+                ChoiceChip(
+                  label: const Text('Child type'),
+                  selected: !root,
+                  onSelected: (_) => setS(() => root = false),
+                ),
+              ]),
+              const SizedBox(height: 6),
+              Text(
+                root
+                    ? 'Gets its own section in the sidebar and a folder in generalized/.'
+                    : 'Lives inside instances of another type (add it under that type\'s Children).',
+                style: const TextStyle(color: Colors.white30, fontSize: 11.5),
+              ),
+              if (root) ...[
+                const SizedBox(height: 14),
+                TextField(
+                  controller: folderCtrl,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: _deco('Root folder'),
+                  onChanged: (_) => folderTouched = true,
+                ),
+              ],
+              const SizedBox(height: 14),
+              _dropdown(
+                label: 'Start from',
+                value: copyFrom ?? '',
+                options: [
+                  ('', 'Blank (anchor file only)'),
+                  for (final id in _sortedIds()) (id, 'Copy of ${_labelOf(_saved[id]!, id)}'),
+                ],
+                onChanged: (v) => setS(() => copyFrom = (v == null || v.isEmpty) ? null : v),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+            ),
+            TextButton(
+              onPressed: nameCtrl.text.trim().isEmpty ? null : () => Navigator.of(ctx).pop(true),
+              child: const Text('Create'),
+            ),
+          ],
+        ),
+      ),
+    );
+    final name = nameCtrl.text.trim();
+    final folder = folderCtrl.text.trim();
+    if (result != true || name.isEmpty || !mounted) return;
+    final id = uniqueTypeId(name, _saved.keys);
+    var raw = newTypeRaw(id: id, label: name, folder: root ? (folder.isEmpty ? entitySlug(name) : folder) : null);
+    if (copyFrom != null) {
+      raw = cloneRaw(_saved[copyFrom!]!);
+      raw['id'] = id;
+      raw['label'] = name;
+      if (root) {
+        raw['folder'] = folder.isEmpty ? entitySlug(name) : folder;
+      } else {
+        raw.remove('folder');
+      }
+    }
+    setState(() {
+      _draft = raw;
+      _isNew = true;
+      _section = 'general';
+      _errors = [];
+      _status = '';
+      _selPath = null;
+      _selIsDir = true;
+      _fileCtrl.text = '';
+    });
+  }
+
+  void _normalizeBeforeSave(Map<String, dynamic> d) {
+    // ids de arquivos: todo arquivo ganha um id (usado por abas e blocos do perfil)
+    for (final f in _fileMaps) {
+      if ((f['id']?.toString() ?? '').isEmpty) {
+        final path = f['path']?.toString() ?? 'file';
+        final base = path.split('/').last.split('.').first;
+        f['id'] = _uniqueFileId(base);
+      }
+    }
+    // layout dos blocos do perfil: empilha na vertical os que ainda não têm layout
+    var y = 0.0;
+    for (final b in _blocks) {
+      final m = b as Map<String, dynamic>;
+      if (m['layout'] is Map) {
+        final l = m['layout'] as Map<String, dynamic>;
+        final yy = (l['y'] is num ? (l['y'] as num).toDouble() : 0.0) + (l['h'] is num ? (l['h'] as num).toDouble() : 260.0);
+        if (yy > y) y = yy;
+      }
+    }
+    for (final b in _blocks) {
+      final m = b as Map<String, dynamic>;
+      if (m['layout'] is! Map) {
+        m['layout'] = <String, dynamic>{'x': 0.015, 'y': y, 'w': 0.97, 'h': 260};
+        y += 268;
+      }
+    }
+  }
+
+  String? _formulaError(String src) {
+    final s = src.trim();
+    if (s.isEmpty) return null;
+    try {
+      parseFormula(s);
+      return null;
+    } catch (e) {
+      return e.toString().replaceFirst('FormulaError: ', '');
+    }
+  }
+
+  List<String> _formulaErrors(Map<String, dynamic> d) {
+    final out = <String>[];
+    for (final p in _list('properties')) {
+      final m = p as Map<String, dynamic>;
+      if (m['type'] == 'formula') {
+        final e = _formulaError(m['formula']?.toString() ?? '');
+        if (e != null) out.add('Property "${m['key']}": $e');
+      }
+    }
+    for (final x in _list('exports')) {
+      final m = x as Map<String, dynamic>;
+      final w = _formulaError(m['where']?.toString() ?? '');
+      if (w != null) out.add('Export "${m['id']}" filter: $w');
+      for (final c in (m['columns'] is List ? m['columns'] as List : const [])) {
+        final cm = c as Map<String, dynamic>;
+        final e = _formulaError(cm['formula']?.toString() ?? '');
+        if (e != null) out.add('Export "${m['id']}" column "${cm['header']}": $e');
+      }
+    }
+    return out;
+  }
+
+  Future<void> _save() async {
+    final d = _draft;
+    if (d == null) return;
+    if (_section == 'yaml' && !_applyYaml()) return;
+    _normalizeBeforeSave(d);
+    final errs = [...validateTypeRaw(d, _others), ..._formulaErrors(d)];
+    if (_isNew && _saved.containsKey(_id)) {
+      errs.insert(0, 'A type with the id "$_id" already exists. Pick another id.');
+    }
+    if (errs.isNotEmpty) {
+      setState(() => _errors = errs);
+      return;
+    }
+    try {
+      await _store.save(_canon(d));
+    } catch (e) {
+      setState(() => _errors = ['Could not save: $e']);
+      return;
+    }
+    await _reload(select: _id);
+    if (!mounted) return;
+    setState(() => _status = 'Saved');
+    widget.onChanged();
+  }
+
+  Future<void> _revert() async {
+    if (!_dirty) return;
+    if (!await _confirm('Revert changes?', 'Discard all unsaved changes to this type?',
+        okLabel: 'Revert', danger: true)) {
+      return;
+    }
+    if (!mounted) return;
+    if (_isNew) {
+      _isNew = false;
+      await _reload();
+    } else {
+      await _reload(select: _id);
+    }
+    if (_section == 'yaml' && _draft != null) _yamlCtrl.text = yamlEmit(_canon(_draft!));
+  }
+
+  Future<void> _delete() async {
+    final d = _draft;
+    if (d == null) return;
+    if (_isNew) {
+      setState(() {
+        _isNew = false;
+        _draft = null;
+      });
+      await _reload();
+      return;
+    }
+    final n = _instanceCount(_saved[_id]?['folder']?.toString());
+    final extra = n > 0
+        ? '\n\n$n existing instance folder(s) in generalized/${_saved[_id]!['folder']} will NOT be deleted, '
+            'but they will be hidden until a type with that folder exists again.'
+        : '';
+    if (!await _confirm('Delete type?', 'Delete "${_labelOf(d, _id)}"? This removes its definition file.$extra',
+        okLabel: 'Delete', danger: true)) {
+      return;
+    }
+    await _store.delete(_id);
+    _draft = null;
+    await _reload();
+    widget.onChanged();
+  }
+
+  // ── YAML ───────────────────────────────────────────────────────────────────
+
+  bool _applyYaml() {
+    try {
+      final parsed = parseTypeYaml(_yamlCtrl.text);
+      final id = parsed['id']?.toString() ?? '';
+      if (id != _id) {
+        setState(() => _yamlError = 'The id cannot be changed here (expected "$_id", got "$id").');
+        return false;
+      }
+      setState(() {
+        _draft = parsed;
+        _yamlError = null;
+        _errors = [];
+      });
+      return true;
+    } on FormatException catch (e) {
+      setState(() => _yamlError = e.message);
+      return false;
+    }
+  }
+
+  void _setSection(String s) {
+    if (s == _section) return;
+    if (_section == 'yaml' && _yamlCtrl.text != yamlEmit(_canon(_draft!)) && !_applyYaml()) return;
+    setState(() {
+      _section = s;
+      if (s == 'yaml' && _draft != null) {
+        _yamlCtrl.text = yamlEmit(_canon(_draft!));
+        _yamlError = null;
+      }
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // UI
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: _kBg,
+      child: Column(children: [
+        _topBar(),
+        const Divider(height: 1, color: _kLine),
+        Expanded(
+          child: _loading
+              ? const Center(child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24))
+              : _focused
+                  ? (_draft == null
+                      ? const Center(
+                          child: Text('This type no longer exists.',
+                              style: TextStyle(color: Colors.white38, fontSize: 13)),
+                        )
+                      : _editor())
+                  : Row(children: [
+                      SizedBox(width: 230, child: _typeList()),
+                      const VerticalDivider(width: 1, color: _kLine),
+                      Expanded(child: _draft == null ? _emptyState() : _editor()),
+                    ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _topBar() => _focused ? _topBarFocused() : _topBarDialog();
+
+  Widget _topBarFocused() => Container(
+        height: 46,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Row(children: [
+          IconButton(
+            tooltip: 'Back',
+            icon: const Icon(Icons.arrow_back_rounded, size: 18, color: Colors.white54),
+            onPressed: () async {
+              if (!await _discardOk()) return;
+              widget.onClose?.call();
+            },
+          ),
+          const SizedBox(width: 4),
+          Icon(entityIconFromName(_draft?['icon']?.toString() ?? ''), size: 18, color: Colors.white54),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              _draft == null ? 'Type settings' : 'Type settings · ${_labelOf(_draft!, _id)}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ]),
+      );
+
+  Widget _topBarDialog() => Container(
+        height: 46,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Row(children: [
+          const Icon(Icons.category_outlined, size: 18, color: Colors.white54),
+          const SizedBox(width: 10),
+          const Text('Entity types',
+              style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text('generalized/.types/*.yaml',
+                style: TextStyle(color: Colors.white24, fontSize: 11, fontFamily: 'monospace')),
+          ),
+          IconButton(
+            tooltip: 'Close',
+            icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white54),
+            onPressed: () async {
+              if (!await _discardOk()) return;
+              widget.onClose?.call();
+            },
+          ),
+        ]),
+      );
+
+  Widget _emptyState() => Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.category_outlined, size: 44, color: Colors.white10),
+          const SizedBox(height: 14),
+          Text(
+            _saved.isEmpty ? 'No entity types yet.' : 'Select a type on the left.',
+            style: const TextStyle(color: Colors.white38, fontSize: 14),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'A type defines the folder pattern, tabs and properties\nof every instance you create.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white24, fontSize: 12, height: 1.5),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: _newType,
+            icon: const Icon(Icons.add_rounded, size: 16),
+            label: const Text('New type'),
+          ),
+        ]),
+      );
+
+  Widget _typeList() {
+    final ids = _sortedIds();
+    return Container(
+      color: _kPanel,
+      child: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(10),
+          child: SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _newType,
+              icon: const Icon(Icons.add_rounded, size: 16),
+              label: const Text('New type'),
+            ),
+          ),
+        ),
+        Expanded(
+          child: ListView(children: [
+            if (_isNew && _draft != null) _typeTile(_id, _draft!, isNewTile: true),
+            for (final id in ids)
+              if (!(_isNew && id == _id)) _typeTile(id, id == _id && !_isNew ? _draft! : _saved[id]!),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _typeTile(String id, Map<String, dynamic> raw, {bool isNewTile = false}) {
+    final selected = id == _id;
+    final folder = raw['folder']?.toString() ?? '';
+    final sub = raw['abstract'] == true
+        ? 'abstract'
+        : folder.isNotEmpty
+            ? 'generalized/$folder'
+            : 'child type';
+    return InkWell(
+      onTap: isNewTile ? null : () => _selectType(id),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+        decoration: BoxDecoration(
+          color: selected ? _kAccent.withOpacity(0.10) : Colors.transparent,
+          border: Border(left: BorderSide(color: selected ? _kAccent : Colors.transparent, width: 2)),
+        ),
+        child: Row(children: [
+          Icon(entityIconFromName(raw['icon']?.toString() ?? ''), size: 16,
+              color: selected ? _kAccent : Colors.white38),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                _labelOf(raw, id) + (isNewTile ? '  (new)' : ''),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: selected ? Colors.white : Colors.white70,
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w500 : FontWeight.normal),
+              ),
+              Text(sub, maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white24, fontSize: 10.5)),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _editor() {
+    final d = _draft!;
+    return Column(children: [
+      Container(
+        padding: const EdgeInsets.fromLTRB(20, 12, 16, 10),
+        child: Row(children: [
+          Icon(entityIconFromName(d['icon']?.toString() ?? ''), size: 20, color: Colors.white70),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(_labelOf(d, _id),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600)),
+              Text(_id, style: const TextStyle(color: Colors.white24, fontSize: 11, fontFamily: 'monospace')),
+            ]),
+          ),
+          if (_status.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Text(_status, style: const TextStyle(color: Colors.greenAccent, fontSize: 12)),
+            ),
+          if (_dirty)
+            const Padding(
+              padding: EdgeInsets.only(right: 12),
+              child: Text('Unsaved changes', style: TextStyle(color: Colors.orangeAccent, fontSize: 12)),
+            ),
+          TextButton(
+            onPressed: _dirty ? _revert : null,
+            child: const Text('Revert'),
+          ),
+          const SizedBox(width: 4),
+          if (!_focused)
+            TextButton(
+              onPressed: _delete,
+              child: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
+            ),
+          if (_focused && widget.onOpenFull != null)
+            TextButton(
+              onPressed: () async {
+                if (!await _discardOk()) return;
+                widget.onOpenFull!();
+              },
+              child: const Text('All settings…'),
+            ),
+          const SizedBox(width: 8),
+          ElevatedButton(
+            onPressed: _dirty ? _save : null,
+            child: const Text('Save'),
+          ),
+        ]),
+      ),
+      if (_errors.isNotEmpty) _errorBanner(),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: Wrap(spacing: 6, runSpacing: 6, children: [
+          for (final s in _focused
+              ? const [
+                  ('general', 'Name & icon'),
+                  ('pattern', 'Folder pattern'),
+                ]
+              : const [
+                  ('general', 'General'),
+                  ('pattern', 'Folder pattern'),
+                  ('tabs', 'Tabs & profile'),
+                  ('children', 'Children'),
+                  ('properties', 'Properties'),
+                  ('exports', 'Exports'),
+                  ('yaml', 'YAML'),
+                ])
+            ChoiceChip(
+              label: Text(s.$2, style: TextStyle(fontSize: 12, color: _section == s.$1 ? Colors.white : Colors.white60)),
+              selected: _section == s.$1,
+              selectedColor: _kAccent.withOpacity(0.35),
+              backgroundColor: Colors.white.withOpacity(0.05),
+              onSelected: (_) => _setSection(s.$1),
+            ),
+        ]),
+      ),
+      const Divider(height: 1, color: _kLine),
+      Expanded(child: _sectionBody()),
+    ]);
+  }
+
+  Widget _errorBanner() => Container(
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+        decoration: BoxDecoration(
+          color: Colors.redAccent.withOpacity(0.10),
+          border: Border.all(color: Colors.redAccent.withOpacity(0.4)),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Icon(Icons.error_outline_rounded, size: 16, color: Colors.redAccent),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              for (final e in _errors.take(8))
+                Text(e, style: const TextStyle(color: Colors.white70, fontSize: 12, height: 1.4)),
+              if (_errors.length > 8)
+                Text('…and ${_errors.length - 8} more', style: const TextStyle(color: Colors.white38, fontSize: 12)),
+            ]),
+          ),
+          IconButton(
+            iconSize: 16,
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.close_rounded, color: Colors.white38),
+            onPressed: () => setState(() => _errors = []),
+          ),
+        ]),
+      );
+
+  Widget _sectionBody() {
+    switch (_section) {
+      case 'general':
+        return _generalSection();
+      case 'pattern':
+        return _patternSection();
+      case 'tabs':
+        return _tabsSection();
+      case 'children':
+        return _childrenSection();
+      case 'properties':
+        return _propertiesSection();
+      case 'exports':
+        return _exportsSection();
+      default:
+        return _yamlSection();
+    }
+  }
+
+  // ── controles reutilizáveis ─────────────────────────────────────────────────
+
+  /// Campo de texto ligado a `m[key]`. [optional]: chave removida quando vazio.
+  Widget _field(
+    Map<String, dynamic> m,
+    String key,
+    String label, {
+    String? hint,
+    String? helper,
+    String? error,
+    bool optional = false,
+    bool mono = false,
+    bool enabled = true,
+    int maxLines = 1,
+    void Function(String)? onChanged,
+  }) {
+    return TextFormField(
+      key: ValueKey('${identityHashCode(m)}:$key'),
+      initialValue: m[key]?.toString() ?? '',
+      enabled: enabled,
+      maxLines: maxLines,
+      style: TextStyle(color: enabled ? Colors.white : Colors.white38, fontSize: 13, fontFamily: mono ? 'monospace' : null),
+      decoration: _deco(label, hint: hint, helper: helper, error: error),
+      onChanged: (v) {
+        if (optional && v.isEmpty) {
+          m.remove(key);
+        } else {
+          m[key] = v;
+        }
+        onChanged?.call(v);
+        _touch();
+      },
+    );
+  }
+
+  Widget _dropdown({
+    required String label,
+    required String? value,
+    required List<(String, String)> options,
+    required ValueChanged<String?> onChanged,
+  }) {
+    final v = options.any((o) => o.$1 == value) ? value : null;
+    return InputDecorator(
+      decoration: _deco(label),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: v,
+          isExpanded: true,
+          isDense: true,
+          dropdownColor: const Color(0xFF26292C),
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          items: [
+            for (final o in options) DropdownMenuItem<String>(value: o.$1, child: Text(o.$2, overflow: TextOverflow.ellipsis)),
+          ],
+          onChanged: onChanged,
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionTitle(String t, {String? sub}) => Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(t, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+          if (sub != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text(sub, style: const TextStyle(color: Colors.white30, fontSize: 12, height: 1.4)),
+            ),
+        ]),
+      );
+
+  Widget _card({required Widget child, VoidCallback? onDelete, List<Widget> actions = const []}) => Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.fromLTRB(12, 12, 6, 12),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.025),
+          border: Border.all(color: Colors.white10),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: child),
+          Column(children: [
+            ...actions,
+            if (onDelete != null)
+              IconButton(
+                tooltip: 'Remove',
+                iconSize: 17,
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38),
+                onPressed: onDelete,
+              ),
+          ]),
+        ]),
+      );
+
+  Widget _moveButtons(List<dynamic> list, int i) => Column(mainAxisSize: MainAxisSize.min, children: [
+        IconButton(
+          tooltip: 'Move up',
+          iconSize: 17,
+          visualDensity: VisualDensity.compact,
+          icon: Icon(Icons.keyboard_arrow_up_rounded, color: i > 0 ? Colors.white38 : Colors.white10),
+          onPressed: i > 0
+              ? () {
+                  final it = list.removeAt(i);
+                  list.insert(i - 1, it);
+                  _touch();
+                }
+              : null,
+        ),
+        IconButton(
+          tooltip: 'Move down',
+          iconSize: 17,
+          visualDensity: VisualDensity.compact,
+          icon: Icon(Icons.keyboard_arrow_down_rounded, color: i < list.length - 1 ? Colors.white38 : Colors.white10),
+          onPressed: i < list.length - 1
+              ? () {
+                  final it = list.removeAt(i);
+                  list.insert(i + 1, it);
+                  _touch();
+                }
+              : null,
+        ),
+      ]);
+
+  Widget _addButton(String label, VoidCallback onTap) => Align(
+        alignment: Alignment.centerLeft,
+        child: TextButton.icon(
+          onPressed: onTap,
+          icon: const Icon(Icons.add_rounded, size: 16),
+          label: Text(label),
+        ),
+      );
+
+  Widget _scroll(List<Widget> children) => SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: children),
+      );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: General
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _generalSection() {
+    final d = _draft!;
+    final isRoot = (d['folder']?.toString() ?? '').isNotEmpty;
+    final savedFolder = _saved[_id]?['folder']?.toString() ?? '';
+    final n = _isNew ? 0 : _instanceCount(savedFolder);
+    final folderChanged = !_isNew && savedFolder.isNotEmpty && (d['folder']?.toString() ?? '') != savedFolder;
+    final currentIcon = d['icon']?.toString() ?? 'category_outlined';
+    if (_focused) {
+      return _scroll([
+        _sectionTitle('Name & icon',
+            sub: 'Shown in the sidebar and on the profile header. The id ("$_id") and the folder on disk do not change.'),
+        SizedBox(width: 420, child: _field(d, 'label', 'Name')),
+        const SizedBox(height: 16),
+        _iconPicker(d),
+      ]);
+    }
+    return _scroll([
+      _sectionTitle('General'),
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Expanded(child: _field(d, 'label', 'Name', onChanged: (_) {})),
+        const SizedBox(width: 12),
+        Expanded(
+          child: TextFormField(
+            key: ValueKey('${identityHashCode(d)}:id:$_isNew'),
+            initialValue: _id,
+            enabled: _isNew,
+            style: TextStyle(
+                color: _isNew ? Colors.white : Colors.white38, fontSize: 13, fontFamily: 'monospace'),
+            decoration: _deco('Id', helper: _isNew ? 'Lowercase letters, digits and _' : 'Cannot be changed after saving'),
+            onChanged: (v) {
+              d['id'] = v;
+              _touch();
+            },
+          ),
+        ),
+      ]),
+      const SizedBox(height: 14),
+      const Text('Icon', style: TextStyle(color: Colors.white38, fontSize: 12)),
+      const SizedBox(height: 6),
+      Wrap(spacing: 6, runSpacing: 6, children: [
+        for (final e in kEntityIconChoices.entries)
+          Tooltip(
+            message: e.key,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () {
+                d['icon'] = e.key;
+                _touch();
+              },
+              child: Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: currentIcon == e.key ? _kAccent.withOpacity(0.25) : Colors.white.withOpacity(0.04),
+                  border: Border.all(color: currentIcon == e.key ? _kAccent : Colors.white10),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Icon(e.value, size: 18, color: currentIcon == e.key ? Colors.white : Colors.white54),
+              ),
+            ),
+          ),
+      ]),
+      const SizedBox(height: 18),
+      const Text('Placement', style: TextStyle(color: Colors.white38, fontSize: 12)),
+      const SizedBox(height: 6),
+      Wrap(spacing: 8, children: [
+        ChoiceChip(
+          label: const Text('Root type'),
+          selected: isRoot,
+          onSelected: (_) {
+            d['folder'] = (d['folder']?.toString() ?? '').isNotEmpty ? d['folder'] : entitySlug(_labelOf(d, _id));
+            _touch();
+          },
+        ),
+        ChoiceChip(
+          label: const Text('Child type'),
+          selected: !isRoot,
+          onSelected: (_) {
+            d.remove('folder');
+            _touch();
+          },
+        ),
+      ]),
+      const SizedBox(height: 6),
+      Text(
+        isRoot
+            ? 'Appears as a section in the sidebar. Instances live in generalized/<root folder>/<name>/.'
+            : 'No section of its own: instances live inside instances of another type. Add it to that type under Children.',
+        style: const TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+      ),
+      if (isRoot) ...[
+        const SizedBox(height: 12),
+        SizedBox(
+          width: 360,
+          child: _field(d, 'folder', 'Root folder',
+              helper: folderChanged && n > 0
+                  ? 'Warning: $n existing instance folder(s) stay in "$savedFolder" and will be hidden. Rename them on disk.'
+                  : 'Folder inside generalized/ that holds the instances'),
+        ),
+      ],
+      const SizedBox(height: 18),
+      SizedBox(
+        width: 360,
+        child: _dropdown(
+          label: 'Extends (inherit pattern, tabs and properties)',
+          value: d['extends']?.toString() ?? '',
+          options: [
+            ('', '(none)'),
+            for (final id in _sortedIds())
+              if (id != _id) (id, _labelOf(_saved[id]!, id)),
+          ],
+          onChanged: (v) {
+            if (v == null || v.isEmpty) {
+              d.remove('extends');
+            } else {
+              d['extends'] = v;
+            }
+            _touch();
+          },
+        ),
+      ),
+      if ((d['extends']?.toString() ?? '').isNotEmpty)
+        const Padding(
+          padding: EdgeInsets.only(top: 6),
+          child: Text(
+            'Inherited folders, files, properties and exports are merged in and are not listed in the editors below. '
+            'Tabs and profile defined here replace the parent\'s.',
+            style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+          ),
+        ),
+      const SizedBox(height: 18),
+      _field(d, 'description', 'Description', optional: true, maxLines: 2),
+    ]);
+  }
+
+  Widget _iconPicker(Map<String, dynamic> d) {
+    final current = d['icon']?.toString() ?? 'category_outlined';
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text('Icon', style: TextStyle(color: Colors.white38, fontSize: 12)),
+      const SizedBox(height: 6),
+      Wrap(spacing: 6, runSpacing: 6, children: [
+        for (final e in kEntityIconChoices.entries)
+          Tooltip(
+            message: e.key,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () {
+                d['icon'] = e.key;
+                _touch();
+              },
+              child: Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: current == e.key ? _kAccent.withOpacity(0.25) : Colors.white.withOpacity(0.04),
+                  border: Border.all(color: current == e.key ? _kAccent : Colors.white10),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Icon(e.value, size: 18, color: current == e.key ? Colors.white : Colors.white54),
+              ),
+            ),
+          ),
+      ]),
+    ]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: Folder pattern
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  List<_TNode> _flattenTree() {
+    final dirs = patternDirSet(_draft!);
+    final files = <String>[for (final f in _fileMaps) f['path']?.toString() ?? ''];
+    String parentOf(String p) => p.contains('/') ? p.substring(0, p.lastIndexOf('/')) : '';
+    final out = <_TNode>[];
+    void walk(String parent, int depth) {
+      final ds = dirs.where((d) => parentOf(d) == parent).toList()..sort();
+      for (final d in ds) {
+        out.add(_TNode(d, true, depth));
+        walk(d, depth + 1);
+      }
+      final fs = files.where((f) => f.isNotEmpty && parentOf(f) == parent).toList()..sort();
+      for (final f in fs) {
+        out.add(_TNode(f, false, depth));
+      }
+    }
+
+    walk('', 0);
+    return out;
+  }
+
+  String _parentFolderOfSelection() {
+    final p = _selPath;
+    if (p == null || p.isEmpty) return '';
+    if (_selIsDir) return p;
+    return p.contains('/') ? p.substring(0, p.lastIndexOf('/')) : '';
+  }
+
+  void _selectNode(String path, bool isDir) {
+    setState(() {
+      _selPath = path;
+      _selIsDir = isDir;
+      if (!isDir) {
+        _fileCtrl.text = _fileAt(path)?['content']?.toString() ?? '';
+      }
+    });
+  }
+
+  Future<void> _addFolder() async {
+    final parent = _parentFolderOfSelection();
+    final name = (await _prompt('New folder', hint: 'e.g. notes   (use / for nested folders)',
+            helper: parent.isEmpty ? 'Created at the root of each instance' : 'Inside "$parent"'))
+        ?.trim();
+    if (name == null || name.isEmpty) return;
+    final path = parent.isEmpty ? name : '$parent/$name';
+    if (patternDirSet(_draft!).contains(path)) return;
+    _dirs.add(path);
+    _selPath = path;
+    _selIsDir = true;
+    _touch();
+  }
+
+  Future<void> _addFile() async {
+    final parent = _parentFolderOfSelection();
+    final name = (await _prompt('New file', hint: 'e.g. notes.md  or  {safe}.md',
+            helper: parent.isEmpty ? 'Created at the root of each instance' : 'Inside "$parent"'))
+        ?.trim();
+    if (name == null || name.isEmpty) return;
+    final path = parent.isEmpty ? name : '$parent/$name';
+    if (_fileAt(path) != null) return;
+    final base = name.split('/').last.split('.').first.replaceAll('{', '').replaceAll('}', '');
+    final m = <String, dynamic>{
+      'id': _uniqueFileId(base),
+      'path': path,
+      'content': name.endsWith('.md') ? '# {name}\n' : '',
+    };
+    _files.add(m);
+    _selPath = path;
+    _selIsDir = false;
+    _fileCtrl.text = m['content'] as String;
+    _touch();
+  }
+
+  Future<void> _renameSelected() async {
+    final p = _selPath;
+    if (p == null || p.isEmpty) return;
+    final np = (await _prompt(_selIsDir ? 'Rename / move folder' : 'Rename / move file',
+            initial: p, helper: 'Full path inside the instance folder'))
+        ?.trim();
+    if (np == null || np.isEmpty || np == p) return;
+    if (_selIsDir) {
+      for (var i = 0; i < _dirs.length; i++) {
+        final s = _dirs[i].toString();
+        if (s == p || s.startsWith('$p/')) _dirs[i] = np + s.substring(p.length);
+      }
+      for (final f in _fileMaps) {
+        final s = f['path']?.toString() ?? '';
+        if (s.startsWith('$p/')) f['path'] = np + s.substring(p.length);
+      }
+      for (final t in _list('tabs')) {
+        final tm = t as Map<String, dynamic>;
+        final s = tm['path']?.toString() ?? '';
+        if (tm['kind'] == 'folder' && (s == p || s.startsWith('$p/'))) tm['path'] = np + s.substring(p.length);
+      }
+    } else {
+      final f = _fileAt(p);
+      if (f != null) f['path'] = np;
+    }
+    _selPath = np;
+    _touch();
+  }
+
+  /// Remove abas/blocos que apontavam para pastas/arquivos apagados. Devolve quantos.
+  int _cleanupDangling() {
+    final dirs = patternDirSet(_draft!);
+    final ids = {for (final f in _fileMaps) f['id']?.toString() ?? ''};
+    var n = 0;
+    final tabs = _list('tabs');
+    tabs.removeWhere((t) {
+      final m = t as Map<String, dynamic>;
+      final bad = (m['kind'] == 'folder' && !dirs.contains(m['path']?.toString() ?? '')) ||
+          (m['kind'] == 'markdown' && !ids.contains(m['bind']?.toString() ?? ''));
+      if (bad) n++;
+      return bad;
+    });
+    _blocks.removeWhere((b) {
+      final m = b as Map<String, dynamic>;
+      final bind = m['bind']?.toString() ?? '';
+      final bad = bind.isNotEmpty && !ids.contains(bind);
+      if (bad) n++;
+      return bad;
+    });
+    return n;
+  }
+
+  Future<void> _deleteSelected() async {
+    final p = _selPath;
+    if (p == null || p.isEmpty) return;
+    final inside = _selIsDir
+        ? _fileMaps.where((f) => (f['path']?.toString() ?? '').startsWith('$p/')).length +
+            _dirs.where((x) => x.toString().startsWith('$p/')).length
+        : 0;
+    if (_selIsDir && inside > 0) {
+      if (!await _confirm('Delete folder?', 'Delete "$p" and the $inside item(s) inside it from the pattern?',
+          okLabel: 'Delete', danger: true)) {
+        return;
+      }
+    }
+    if (_selIsDir) {
+      _dirs.removeWhere((x) => x.toString() == p || x.toString().startsWith('$p/'));
+      _files.removeWhere((f) => ((f as Map<String, dynamic>)['path']?.toString() ?? '').startsWith('$p/'));
+    } else {
+      _files.removeWhere((f) => (f as Map<String, dynamic>)['path']?.toString() == p);
+    }
+    final cleaned = _cleanupDangling();
+    _selPath = null;
+    _selIsDir = true;
+    _fileCtrl.text = '';
+    _touch();
+    if (cleaned > 0) setState(() => _status = 'Removed $cleaned tab/block(s) that used it');
+  }
+
+  void _insertPlaceholder(String ph) {
+    final f = _selIsDir ? null : _fileAt(_selPath ?? '');
+    if (f == null) return;
+    final sel = _fileCtrl.selection;
+    final text = _fileCtrl.text;
+    final start = sel.isValid ? math.min(sel.start, sel.end) : text.length;
+    final end = sel.isValid ? math.max(sel.start, sel.end) : text.length;
+    final nt = text.replaceRange(start, end, ph);
+    _fileCtrl.value = TextEditingValue(
+      text: nt,
+      selection: TextSelection.collapsed(offset: start + ph.length),
+    );
+    f['content'] = nt;
+    _touch();
+  }
+
+  String _examplePath(String p) => p
+      .replaceAll('{safe}', 'Example')
+      .replaceAll('{name}', 'Example')
+      .replaceAll('{type}', _id)
+      .replaceAll('{workspace}', 'Workspace');
+
+  Widget _patternSection() {
+    final nodes = _flattenTree();
+    final hasInherited = (_draft!['extends']?.toString() ?? '').isNotEmpty;
+    final hasVariants = _draft!['patterns'] is Map;
+    if (hasVariants) {
+      return _scroll([
+        _sectionTitle('Folder pattern'),
+        const Text(
+          'This type uses pattern variants (patterns:), which are edited in the YAML tab.',
+          style: TextStyle(color: Colors.white38, fontSize: 13),
+        ),
+      ]);
+    }
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+        child: Row(children: [
+          Expanded(
+            child: Text(
+              hasInherited
+                  ? 'Folders and files created inside every new instance (inherited ones from the parent are added too).'
+                  : 'Folders and files created inside every new instance. Use {name}, {safe}, {uuid}… in names and contents.',
+              style: const TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+            ),
+          ),
+        ]),
+      ),
+      Expanded(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          SizedBox(width: 300, child: _patternTree(nodes)),
+          const VerticalDivider(width: 1, color: _kLine),
+          Expanded(child: _patternDetail()),
+        ]),
+      ),
+    ]);
+  }
+
+  Widget _patternTree(List<_TNode> nodes) {
+    final sel = _selPath;
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 8, 4),
+        child: Wrap(spacing: 2, children: [
+          TextButton.icon(
+            onPressed: _addFolder,
+            icon: const Icon(Icons.create_new_folder_outlined, size: 16),
+            label: const Text('Folder', style: TextStyle(fontSize: 12)),
+          ),
+          TextButton.icon(
+            onPressed: _addFile,
+            icon: const Icon(Icons.note_add_outlined, size: 16),
+            label: const Text('File', style: TextStyle(fontSize: 12)),
+          ),
+        ]),
+      ),
+      const Divider(height: 1, color: _kLine),
+      Expanded(
+        child: ListView(children: [
+          InkWell(
+            onTap: () => setState(() {
+              _selPath = '';
+              _selIsDir = true;
+            }),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              color: sel == '' ? _kAccent.withOpacity(0.10) : Colors.transparent,
+              child: Row(children: [
+                const Icon(Icons.account_tree_outlined, size: 15, color: Colors.white38),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('<instance folder>',
+                      style: TextStyle(
+                          color: sel == '' ? Colors.white : Colors.white54,
+                          fontSize: 12.5,
+                          fontStyle: FontStyle.italic)),
+                ),
+              ]),
+            ),
+          ),
+          for (final n in nodes)
+            InkWell(
+              onTap: () => _selectNode(n.path, n.isDir),
+              child: Container(
+                padding: EdgeInsets.fromLTRB(14.0 + (n.depth + 1) * 14.0, 7, 8, 7),
+                decoration: BoxDecoration(
+                  color: sel == n.path && _selIsDir == n.isDir ? _kAccent.withOpacity(0.10) : Colors.transparent,
+                  border: Border(
+                      left: BorderSide(
+                          color: sel == n.path && _selIsDir == n.isDir ? _kAccent : Colors.transparent, width: 2)),
+                ),
+                child: Row(children: [
+                  Icon(
+                    n.isDir
+                        ? Icons.folder_outlined
+                        : (_fileAt(n.path)?['role'] == 'anchor' ? Icons.star_rounded : Icons.description_outlined),
+                    size: 15,
+                    color: n.isDir
+                        ? Colors.white54
+                        : (_fileAt(n.path)?['role'] == 'anchor' ? Colors.amberAccent : Colors.white38),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(n.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: sel == n.path && _selIsDir == n.isDir ? Colors.white : Colors.white70,
+                            fontSize: 12.5,
+                            fontFamily: 'monospace')),
+                  ),
+                ]),
+              ),
+            ),
+          if (nodes.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('Empty pattern: new instances only get their folder.',
+                  style: TextStyle(color: Colors.white24, fontSize: 12, height: 1.4)),
+            ),
+        ]),
+      ),
+    ]);
+  }
+
+  Widget _patternDetail() {
+    final p = _selPath;
+    if (p == null) {
+      return const Center(
+        child: Text('Select a folder or file on the left\nor add one with the buttons above.',
+            textAlign: TextAlign.center, style: TextStyle(color: Colors.white24, fontSize: 13, height: 1.5)),
+      );
+    }
+    if (p.isEmpty) {
+      return _scroll([
+        _sectionTitle('<instance folder>',
+            sub: 'Every new instance gets a folder named after it, under generalized/${_draft!['folder'] ?? '<type>'}/ '
+                '(or inside its parent for child types). The folders and files you add here are created inside it.'),
+      ]);
+    }
+    final f = _selIsDir ? null : _fileAt(p);
+    if (!_selIsDir && f == null) return const SizedBox.shrink();
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(20, 14, 12, 4),
+        child: Row(children: [
+          Icon(_selIsDir ? Icons.folder_outlined : Icons.description_outlined, size: 18, color: Colors.white54),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(p,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white, fontSize: 13.5, fontFamily: 'monospace')),
+          ),
+          TextButton(onPressed: _renameSelected, child: const Text('Rename / move')),
+          TextButton(
+            onPressed: _deleteSelected,
+            child: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ]),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+        child: Text('Example instance → ${_examplePath(p)}',
+            style: const TextStyle(color: Colors.white24, fontSize: 11.5, fontFamily: 'monospace')),
+      ),
+      if (_selIsDir)
+        const Padding(
+          padding: EdgeInsets.fromLTRB(20, 4, 20, 0),
+          child: Text(
+            'Created (empty) in every new instance. Add files or sub-folders with the buttons on the left. '
+            'To show this folder as a tab (e.g. Logs), add a Folder tab in "Tabs & profile".',
+            style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+          ),
+        )
+      else
+        Expanded(child: _fileDetail(f!)),
+    ]);
+  }
+
+  Widget _fileDetail(Map<String, dynamic> f) {
+    final isAnchor = f['role']?.toString() == 'anchor';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+          Switch(
+            value: isAnchor,
+            onChanged: (v) {
+              for (final o in _fileMaps) {
+                if (o['role'] == 'anchor') o.remove('role');
+              }
+              if (v) {
+                f['role'] = 'anchor';
+                if ((f['id']?.toString() ?? '').isEmpty) f['id'] = _uniqueFileId('anchor');
+              }
+              _touch();
+            },
+          ),
+          const SizedBox(width: 6),
+          const Expanded(
+            child: Text(
+              'Anchor file: the instance\'s identity (id, tags, properties live in its frontmatter).',
+              style: TextStyle(color: Colors.white54, fontSize: 12.5),
+            ),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 170,
+            child: _field(f, 'id', 'File id', mono: true, onChanged: (_) {}),
+          ),
+        ]),
+        const SizedBox(height: 10),
+        Wrap(spacing: 6, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          const Text('Insert:', style: TextStyle(color: Colors.white30, fontSize: 12)),
+          for (final ph in _kPlaceholders)
+            ActionChip(
+              label: Text(ph, style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace', color: Colors.white70)),
+              backgroundColor: Colors.white.withOpacity(0.05),
+              onPressed: () => _insertPlaceholder(ph),
+            ),
+        ]),
+        const SizedBox(height: 8),
+        Expanded(
+          child: TextField(
+            controller: _fileCtrl,
+            expands: true,
+            maxLines: null,
+            minLines: null,
+            textAlignVertical: TextAlignVertical.top,
+            style: const TextStyle(color: Colors.white, fontSize: 12.5, fontFamily: 'monospace', height: 1.4),
+            decoration: _deco('Initial content', hint: 'Text written to this file when an instance is created'),
+            onChanged: (v) {
+              f['content'] = v;
+              _touch();
+            },
+          ),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          '{name} display name · {safe} file-system-safe name · {type} type id · {uuid} new unique id · {workspace} workspace name',
+          style: TextStyle(color: Colors.white24, fontSize: 11),
+        ),
+      ]),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: Tabs & profile
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  static const List<(String, String)> _kAddableTabs = [
+    ('folder', 'Folder view (e.g. Logs)'),
+    ('works', 'Works (linked files)'),
+    ('connections', 'Connections'),
+    ('properties', 'Properties'),
+    ('children', 'Children (nested type)'),
+    ('markdown', 'Markdown file'),
+  ];
+
+  String _capFirst(String s) => s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+
+  Map<String, dynamic> _newTab(String kind) {
+    final dirs = patternDirSet(_draft!).toList()..sort();
+    switch (kind) {
+      case 'folder':
+        final path = dirs.isNotEmpty ? dirs.first : '';
+        final title = path.isEmpty ? 'Folder' : _capFirst(path.split('/').last);
+        return <String, dynamic>{
+          'id': _uniqueTabId(entitySlug(title)),
+          'kind': 'folder',
+          'title': title,
+          'path': path,
+          'perspective': 'timeline',
+          'badge': 'count',
+        };
+      case 'works':
+        return <String, dynamic>{
+          'id': _uniqueTabId('works'),
+          'kind': 'works',
+          'title': 'Works',
+          'from': 'vault/works',
+          'linked_to': 'self',
+          'badge': 'count',
+        };
+      case 'connections':
+        return <String, dynamic>{
+          'id': _uniqueTabId('connections'),
+          'kind': 'connections',
+          'title': 'Connections',
+          'source': <dynamic>['property:connections', 'backlinks'],
+          'badge': 'count',
+        };
+      case 'properties':
+        return <String, dynamic>{'id': _uniqueTabId('properties'), 'kind': 'properties', 'title': 'Properties'};
+      case 'children':
+        final slots = _list('children');
+        final slot = slots.isNotEmpty ? (slots.first as Map<String, dynamic>)['folder']?.toString() ?? '' : '';
+        return <String, dynamic>{
+          'id': _uniqueTabId(slot.isEmpty ? 'children' : entitySlug(slot)),
+          'kind': 'children',
+          'title': slot.isEmpty ? 'Children' : slot,
+          'slot': slot,
+          'badge': 'count',
+        };
+      default:
+        final files = _fileMaps;
+        return <String, dynamic>{
+          'id': _uniqueTabId('file'),
+          'kind': 'markdown',
+          'title': 'Notes',
+          'bind': files.isNotEmpty ? files.first['id']?.toString() ?? '' : '',
+        };
+    }
+  }
+
+  void _moveTab(Map<String, dynamic> tab, int delta) {
+    final tabs = _list('tabs');
+    final idxs = <int>[
+      for (var i = 0; i < tabs.length; i++)
+        if (!{'profile', 'files'}.contains((tabs[i] as Map<String, dynamic>)['kind'])) i,
+    ];
+    final pos = idxs.indexWhere((i) => identical(tabs[i], tab));
+    final np = pos + delta;
+    if (pos < 0 || np < 0 || np >= idxs.length) return;
+    final a = idxs[pos], b = idxs[np];
+    final tmp = tabs[a];
+    tabs[a] = tabs[b];
+    tabs[b] = tmp;
+    _touch();
+  }
+
+  Widget _tabCard(Map<String, dynamic> t) {
+    final kind = t['kind']?.toString() ?? '';
+    final dirs = patternDirSet(_draft!).toList()..sort();
+    final slotFolders = [for (final c in _list('children')) (c as Map<String, dynamic>)['folder']?.toString() ?? ''];
+    final files = _fileMaps;
+    final badgeable = {'folder', 'works', 'connections', 'children'}.contains(kind);
+    return _card(
+      onDelete: () {
+        _list('tabs').removeWhere((x) => identical(x, t));
+        _touch();
+      },
+      actions: [
+        IconButton(
+          tooltip: 'Move up',
+          iconSize: 17,
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.keyboard_arrow_up_rounded, color: Colors.white38),
+          onPressed: () => _moveTab(t, -1),
+        ),
+        IconButton(
+          tooltip: 'Move down',
+          iconSize: 17,
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white38),
+          onPressed: () => _moveTab(t, 1),
+        ),
+      ],
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(flex: 3, child: _field(t, 'title', 'Tab title')),
+          const SizedBox(width: 10),
+          Expanded(flex: 2, child: _field(t, 'id', 'Id', mono: true)),
+          const SizedBox(width: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            decoration: BoxDecoration(color: Colors.white.withOpacity(0.06), borderRadius: BorderRadius.circular(4)),
+            child: Text(kind, style: const TextStyle(color: Colors.white54, fontSize: 11, fontFamily: 'monospace')),
+          ),
+        ]),
+        const SizedBox(height: 10),
+        if (kind == 'folder')
+          Row(children: [
+            Expanded(
+              child: _dropdown(
+                label: 'Folder of the pattern',
+                value: t['path']?.toString() ?? '',
+                options: [for (final d in dirs) (d, d)],
+                onChanged: (v) {
+                  t['path'] = v ?? '';
+                  _touch();
+                },
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _dropdown(
+                label: 'Layout',
+                value: t['perspective']?.toString() ?? 'timeline',
+                options: const [('timeline', 'Timeline (files + editor)'), ('list', 'List')],
+                onChanged: (v) {
+                  t['perspective'] = v ?? 'timeline';
+                  _touch();
+                },
+              ),
+            ),
+          ])
+        else if (kind == 'works')
+          _field(t, 'from', 'Source folder (inside files/)', optional: true, helper: 'Default: vault/works')
+        else if (kind == 'children')
+          _dropdown(
+            label: 'Child slot',
+            value: t['slot']?.toString() ?? '',
+            options: [for (final s in slotFolders) if (s.isNotEmpty) (s, s)],
+            onChanged: (v) {
+              t['slot'] = v ?? '';
+              _touch();
+            },
+          )
+        else if (kind == 'markdown')
+          _dropdown(
+            label: 'File',
+            value: t['bind']?.toString() ?? '',
+            options: [for (final f in files) (f['id']?.toString() ?? '', f['path']?.toString() ?? '')],
+            onChanged: (v) {
+              t['bind'] = v ?? '';
+              _touch();
+            },
+          )
+        else if (kind == 'connections')
+          const Text('Shows the "connections" frontmatter list of the anchor file plus backlinks from other entities.',
+              style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4))
+        else if (kind == 'properties')
+          const Text('Edits the values of this type\'s Properties and runs its exports.',
+              style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4)),
+        if (badgeable)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Row(children: [
+              Checkbox(
+                value: t['badge']?.toString() == 'count',
+                onChanged: (v) {
+                  if (v == true) {
+                    t['badge'] = 'count';
+                  } else {
+                    t.remove('badge');
+                  }
+                  _touch();
+                },
+              ),
+              const Text('Show item count on the tab', style: TextStyle(color: Colors.white54, fontSize: 12.5)),
+            ]),
+          ),
+      ]),
+    );
+  }
+
+  Widget _blockCard(List<dynamic> blocks, int i) {
+    final b = blocks[i] as Map<String, dynamic>;
+    final kind = b['kind']?.toString() ?? 'markdown';
+    final files = _fileMaps;
+    return _card(
+      onDelete: () {
+        blocks.removeAt(i);
+        _touch();
+      },
+      actions: [_moveButtons(blocks, i)],
+      child: kind == 'markdown'
+          ? Row(children: [
+              Expanded(flex: 2, child: _field(b, 'title', 'Block title')),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 3,
+                child: _dropdown(
+                  label: 'Shows file',
+                  value: b['bind']?.toString() ?? '',
+                  options: [for (final f in files) (f['id']?.toString() ?? '', f['path']?.toString() ?? '')],
+                  onChanged: (v) {
+                    b['bind'] = v ?? '';
+                    _touch();
+                  },
+                ),
+              ),
+            ])
+          : Text('Block "${b['title'] ?? b['id']}" of kind "$kind" (edit it in the YAML tab).',
+              style: const TextStyle(color: Colors.white54, fontSize: 12.5)),
+    );
+  }
+
+  Widget _tabsSection() {
+    final tabs = _list('tabs');
+    final others = <Map<String, dynamic>>[
+      for (final t in tabs)
+        if (!{'profile', 'files'}.contains((t as Map<String, dynamic>)['kind'])) t,
+    ];
+    final blocks = _blocks;
+    final inherited = (_draft!['extends']?.toString() ?? '').isNotEmpty;
+    return _scroll([
+      _sectionTitle('Tabs',
+          sub: 'The bar at the top of every instance. Profile and Files are always first.'
+              '${inherited ? ' Tabs defined here replace the parent\'s.' : ''}'),
+      Wrap(spacing: 8, children: [
+        for (final n in const ['Profile', 'Files'])
+          Chip(
+            label: Text(n, style: const TextStyle(color: Colors.white60, fontSize: 12)),
+            backgroundColor: Colors.white.withOpacity(0.05),
+          ),
+      ]),
+      const SizedBox(height: 12),
+      for (final t in others) _tabCard(t),
+      PopupMenuButton<String>(
+        tooltip: 'Add tab',
+        color: const Color(0xFF26292C),
+        onSelected: (k) {
+          tabs.add(_newTab(k));
+          _touch();
+        },
+        itemBuilder: (ctx) => [
+          for (final k in _kAddableTabs)
+            PopupMenuItem<String>(value: k.$1, child: Text(k.$2, style: const TextStyle(color: Colors.white, fontSize: 13))),
+        ],
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          child: Row(mainAxisSize: MainAxisSize.min, children: const [
+            Icon(Icons.add_rounded, size: 16, color: _kAccent),
+            SizedBox(width: 6),
+            Text('Add tab', style: TextStyle(color: _kAccent, fontSize: 13.5)),
+          ]),
+        ),
+      ),
+      const SizedBox(height: 20),
+      const Divider(height: 1, color: _kLine),
+      const SizedBox(height: 14),
+      _sectionTitle('Profile blocks',
+          sub: 'What the Profile tab shows. Each block displays one file of the pattern. '
+              'Blocks without a layout are stacked; drag them later with "Edit layout" in the Profile.'),
+      for (var i = 0; i < blocks.length; i++) _blockCard(blocks, i),
+      _addButton('Add block', () {
+        final files = _fileMaps;
+        var n = blocks.length + 1;
+        final used = {for (final b in blocks) (b as Map<String, dynamic>)['id']?.toString() ?? ''};
+        while (used.contains('b$n')) {
+          n++;
+        }
+        blocks.add(<String, dynamic>{
+          'id': 'b$n',
+          'kind': 'markdown',
+          'bind': files.isNotEmpty ? files.first['id']?.toString() ?? '' : '',
+          'title': 'Block $n',
+        });
+        _touch();
+      }),
+    ]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: Children
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _childrenSection() {
+    final slots = _list('children');
+    final label = _labelOf(_draft!, _id);
+    final typeOptions = <(String, String)>[
+      (_id, '$label (this type)'),
+      for (final id in _sortedIds())
+        if (id != _id) (id, _labelOf(_saved[id]!, id)),
+    ];
+    return _scroll([
+      _sectionTitle('Children',
+          sub: 'Nested types: instances of the child type live inside each instance of "$label", '
+              'e.g. <instance>/<folder>/<child name>/. A child type does not get a sidebar section of its own.'),
+      for (var i = 0; i < slots.length; i++)
+        Builder(builder: (_) {
+          final s = slots[i] as Map<String, dynamic>;
+          return _card(
+            onDelete: () {
+              slots.removeAt(i);
+              _touch();
+            },
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(
+                flex: 3,
+                child: _dropdown(
+                  label: 'Child type',
+                  value: s['type']?.toString() ?? '',
+                  options: typeOptions,
+                  onChanged: (v) {
+                    s['type'] = v ?? '';
+                    if ((s['folder']?.toString() ?? '').isEmpty && v != null) {
+                      final nm = v == _id ? label : _labelOf(_saved[v] ?? <String, dynamic>{}, v);
+                      s['folder'] = nm;
+                    }
+                    _touch();
+                  },
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 3,
+                child: _field(s, 'folder', 'Folder', helper: 'Inside each instance, e.g. Complexes'),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: _dropdown(
+                  label: 'How many',
+                  value: s['cardinality']?.toString() ?? 'many',
+                  options: const [('many', 'Many'), ('one', 'Exactly one')],
+                  onChanged: (v) {
+                    s['cardinality'] = v ?? 'many';
+                    _touch();
+                  },
+                ),
+              ),
+            ]),
+          );
+        }),
+      if (slots.isEmpty)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text('No child slots.', style: TextStyle(color: Colors.white24, fontSize: 12.5)),
+        ),
+      _addButton('Add child slot', () {
+        final others = _sortedIds().where((id) => id != _id).toList();
+        final t = others.isNotEmpty ? others.first : _id;
+        final nm = t == _id ? label : _labelOf(_saved[t] ?? <String, dynamic>{}, t);
+        slots.add(<String, dynamic>{'type': t, 'folder': nm, 'cardinality': 'many'});
+        _touch();
+      }),
+      const Padding(
+        padding: EdgeInsets.only(top: 8),
+        child: Text(
+          '"Exactly one" uses the slot folder itself as the instance (e.g. a single Self/ folder). '
+          'To show the children as a tab, add a Children tab under "Tabs & profile".',
+          style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+        ),
+      ),
+    ]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: Properties
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  static const List<(String, String)> _kPropTypes = [
+    ('text', 'Text'),
+    ('bool', 'Yes / No'),
+    ('phone_list', 'Phone numbers (list)'),
+    ('ref', 'Reference to another entity'),
+    ('ref_list', 'References (list)'),
+    ('formula', 'Formula (calculated)'),
+  ];
+
+  Widget _propertiesSection() {
+    final props = _list('properties');
+    final hasTab = _list('tabs').any((t) => (t as Map<String, dynamic>)['kind'] == 'properties');
+    final refTargets = <(String, String)>[
+      ('any', 'Any type'),
+      (_id, '${_labelOf(_draft!, _id)} (this type)'),
+      for (final id in _sortedIds())
+        if (id != _id) (id, _labelOf(_saved[id]!, id)),
+    ];
+    return _scroll([
+      _sectionTitle('Properties',
+          sub: 'Fields stored in the anchor file\'s frontmatter. Edit their values in each instance\'s Properties tab; '
+              'use them in formulas and exports as \$key.'),
+      if (props.isNotEmpty && !hasTab)
+        Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Colors.orangeAccent.withOpacity(0.08),
+            border: Border.all(color: Colors.orangeAccent.withOpacity(0.35)),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(children: [
+            const Icon(Icons.info_outline_rounded, size: 16, color: Colors.orangeAccent),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text('This type has no Properties tab yet, so values cannot be edited.',
+                  style: TextStyle(color: Colors.white70, fontSize: 12.5)),
+            ),
+            TextButton(
+              onPressed: () {
+                _list('tabs').add(_newTab('properties'));
+                _touch();
+              },
+              child: const Text('Add tab'),
+            ),
+          ]),
+        ),
+      for (var i = 0; i < props.length; i++)
+        Builder(builder: (_) {
+          final p = props[i] as Map<String, dynamic>;
+          final type = p['type']?.toString() ?? 'text';
+          return _card(
+            onDelete: () {
+              props.removeAt(i);
+              _touch();
+            },
+            actions: [_moveButtons(props, i)],
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Row(children: [
+                Expanded(flex: 3, child: _field(p, 'label', 'Label', optional: true)),
+                const SizedBox(width: 10),
+                Expanded(flex: 2, child: _field(p, 'key', 'Key', mono: true)),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 3,
+                  child: _dropdown(
+                    label: 'Type',
+                    value: type,
+                    options: _kPropTypes,
+                    onChanged: (v) {
+                      p['type'] = v ?? 'text';
+                      if (v == 'ref' || v == 'ref_list') p['target'] ??= 'any';
+                      _touch();
+                    },
+                  ),
+                ),
+              ]),
+              if (type == 'ref' || type == 'ref_list') ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: 320,
+                  child: _dropdown(
+                    label: 'Target type',
+                    value: p['target']?.toString() ?? 'any',
+                    options: refTargets,
+                    onChanged: (v) {
+                      p['target'] = v ?? 'any';
+                      _touch();
+                    },
+                  ),
+                ),
+              ],
+              if (type == 'formula') ...[
+                const SizedBox(height: 10),
+                _field(p, 'formula', 'Formula',
+                    mono: true,
+                    maxLines: 2,
+                    hint: r'e.g. COUNT_SAME($name) > 1',
+                    error: _formulaError(p['formula']?.toString() ?? '')),
+              ],
+            ]),
+          );
+        }),
+      if (props.isEmpty)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text('No properties.', style: TextStyle(color: Colors.white24, fontSize: 12.5)),
+        ),
+      _addButton('Add property', () {
+        final used = {for (final p in props) (p as Map<String, dynamic>)['key']?.toString() ?? ''};
+        var n = props.length + 1;
+        while (used.contains('field_$n')) {
+          n++;
+        }
+        props.add(<String, dynamic>{'key': 'field_$n', 'label': 'Field $n', 'type': 'text'});
+        _touch();
+      }),
+    ]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: Exports
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _exportsSection() {
+    final exps = _list('exports');
+    final listProps = <(String, String)>[
+      ('', '(one row per instance)'),
+      for (final p in _list('properties'))
+        if ((p as Map<String, dynamic>)['type']?.toString().endsWith('list') ?? false)
+          (p['key']?.toString() ?? '', '${p['label'] ?? p['key']} (${p['key']})'),
+    ];
+    return _scroll([
+      _sectionTitle('Exports',
+          sub: 'Files generated from the instances (written to files/exports/$_id/). Each column is a formula: '
+              r'$prop, $ref.prop, IF(...), +, COUNT_SAME($name)…  With "one row per item of a list", use $alias.field.'),
+      for (var i = 0; i < exps.length; i++) _exportCard(exps, i, listProps),
+      if (exps.isEmpty)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text('No exports.', style: TextStyle(color: Colors.white24, fontSize: 12.5)),
+        ),
+      _addButton('Add export', () {
+        final used = {for (final e in exps) (e as Map<String, dynamic>)['id']?.toString() ?? ''};
+        var n = exps.length + 1;
+        while (used.contains('export_$n')) {
+          n++;
+        }
+        exps.add(<String, dynamic>{
+          'id': 'export_$n',
+          'format': 'csv',
+          'file': 'export_$n.csv',
+          'sync': 'manual',
+          'columns': <dynamic>[
+            <String, dynamic>{'header': 'Name', 'formula': r'$name'},
+          ],
+        });
+        _touch();
+      }),
+    ]);
+  }
+
+  Widget _exportCard(List<dynamic> exps, int i, List<(String, String)> listProps) {
+    final e = exps[i] as Map<String, dynamic>;
+    if (e['columns'] is! List) e['columns'] = <dynamic>[];
+    final cols = e['columns'] as List<dynamic>;
+    final each = e['each']?.toString() ?? '';
+    final eachParts = each.split(' as ');
+    final eachSrc = eachParts.first.trim();
+    final eachAlias = eachParts.length > 1 ? eachParts[1].trim() : '';
+    void writeEach(String src, String alias) {
+      if (src.isEmpty) {
+        e.remove('each');
+      } else {
+        e['each'] = alias.isEmpty ? src : '$src as $alias';
+      }
+      _touch();
+    }
+
+    return _card(
+      onDelete: () {
+        exps.removeAt(i);
+        _touch();
+      },
+      actions: [_moveButtons(exps, i)],
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(flex: 3, child: _field(e, 'id', 'Export id', mono: true)),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 2,
+            child: _dropdown(
+              label: 'Format',
+              value: e['format']?.toString() ?? 'csv',
+              options: const [('csv', 'CSV'), ('xlsx', 'Excel (.xlsx)')],
+              onChanged: (v) {
+                e['format'] = v ?? 'csv';
+                _touch();
+              },
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(flex: 3, child: _field(e, 'file', 'File name')),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 3,
+            child: _dropdown(
+              label: 'Sync',
+              value: e['sync']?.toString() ?? 'manual',
+              options: const [('manual', 'Manual (button)'), ('one_way', 'Automatic after edits')],
+              onChanged: (v) {
+                e['sync'] = v ?? 'manual';
+                _touch();
+              },
+            ),
+          ),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            flex: 4,
+            child: _dropdown(
+              label: 'Rows',
+              value: eachSrc,
+              options: listProps,
+              onChanged: (v) => writeEach(v ?? '', eachAlias.isEmpty ? 'item' : eachAlias),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 2,
+            child: TextFormField(
+              key: ValueKey('${identityHashCode(e)}:alias:$eachSrc'),
+              initialValue: eachAlias,
+              enabled: eachSrc.isNotEmpty,
+              style: TextStyle(color: eachSrc.isNotEmpty ? Colors.white : Colors.white38, fontSize: 13, fontFamily: 'monospace'),
+              decoration: _deco('Alias', helper: r'use as $alias.field'),
+              onChanged: (v) => writeEach(eachSrc, v.trim()),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 5,
+            child: _field(e, 'where', 'Only rows where (formula, optional)',
+                optional: true, mono: true, error: _formulaError(e['where']?.toString() ?? '')),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        const Text('Columns', style: TextStyle(color: Colors.white38, fontSize: 12)),
+        const SizedBox(height: 6),
+        for (var c = 0; c < cols.length; c++)
+          Builder(builder: (_) {
+            final col = cols[c] as Map<String, dynamic>;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(flex: 2, child: _field(col, 'header', 'Header')),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 6,
+                  child: _field(col, 'formula', 'Formula',
+                      mono: true, maxLines: 2, error: _formulaError(col['formula']?.toString() ?? '')),
+                ),
+                IconButton(
+                  tooltip: 'Remove column',
+                  iconSize: 17,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.close_rounded, color: Colors.white38),
+                  onPressed: () {
+                    cols.removeAt(c);
+                    _touch();
+                  },
+                ),
+              ]),
+            );
+          }),
+        _addButton('Add column', () {
+          cols.add(<String, dynamic>{'header': 'Column ${cols.length + 1}', 'formula': ''});
+          _touch();
+        }),
+      ]),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Seção: YAML
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _yamlSection() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          const Expanded(
+            child: Text(
+              'The raw definition file. Edit it for anything the forms do not cover (pattern variants, seeds, profile layout…), '
+              'then press Apply. Saving applies it automatically.',
+              style: TextStyle(color: Colors.white30, fontSize: 12, height: 1.4),
+            ),
+          ),
+          TextButton(
+            onPressed: () {
+              if (_applyYaml()) _touch();
+            },
+            child: const Text('Apply'),
+          ),
+          TextButton(
+            onPressed: () => setState(() {
+              _yamlCtrl.text = yamlEmit(_canon(_draft!));
+              _yamlError = null;
+            }),
+            child: const Text('Reset from form'),
+          ),
+        ]),
+        if (_yamlError != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(_yamlError!, style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+          ),
+        Expanded(
+          child: TextField(
+            controller: _yamlCtrl,
+            expands: true,
+            maxLines: null,
+            minLines: null,
+            textAlignVertical: TextAlignVertical.top,
+            style: const TextStyle(color: Colors.white, fontSize: 12.5, fontFamily: 'monospace', height: 1.4),
+            decoration: _deco(''),
+            onChanged: (_) {
+              if (_yamlError != null) setState(() => _yamlError = null);
+            },
+          ),
+        ),
+      ]),
     );
   }
 }
