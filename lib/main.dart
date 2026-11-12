@@ -12,6 +12,8 @@ import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:emoji_selector/emoji_selector.dart';
 import 'package:yaml/yaml.dart';
+import 'package:pdf/pdf.dart' as pdfc;
+import 'package:pdf/widgets.dart' as pw;
 
 // Set to true to enable verbose Planner rendering diagnostics in the console.
 // Toggle here without recompiling business logic.
@@ -235,9 +237,10 @@ class Task {
   RepeatConfig? repeatConfig; // mutable – set via details panel
   String? repeatParentId; // non-null on auto-generated repeat instances
 
-  /// Canonical series membership key.
-  /// • Parent task  → equals its own [id] (set at construction / fromJson).
-  /// • Instance     → equals the parent's [id] (same as [repeatParentId]).
+  /// Canonical, fixed series membership key.
+  /// • Series created from a task → that task's [id] at creation time.
+  /// • Instances → same key (also stored in [repeatParentId]).
+  /// • A promoted root keeps the key, so no other file needs rewriting.
   /// • Non-repeating → null.
   ///
   /// Use [isPartOfSeries] / [isSeriesParent] instead of reading raw fields.
@@ -246,9 +249,14 @@ class Task {
   /// True for every task that belongs to a repeat series (parent or instance).
   bool get isPartOfSeries => seriesId != null;
 
-  /// True only for the originating task of a series (the one that owns
-  /// the master [repeatConfig]). Instances have [seriesId] != [id].
-  bool get isSeriesParent => seriesId != null && seriesId == id;
+  /// True only for the current root of a series (the task that owns the master
+  /// [repeatConfig]). Generated instances carry a [repeatParentId]; the root
+  /// does not. [seriesId] is a fixed key that does NOT change when the root is
+  /// deleted and the next occurrence is promoted to root.
+  bool get isSeriesParent => seriesId != null && repeatParentId == null;
+
+  /// The fixed series key (falls back to [id] for a task not yet in a series).
+  String get seriesKey => seriesId ?? id;
 
   // UI State fields
   bool isExpanded;
@@ -665,6 +673,7 @@ enum CriteriaItemType {
   status,
   repeating,    // true = repeating, false = non-repeating
   overdue,      // true = overdue, false = not overdue
+  currentWeek,  // repeating tasks only: true = in current week, false = outside it
   catchAll,
   parenOpen,
   parenClose,
@@ -696,6 +705,10 @@ class ContainerCriteriaItem {
         return boolValue == true ? 'Repeating' : 'Non-Repeating';
       case CriteriaItemType.overdue:
         return boolValue == true ? 'Overdue' : 'Not Overdue';
+      case CriteriaItemType.currentWeek:
+        return boolValue == true
+            ? 'Repeating: this week'
+            : 'Repeating: not this week';
       case CriteriaItemType.catchAll:
         return 'catch-all';
       case CriteriaItemType.parenOpen:
@@ -717,6 +730,8 @@ class ContainerCriteriaItem {
         return boolValue == true
             ? const Color(0xFFEF5350).withOpacity(0.7)
             : Colors.white38;
+      case CriteriaItemType.currentWeek:
+        return const Color(0xFF7C4DFF).withOpacity(0.5);
       case CriteriaItemType.catchAll:
         return Colors.white24;
       case CriteriaItemType.parenOpen:
@@ -739,6 +754,11 @@ class GroupContainer {
   // false = only tasks whose scheduledDate >= today OR no date
   // null  = no overdue constraint
   final bool? overdueMatch;
+  // Applies to REPEATING tasks only (non-repeating tasks are unaffected):
+  // true  = repeating tasks must be scheduled in the current Mon–Sun week
+  // false = repeating tasks must be scheduled outside the current week
+  // null  = no constraint
+  final bool? repeatingWeekMatch;
   // true = catch-all: matches everything NOT matched by earlier containers
   final bool isRest;
   // Whether to show this container even when empty
@@ -754,6 +774,7 @@ class GroupContainer {
     Set<TaskStatus>? statusMatches,
     this.repeatingMatch,
     this.overdueMatch,
+    this.repeatingWeekMatch,
     this.isRest = false,
     this.collapsed = false,
     List<ContainerCriteriaItem>? criteriaItems,
@@ -763,6 +784,7 @@ class GroupContainer {
          statusMatches: statusMatches ?? {},
          repeatingMatch: repeatingMatch,
          overdueMatch: overdueMatch,
+         repeatingWeekMatch: repeatingWeekMatch,
          isRest: isRest,
        );
 
@@ -771,6 +793,7 @@ class GroupContainer {
     required Set<TaskStatus> statusMatches,
     bool? repeatingMatch,
     bool? overdueMatch,
+    bool? repeatingWeekMatch,
     bool isRest = false,
   }) {
     final items = <ContainerCriteriaItem>[];
@@ -802,6 +825,13 @@ class GroupContainer {
         boolValue: overdueMatch,
       ));
     }
+    if (repeatingWeekMatch != null) {
+      items.add(ContainerCriteriaItem(
+        id: _gristId(),
+        type: CriteriaItemType.currentWeek,
+        boolValue: repeatingWeekMatch,
+      ));
+    }
     // Assign operators between consecutive items (last has no operator).
     // Status criteria are combined with OR (a task has status X *or* Y),
     // while the transition from status → repeating/overdue uses AND.
@@ -823,7 +853,8 @@ class GroupContainer {
     // since without a following AND the parens add no value visually.
     final hasTrailing = items.any((e) =>
         e.type == CriteriaItemType.repeating ||
-        e.type == CriteriaItemType.overdue);
+        e.type == CriteriaItemType.overdue ||
+        e.type == CriteriaItemType.currentWeek);
     final statusCount = items.where((e) => e.type == CriteriaItemType.status).length;
     if (hasTrailing && statusCount > 1) {
       // Find the index of the first non-status item
@@ -868,52 +899,88 @@ class GroupContainer {
       if (overdueMatch! && !isOvd) return false;
       if (!overdueMatch! && isOvd) return false;
     }
+    // Current-week gate (repeating tasks only)
+    if (repeatingWeekMatch != null && t.isPartOfSeries) {
+      final sd = t.scheduledDate;
+      if (sd == null) return false;
+      final day = DateTime(sd.year, sd.month, sd.day);
+      final weekStart = DateTime(today.year, today.month, today.day)
+          .subtract(Duration(days: today.weekday - 1));
+      final weekEnd = weekStart.add(const Duration(days: 6));
+      final inWeek = !day.isBefore(weekStart) && !day.isAfter(weekEnd);
+      if (repeatingWeekMatch! != inWeek) return false;
+    }
     return true;
   }
 }
 
-/// Returns the default set of containers that replicates the legacy bucketing.
+/// Default containers for project / task lists. The buckets are mutually
+/// exclusive:
+///   Standard                 – not done; non-repeating, plus repeating of the
+///                              current week (both not overdue)
+///   Overdue & Non-Repeating  – not done, overdue
+///   Overdue & Repeating      – not done, overdue
+///   Not Done & Repeating     – not done, repeating, NOT overdue, outside the
+///                              current week
+///   Done & Non-Repeating / Done & Repeating – terminal statuses
 List<GroupContainer> _defaultGroupContainers() {
+  const active = {
+    TaskStatus.none,
+    TaskStatus.todo,
+    TaskStatus.inProgress,
+    TaskStatus.waiting,
+  };
+  const finished = {
+    TaskStatus.done,
+    TaskStatus.cancelled,
+    TaskStatus.withdrawn,
+    TaskStatus.surpassed,
+  };
   return [
-    // Standard: active non-overdue non-repeating tasks
     GroupContainer(
       id: 'default_standard',
       displayLabel: 'Standard',
-      statusMatches: {TaskStatus.none, TaskStatus.todo, TaskStatus.inProgress, TaskStatus.waiting},
-      repeatingMatch: false,
+      statusMatches: {...active},
       overdueMatch: false,
+      repeatingWeekMatch: true,
       defaultOperator: LogicalOperator.or,
     ),
-    // Overdue: active non-repeating overdue
     GroupContainer(
       id: 'default_overdue',
-      displayLabel: 'Overdue',
-      statusMatches: {TaskStatus.none, TaskStatus.todo, TaskStatus.inProgress, TaskStatus.waiting},
+      displayLabel: 'Overdue & Non-Repeating',
+      statusMatches: {...active},
       repeatingMatch: false,
       overdueMatch: true,
       defaultOperator: LogicalOperator.or,
     ),
-    // Done: terminal-status, non-repeating
+    GroupContainer(
+      id: 'default_overdue_repeating',
+      displayLabel: 'Overdue & Repeating',
+      statusMatches: {...active},
+      repeatingMatch: true,
+      overdueMatch: true,
+      defaultOperator: LogicalOperator.or,
+    ),
+    GroupContainer(
+      id: 'default_repeating_active',
+      displayLabel: 'Not Done & Repeating',
+      statusMatches: {...active},
+      repeatingMatch: true,
+      overdueMatch: false,
+      repeatingWeekMatch: false,
+      defaultOperator: LogicalOperator.or,
+    ),
     GroupContainer(
       id: 'default_done',
-      displayLabel: 'Done',
-      statusMatches: {TaskStatus.done, TaskStatus.cancelled, TaskStatus.withdrawn, TaskStatus.surpassed},
+      displayLabel: 'Done & Non-Repeating',
+      statusMatches: {...finished},
       repeatingMatch: false,
       defaultOperator: LogicalOperator.or,
     ),
-    // Not-Done & Repeating
-    GroupContainer(
-      id: 'default_repeating_active',
-      displayLabel: 'Not-Done & Repeating',
-      statusMatches: {TaskStatus.none, TaskStatus.todo, TaskStatus.inProgress, TaskStatus.waiting},
-      repeatingMatch: true,
-      defaultOperator: LogicalOperator.or,
-    ),
-    // Done & Repeating
     GroupContainer(
       id: 'default_repeating_done',
       displayLabel: 'Done & Repeating',
-      statusMatches: {TaskStatus.done, TaskStatus.cancelled, TaskStatus.withdrawn, TaskStatus.surpassed},
+      statusMatches: {...finished},
       repeatingMatch: true,
       defaultOperator: LogicalOperator.or,
     ),
@@ -1140,6 +1207,10 @@ class RepeatConfig {
   /// When null, only [endDate] controls the horizon (no days cap).
   int? propagationDays;
 
+  /// Exception dates (yyyy-MM-dd): occurrences the user deleted/skipped from
+  /// the series. The generator never recreates an instance on these dates.
+  List<String> exceptionDates;
+
   RepeatConfig({
     this.preset = RepeatPreset.everyday,
     this.customEvery = 1,
@@ -1150,8 +1221,10 @@ class RepeatConfig {
     this.anchorDate,
     this.endDate,
     this.propagationDays,
+    List<String>? exceptionDates,
   }) : customStartDate = customStartDate ?? DateTime.now(),
-       customWeekDays = customWeekDays ?? {DateTime.now().weekday};
+       customWeekDays = customWeekDays ?? {DateTime.now().weekday},
+       exceptionDates = exceptionDates ?? <String>[];
 
   String get label {
     switch (preset) {
@@ -3548,6 +3621,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
   // Folders: projectFolders[folderName] = {projId, ...}
   //          tagFolders[folderName]     = {tag, ...}
   Map<String, Set<String>> _projectFolders = {};
+  // Optional per-folder colour for project folders (Tasks tab). Absent = default yellow.
+  Map<String, Color> _projectFolderColors = {};
+  Map<String, Color> _tagFolderColors = {};
   Map<String, Set<String>> _tagFolders = {};
   // Persisted vertical order of project/tag folder groups in the sidebar.
   // Each list contains folder-name keys plus '__standard__' / '__unfoldered__'
@@ -3602,6 +3678,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
       'editor'; // 'editor' | 'notes_org_notes' | 'org_projects'
   // Hidden tags (by tag string)
   final Set<String> _hiddenTags = {};
+  // Whole folders hidden from the Tasks sidebar (Standard = '__standard__' / '__unfoldered__').
+  final Set<String> _hiddenProjectFolders = {};
+  final Set<String> _hiddenTagFolders = {};
   Map<String, Color> _tagColors = {}; // tagName → color
   Map<String, String> _tagIcons = {}; // tagName → emoji/char
   // ── Grist-style stackable Filter / Group / Sort state ─────────────────────
@@ -4574,6 +4653,328 @@ class _ResizableScreenState extends State<ResizableScreen> {
     });
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Schedule › Export one day to PDF / PNG
+  // ───────────────────────────────────────────────────────────────────────────
+
+  Future<void> _showExportScheduleDayDialog() async {
+    final nowApp = AppClock.now();
+    final today = DateTime(nowApp.year, nowApp.month, nowApp.day);
+    final start = DateTime(
+      _scheduleWeekStart.year,
+      _scheduleWeekStart.month,
+      _scheduleWeekStart.day,
+    );
+    final visEnd =
+        _scheduleVisibleEnd ?? _scheduleWeekStart.add(const Duration(days: 6));
+    // Default: today when it is on screen, otherwise the first visible day.
+    DateTime day = (!today.isBefore(start) && !today.isAfter(visEnd))
+        ? today
+        : start;
+    String format = 'pdf';
+    bool byProject = false;
+    bool fillable = false;
+    const accent = Color(0xFF4FC3F7);
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (dctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          Widget choice(String text, bool active, VoidCallback onTap) =>
+              GestureDetector(
+                onTap: onTap,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: active
+                        ? accent.withOpacity(0.2)
+                        : Colors.white.withOpacity(0.05),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: active ? accent : Colors.white12,
+                    ),
+                  ),
+                  child: Text(
+                    text,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: active ? FontWeight.bold : FontWeight.normal,
+                      color: active ? accent : Colors.white60,
+                    ),
+                  ),
+                ),
+              );
+
+          Widget heading(String t) => Padding(
+            padding: const EdgeInsets.only(top: 16, bottom: 8),
+            child: Text(
+              t,
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.6,
+              ),
+            ),
+          );
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF252525),
+            title: const Text(
+              'Export day',
+              style: TextStyle(color: Colors.white, fontSize: 16),
+            ),
+            content: SizedBox(
+              width: 340,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  heading('DAY'),
+                  InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: () async {
+                      final picked = await showDatePicker(
+                        context: ctx,
+                        initialDate: day,
+                        firstDate: DateTime(2000),
+                        lastDate: DateTime(2100),
+                        builder: (c, child) => Theme(
+                          data: ThemeData.dark().copyWith(
+                            colorScheme: const ColorScheme.dark(primary: accent),
+                          ),
+                          child: child!,
+                        ),
+                      );
+                      if (picked != null) {
+                        setD(
+                          () => day = DateTime(
+                            picked.year,
+                            picked.month,
+                            picked.day,
+                          ),
+                        );
+                      }
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.event_outlined,
+                            size: 16,
+                            color: Colors.white54,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '${months[day.month - 1]} ${day.day}, ${day.year}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const Spacer(),
+                          const Icon(
+                            Icons.edit_calendar_outlined,
+                            size: 15,
+                            color: Colors.white38,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  heading('FORMAT'),
+                  Row(
+                    children: [
+                      choice('PDF', format == 'pdf',
+                          () => setD(() => format = 'pdf')),
+                      const SizedBox(width: 8),
+                      choice('Image (PNG)', format == 'png',
+                          () => setD(() => format = 'png')),
+                    ],
+                  ),
+                  heading('CARD COLOR'),
+                  Row(
+                    children: [
+                      choice('By status', !byProject,
+                          () => setD(() => byProject = false)),
+                      const SizedBox(width: 8),
+                      choice('By project', byProject,
+                          () => setD(() => byProject = true)),
+                    ],
+                  ),
+                  if (format == 'pdf') ...[
+                    heading('FILLABLE FIELDS'),
+                    Row(
+                      children: [
+                        choice('Off', !fillable,
+                            () => setD(() => fillable = false)),
+                        const SizedBox(width: 8),
+                        choice('On', fillable,
+                            () => setD(() => fillable = true)),
+                      ],
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text(
+                        'Adds actual start/end, notes and a done checkbox '
+                        'next to each task, editable in a PDF reader.',
+                        style: TextStyle(color: Colors.white38, fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dctx).pop(),
+                child: const Text(
+                  'Cancel',
+                  style: TextStyle(color: Colors.white54),
+                ),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(dctx).pop({
+                  'day': day,
+                  'format': format,
+                  'byProject': byProject,
+                  'fillable': format == 'pdf' && fillable,
+                }),
+                child: const Text('Export', style: TextStyle(color: accent)),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (result == null || !mounted) return;
+    await _exportScheduleDay(
+      result['day'] as DateTime,
+      result['format'] as String,
+      result['byProject'] as bool,
+      result['fillable'] as bool,
+    );
+  }
+
+  Future<void> _exportScheduleDay(
+    DateTime day,
+    String format,
+    bool byProject,
+    bool fillable,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ext = format == 'pdf' ? 'pdf' : 'png';
+    final mm = day.month.toString().padLeft(2, '0');
+    final dd = day.day.toString().padLeft(2, '0');
+
+    // 1) Where to save.
+    final picked = await FilePicker.platform.saveFile(
+      dialogTitle: 'Export schedule day',
+      fileName: 'schedule_${day.year}-$mm-$dd.$ext',
+      type: FileType.custom,
+      allowedExtensions: [ext],
+    );
+    if (picked == null || !mounted) return;
+    final outPath = picked.toLowerCase().endsWith('.$ext')
+        ? picked
+        : '$picked.$ext';
+
+    // 2) Progress indicator (rasterising + zlib run on the UI isolate).
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: CircularProgressIndicator(strokeWidth: 3),
+        ),
+      ),
+    );
+    await Future.delayed(const Duration(milliseconds: 60));
+
+    try {
+      // 3) Make sure that day's week is loaded (same as navigating there).
+      final visEnd =
+          _scheduleVisibleEnd ??
+          _scheduleWeekStart.add(const Duration(days: 6));
+      final s0 = DateTime(
+        _scheduleWeekStart.year,
+        _scheduleWeekStart.month,
+        _scheduleWeekStart.day,
+      );
+      if (day.isBefore(s0) || day.isAfter(visEnd)) {
+        await _loadWeekTasks(day);
+      }
+
+      // 4) Same selection rule as the canvas: scheduledDate == day.
+      final items = <_DayExportItem>[];
+      for (final t in _allTasks) {
+        if (t.dueDay == null) continue;
+        final d = t.scheduledDate;
+        if (d == null ||
+            d.year != day.year ||
+            d.month != day.month ||
+            d.day != day.day) {
+          continue;
+        }
+        items.add(
+          _DayExportItem(
+            id: t.id,
+            title: t.title,
+            project: _projects[t.projectId]?.title,
+            status: t.status,
+            done: t.isDone || t.status == TaskStatus.done,
+            color: byProject
+                ? (_projectColors[t.projectId] ?? t.status.color)
+                : t.status.color,
+            start: t.scheduledDateTime,
+            durationMinutes: t.durationMinutes,
+          ),
+        );
+      }
+
+      // 5) Render + encode + write.
+      final Uint8List bytes;
+      if (format == 'pdf') {
+        bytes = await _ScheduleDayExporter.buildVectorPdf(
+          day,
+          items,
+          fillable: fillable,
+        );
+      } else {
+        final pages = await _ScheduleDayExporter.render(day, items);
+        bytes = await _ScheduleDayExporter.toPng(pages.first);
+      }
+      await File(outPath).writeAsBytes(bytes, flush: true);
+
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      messenger.showSnackBar(
+        SnackBar(content: Text('Exported to $outPath')),
+      );
+    } catch (e, st) {
+      debugPrint('_exportScheduleDay failed: $e\n$st');
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      messenger.showSnackBar(SnackBar(content: Text('Export failed: $e')));
+    }
+  }
+
   Widget _buildScheduleTitleBar() {
     final weekEnd =
         _scheduleVisibleEnd ?? _scheduleWeekStart.add(const Duration(days: 6));
@@ -4770,6 +5171,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
           _ExecViewDropdown(
             value: _scheduleExecViewMode,
             onChanged: (v) => setState(() => _scheduleExecViewMode = v),
+          ),
+          const SizedBox(width: 8),
+          // Export a single day (PDF / PNG)
+          _tasksIconBtn(
+            Icons.file_download_outlined,
+            'Export day (PDF / PNG)',
+            _showExportScheduleDayDialog,
           ),
           const Spacer(),
         ],
@@ -5563,6 +5971,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
     if (cfg.anchorDate != null) m['anchorDate'] = cfg.anchorDate!.toIso8601String();
     if (cfg.endDate != null) m['endDate'] = cfg.endDate!.toIso8601String();
     if (cfg.propagationDays != null) m['propagationDays'] = cfg.propagationDays;
+    if (cfg.exceptionDates.isNotEmpty) {
+      m['exceptionDates'] = (cfg.exceptionDates.toSet().toList()..sort());
+    }
     return m;
   }
 
@@ -5595,6 +6006,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
           ? DateTime.tryParse(m['endDate'] as String)
           : null,
       propagationDays: m['propagationDays'] as int?,
+      exceptionDates: ((m['exceptionDates'] ?? m['excludedDates']) as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          <String>[],
     );
   }
 
@@ -6047,6 +6462,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
           (k, v) => MapEntry(k, v.toList()),
         ),
         'tagFolders': _tagFolders.map((k, v) => MapEntry(k, v.toList())),
+        'projectFolderColors': _projectFolderColors.map(
+          (k, v) => MapEntry(k, v.value),
+        ),
+        'tagFolderColors': _tagFolderColors.map(
+          (k, v) => MapEntry(k, v.value),
+        ),
         'projectFolderOrder': _projectFolderOrder,
         'tagFolderOrder': _tagFolderOrder,
         'tagOrder': _tagOrder,
@@ -6055,6 +6476,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         'hiddenNoteProjects': _hiddenNoteProjects.toList(),
         'hiddenNoteTasks': _hiddenNoteTasks.toList(),
         'hiddenTags': _hiddenTags.toList(),
+        'hiddenProjectFolders': _hiddenProjectFolders.toList(),
+        'hiddenTagFolders': _hiddenTagFolders.toList(),
         'tagColors': _tagColors.map((k, v) => MapEntry(k, v.value)),
         'tagIcons': _tagIcons,
         'showHiddenProjects': _showHiddenProjects,
@@ -6363,6 +6786,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
       // Clear sidebar/projects
       _allTasks.clear();
       _projects.clear();
+      _projectOrder.clear();
+      _groupedTasks.clear();
+      _taskIndex = {};
+      _savedBoards = [];
+      _currentBoardId = '';
       _sidebarSectionOrder.clear();
       _favoriteProjectIds.clear();
       _projectColors.clear();
@@ -6560,6 +6988,137 @@ class _ResizableScreenState extends State<ResizableScreen> {
     }
   }
 
+  /// Repeat instances of series [sid] that exist only in [_taskIndex] (their
+  /// .md files are not loaded into [_allTasks]), sorted by date.
+  List<_UnloadedRepeatInstance> _unloadedRepeatInstances(String sid) {
+    final loadedIds = _allTasks.map((t) => t.id).toSet();
+    final prefix = 'repeat_${sid}_';
+    final out = <_UnloadedRepeatInstance>[];
+    for (final kv in _taskIndex.entries) {
+      if (!kv.key.startsWith(prefix)) continue;
+      if (loadedIds.contains(kv.key)) continue;
+      final d = DateTime.tryParse((kv.value['dueDay'] as String?) ?? '');
+      if (d == null) continue;
+      out.add(_UnloadedRepeatInstance(kv.key, DateTime(d.year, d.month, d.day)));
+    }
+    out.sort((a, b) => a.date.compareTo(b.date));
+    return out;
+  }
+
+  /// Generates additional repeat instances **after the last existing one** for
+  /// the series that [task] belongs to. Provide either [count] (number of new
+  /// occurrences) or [until] (generate up to and including that date).
+  ///
+  /// Returns a human-readable result message. The series' own limits
+  /// (endDate / propagationDays) are still honoured; when they cut the
+  /// generation short the message says so.
+  Future<String> _generateMoreRepeatInstances(
+    Task task, {
+    int? count,
+    DateTime? until,
+  }) async {
+    final sid = task.seriesId;
+    if (sid == null) return 'This task is not part of a repeating series.';
+
+    Task? anchor;
+    for (final t in _allTasks) {
+      if (t.seriesId == sid && t.isSeriesParent) {
+        anchor = t;
+        break;
+      }
+    }
+    anchor ??= task;
+
+    final anchors = _allTasks
+        .where(
+          (t) =>
+              t.seriesId == sid &&
+              t.repeatConfig != null &&
+              !t.repeatConfig!.cleared &&
+              t.scheduledDate != null,
+        )
+        .toList()
+      ..sort((a, b) => a.scheduledDate!.compareTo(b.scheduledDate!));
+    if (anchors.isEmpty) {
+      return 'This series has no active repeat configuration.';
+    }
+    final cfg = anchors.last.repeatConfig!;
+
+    // Last date that already has an instance (loaded or only in the index).
+    DateTime lastDate = anchors.last.scheduledDate!;
+    lastDate = DateTime(lastDate.year, lastDate.month, lastDate.day);
+    for (final t in _allTasks.where((t) => t.seriesId == sid)) {
+      final d = t.scheduledDate;
+      if (d == null) continue;
+      final day = DateTime(d.year, d.month, d.day);
+      if (day.isAfter(lastDate)) lastDate = day;
+    }
+    final seriesPrefix = 'repeat_${sid}_';
+    for (final kv in _taskIndex.entries) {
+      if (!kv.key.startsWith(seriesPrefix)) continue;
+      final d = DateTime.tryParse((kv.value['dueDay'] as String?) ?? '');
+      if (d == null) continue;
+      final day = DateTime(d.year, d.month, d.day);
+      if (day.isAfter(lastDate)) lastDate = day;
+    }
+
+    // Work out the target end date.
+    final maxTarget = lastDate.add(const Duration(days: 1826)); // ~5 years
+    DateTime? target;
+    if (count != null) {
+      var cursor = lastDate;
+      var n = 0;
+      while (n < count) {
+        final next = _nextRepeatDate(cfg, cursor);
+        if (next == null) break;
+        final day = DateTime(next.year, next.month, next.day);
+        if (!day.isAfter(cursor) || day.isAfter(maxTarget)) break;
+        cursor = day;
+        target = day;
+        n++;
+      }
+      if (target == null) {
+        return 'No further occurrences could be computed for this repeat rule.';
+      }
+    } else if (until != null) {
+      target = DateTime(until.year, until.month, until.day);
+      if (!target.isAfter(lastDate)) {
+        return 'Instances already exist up to ${_fmtDateChip(lastDate)}. '
+            'Pick a later date.';
+      }
+      if (target.isAfter(maxTarget)) target = maxTarget;
+    } else {
+      return 'Nothing to generate.';
+    }
+
+    final before = _allTasks.where((t) => t.seriesId == sid).length;
+    final knownIds = _allTasks.map((t) => t.id).toSet();
+    await _generateWeekInstances(
+      anchor,
+      lastDate.add(const Duration(days: 1)),
+      target!,
+    );
+    final created = _allTasks.where((t) => !knownIds.contains(t.id)).toList();
+    final after = _allTasks.where((t) => t.seriesId == sid).length;
+    final createdCount = after - before;
+
+    if (createdCount <= 0) {
+      return 'No instances were created. The series is limited by its end date '
+          'or propagation days — edit the repeat configuration to extend it.';
+    }
+    DateTime? newest;
+    for (final t in created) {
+      final d = t.scheduledDate;
+      if (d != null && (newest == null || d.isAfter(newest))) newest = d;
+    }
+    final upTo = newest != null ? ' (up to ${_fmtDateChip(newest)})' : '';
+    if (count != null && createdCount < count) {
+      return 'Created $createdCount of $count instances$upTo. The series is '
+          'limited by its end date or propagation days.';
+    }
+    return 'Created $createdCount instance${createdCount == 1 ? '' : 's'}$upTo.';
+  }
+
   /// Loads tasks for [weekStart]–[weekStart+6] that are not already in
   /// [_allTasks], reading their .md files on demand.
   ///
@@ -6657,7 +7216,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
       }
     }
 
-    if (toLoad.isEmpty) return;
+    if (toLoad.isEmpty) {
+      // Nothing to load from disk, but the series' upcoming instances may
+      // still need to be generated in memory.
+      await _generateProjectSeriesInstances(projectId);
+      return;
+    }
 
     final loaded = <Task>[];
     for (final absPath in toLoad) {
@@ -6733,7 +7297,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     for (final anchor in anchors) {
       final cfg = anchor.repeatConfig!;
-      final seriesDates = occupiedDates[anchor.id] ?? {};
+      final seriesDates = occupiedDates[anchor.seriesKey] ?? {};
 
       // Determine horizon: endDate, propagationDays, or 1-year fallback.
       final DateTime horizon;
@@ -6751,7 +7315,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       // All anchor tasks in this series (segments), sorted chronologically.
       final segments = _allTasks
           .where((t) =>
-              t.seriesId == anchor.id &&
+              t.seriesId == anchor.seriesKey &&
               t.repeatConfig != null &&
               !t.repeatConfig!.cleared)
           .toList()
@@ -6760,6 +7324,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
           final db = b.scheduledDate ?? DateTime(2099);
           return da.compareTo(db);
         });
+      // Never recreate occurrences the user deleted.
+      for (final sg in segments) {
+        for (final ds in sg.repeatConfig!.exceptionDates) {
+          final d = DateTime.tryParse(ds);
+          if (d != null) seriesDates.add(DateTime(d.year, d.month, d.day));
+        }
+      }
 
       final timeOfDay = anchor.plannedAt != null
           ? Duration(
@@ -6806,7 +7377,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           if (seriesDates.contains(day)) continue;
 
           final id =
-              'repeat_${anchor.id}_${cursor.millisecondsSinceEpoch}';
+              'repeat_${anchor.seriesKey}_${cursor.millisecondsSinceEpoch}';
           if (occupiedIds.contains(id)) continue;
 
           final instance = Task(
@@ -6825,8 +7396,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
             attachments: [],
             tagIds: List.from(anchor.tagIds),
             notes: anchor.notes,
-            repeatParentId: anchor.id,
-            seriesId: anchor.id,
+            repeatParentId: anchor.seriesKey,
+            seriesId: anchor.seriesKey,
           );
 
           newTasks.add(instance);
@@ -6859,7 +7430,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     // Collect already-occupied dates (memory + index) to avoid duplicates.
     final occupiedDates = <DateTime>{};
-    for (final t in _allTasks.where((t) => t.seriesId == anchor.id)) {
+    for (final t in _allTasks.where((t) => t.seriesId == anchor.seriesKey)) {
       final d = t.scheduledDate;
       if (d != null) occupiedDates.add(DateTime(d.year, d.month, d.day));
     }
@@ -6867,7 +7438,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     // have ids of the form "repeat_<anchorId>_<epochMs>", so the prefix is a
     // reliable filter). Using all _taskIndex entries was causing instances of
     // an unrelated series to "block" generation for this one on the same date.
-    final seriesPrefix = 'repeat_${anchor.id}_';
+    final seriesPrefix = 'repeat_${anchor.seriesKey}_';
     for (final kv in _taskIndex.entries) {
       if (!kv.key.startsWith(seriesPrefix)) continue;
       final dueDayStr = kv.value['dueDay'] as String?;
@@ -6880,7 +7451,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final anchorTasks = _allTasks
         .where(
           (t) =>
-              t.seriesId == anchor.id &&
+              t.seriesId == anchor.seriesKey &&
               t.repeatConfig != null &&
               !t.repeatConfig!.cleared,
         )
@@ -6890,6 +7461,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
         final db = b.scheduledDate ?? DateTime(2099);
         return da.compareTo(db);
       });
+
+    // Never recreate occurrences the user deleted.
+    for (final at in anchorTasks) {
+      for (final ds in at.repeatConfig!.exceptionDates) {
+        final d = DateTime.tryParse(ds);
+        if (d != null) occupiedDates.add(DateTime(d.year, d.month, d.day));
+      }
+    }
 
     final timeOfDay = anchor.plannedAt != null
         ? Duration(
@@ -6961,7 +7540,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         if (occupiedDates.contains(day)) continue;
 
         final id =
-            'repeat_${anchor.id}_${cursor.millisecondsSinceEpoch}';
+            'repeat_${anchor.seriesKey}_${cursor.millisecondsSinceEpoch}';
         newTasks.add(
           Task(
             id: id,
@@ -6979,8 +7558,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
             attachments: [],
             tagIds: List.from(anchor.tagIds),
             notes: anchor.notes,
-            repeatParentId: anchor.id,
-            seriesId: anchor.id,
+            repeatParentId: anchor.seriesKey,
+            seriesId: anchor.seriesKey,
           ),
         );
         occupiedDates.add(day);
@@ -7235,6 +7814,16 @@ class _ResizableScreenState extends State<ResizableScreen> {
             (k, v) => MapEntry(k as String, Set<String>.from(v as List)),
           );
         }
+        if (data['tagFolderColors'] != null) {
+          _tagFolderColors = (data['tagFolderColors'] as Map).map(
+            (k, v) => MapEntry(k as String, Color(v as int)),
+          );
+        }
+        if (data['projectFolderColors'] != null) {
+          _projectFolderColors = (data['projectFolderColors'] as Map).map(
+            (k, v) => MapEntry(k as String, Color(v as int)),
+          );
+        }
         if (data['tagFolders'] != null) {
           _tagFolders = (data['tagFolders'] as Map).map(
             (k, v) => MapEntry(k as String, Set<String>.from(v as List)),
@@ -7267,6 +7856,16 @@ class _ResizableScreenState extends State<ResizableScreen> {
         if (data['hiddenNoteTasks'] != null) {
           _hiddenNoteTasks = Set<String>.from(data['hiddenNoteTasks'] as List);
         }
+        _hiddenProjectFolders
+          ..clear()
+          ..addAll(
+            List<String>.from((data['hiddenProjectFolders'] as List?) ?? []),
+          );
+        _hiddenTagFolders
+          ..clear()
+          ..addAll(
+            List<String>.from((data['hiddenTagFolders'] as List?) ?? []),
+          );
         if (data['hiddenTags'] != null) {
           _hiddenTags.addAll(List<String>.from(data['hiddenTags'] as List));
           if (data['tagColors'] != null) {
@@ -7543,79 +8142,116 @@ class _ResizableScreenState extends State<ResizableScreen> {
       await _saveWorkspace();
     }
   }
-  // ── Restore workspace from a .json file picked by the user ────────────────
-  Future<void> _restoreWorkspaceFromFile() async {
-    // Step 1: pick the backup .json file.
-    final result = await FilePicker.platform.pickFiles(
-      dialogTitle: 'Restore workspace from file',
-      type: FileType.custom,
-      allowedExtensions: ['json'],
-      allowMultiple: false,
+  // ── Find an existing workspace folder and open it ─────────────────────────
+  /// Lets the user pick a workspace folder (the one that contains
+  /// metadata/workspace_<id>.json). Registers it in the workspace list if it
+  /// is not there yet (or updates its path if it moved) and opens it.
+  Future<void> _findWorkspaceFolder() async {
+    final dir = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Find workspace folder',
     );
-    if (result == null || result.files.single.path == null) return;
-    final srcPath = result.files.single.path!;
+    if (dir == null) return;
 
-    Map<String, dynamic> data;
-    try {
-      data =
-          jsonDecode(await File(srcPath).readAsString())
-              as Map<String, dynamic>;
-    } catch (e) {
-      if (mounted) {
-        showDialog(
-          context: context,
-          builder: (_) => AlertDialog(
-            backgroundColor: const Color(0xFF252525),
-            title: const Text(
-              'Invalid file',
-              style: TextStyle(color: Colors.white),
-            ),
-            content: Text(
-              'Could not read workspace file: $e',
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('OK'),
-              ),
-            ],
-          ),
-        );
+    final sep = Platform.pathSeparator;
+    String clean(String d) =>
+        d.length > 1 && d.endsWith(sep) ? d.substring(0, d.length - 1) : d;
+
+    // Accept the workspace root itself, or its metadata/ or files/ subfolder.
+    final picked = clean(dir);
+    final candidates = <String>[picked];
+    final last = picked.split(sep).last;
+    if (last == 'metadata' || last == 'files') {
+      candidates.add(clean(Directory(picked).parent.path));
+    }
+
+    String? wsRoot;
+    File? wsFile;
+    for (final root in candidates) {
+      final metaDir = Directory('$root${sep}metadata');
+      if (!await metaDir.exists()) continue;
+      await for (final e in metaDir.list(followLinks: false)) {
+        if (e is! File) continue;
+        final fname = e.path.split(sep).last;
+        if (fname.startsWith('workspace_') && fname.endsWith('.json')) {
+          wsRoot = root;
+          wsFile = e;
+          break;
+        }
       }
+      if (wsFile != null) break;
+    }
+
+    Future<void> showErr(String msg) async {
+      if (!mounted) return;
+      await showDialog(
+        context: context,
+        builder: (dctx) => AlertDialog(
+          backgroundColor: const Color(0xFF252525),
+          title: const Text(
+            'Workspace not found',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Text(
+            msg,
+            style: const TextStyle(color: Colors.white70, fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dctx),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (wsRoot == null || wsFile == null) {
+      await showErr(
+        'No workspace was found in "$picked". Select the workspace folder '
+        '(the one that contains a "metadata" folder with a workspace_*.json file).',
+      );
       return;
     }
 
-    final id = data['id'] as String? ?? _generateId();
-    final name = data['workspaceName'] as String? ?? 'Restored Workspace';
-    final meta = data['metaPath'] as String? ?? '';
-
-    // Step 2: ask the user where to place the restored workspace.
-    // Pre-select the backup file's grandparent as a sensible default
-    // (standard workspace files live at <wsRoot>/metadata/workspace_X.json).
-    final destDir = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: 'Choose folder for restored workspace',
-    );
-    if (destDir == null) return;
-
-    final wsRoot = destDir;
-    final dest = File('$wsRoot/metadata/workspace_$id.json');
-    await dest.parent.create(recursive: true);
-    // Only write if the source and destination are different paths.
-    if (dest.path != srcPath) {
-      await dest.writeAsString(jsonEncode({...data, 'id': id}));
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(await wsFile.readAsString()) as Map<String, dynamic>;
+    } catch (e) {
+      await showErr('Could not read workspace file: $e');
+      return;
     }
 
-    final entry = {
+    final fname = wsFile.path.split(sep).last;
+    final fileId = fname.substring('workspace_'.length, fname.length - '.json'.length);
+    final id = (data['id'] as String?)?.isNotEmpty == true
+        ? data['id'] as String
+        : fileId;
+    final name = (data['workspaceName'] as String?)?.isNotEmpty == true
+        ? data['workspaceName'] as String
+        : wsRoot.split(sep).last;
+    final meta = data['metaPath'] as String? ?? '';
+
+    // The loader expects metadata/workspace_<id>.json — if the id inside the
+    // JSON differs from the file name, stop rather than open the wrong data.
+    if (id != fileId) {
+      await showErr(
+        'The workspace file name ("$fname") does not match the id stored inside it.',
+      );
+      return;
+    }
+
+    final entry = <String, String>{
       'id': id,
       'name': name,
       'metaPath': meta,
       'basePath': wsRoot,
     };
 
-    // Register in workspace list if not already there.
     setState(() {
-      if (!_savedWorkspaces.any((w) => w['id'] == id)) {
+      final idx = _savedWorkspaces.indexWhere((w) => w['id'] == id);
+      if (idx >= 0) {
+        _savedWorkspaces[idx]['basePath'] = wsRoot!;
+      } else {
         _savedWorkspaces.add(entry);
       }
     });
@@ -7623,8 +8259,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     // Close switcher dialog then load — deferred to avoid navigation race.
     if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    final toLoad = _savedWorkspaces.firstWhere((w) => w['id'] == id);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadWorkspaceById(entry);
+      _loadWorkspaceById(toLoad);
     });
   }
 
@@ -8913,6 +9550,78 @@ class _ResizableScreenState extends State<ResizableScreen> {
     // Drop outside all segments — leave date unchanged
   }
 
+  /// Permanently removes the on-disk state of tasks that were deleted from
+  /// [_allTasks]: their .md files, their [_taskIndex] entries, and any task
+  /// note linked to them. Without this the .md survives and the task is
+  /// re-imported on the next reload (index load / orphan repair).
+  Future<void> _deleteTaskFiles(Iterable<Task> tasks) async {
+    if (_workspaceId.isEmpty) return;
+    final list = tasks.toList();
+    if (list.isEmpty) return;
+    final filesDir = _wsFilesDir(_workspaceId);
+    final removedIds = list.map((t) => t.id).toSet();
+    // Paths still owned by surviving tasks must never be deleted.
+    final livePaths = <String>{};
+    for (final t in _allTasks) {
+      if (removedIds.contains(t.id)) continue;
+      livePaths.add(_taskMdPath(t));
+    }
+    for (final t in list) {
+      final paths = <String>{};
+      final rel = _taskIndex[t.id]?['path'] as String?;
+      if (rel != null && rel.isNotEmpty) {
+        paths.add(rel.startsWith('/') ? rel : '$filesDir/$rel');
+      }
+      paths.add(_taskMdPath(t));
+      for (final path in paths) {
+        if (livePaths.contains(path)) continue;
+        try {
+          final f = File(path);
+          if (!await f.exists()) continue;
+          // Only delete the file if it really holds this task.
+          final parsed = _loadTaskFromMd(path, await f.readAsString());
+          if (parsed != null && parsed.id != t.id) continue;
+          await f.delete();
+        } catch (e) {
+          debugPrint('_deleteTaskFiles: could not delete $path: $e');
+        }
+      }
+      _taskIndex.remove(t.id);
+    }
+    // Drop task notes linked to the deleted tasks so they are not re-saved.
+    final staleNotes = _notes.entries
+        .where((e) =>
+            e.value.type == NoteType.task &&
+            e.value.linkedTaskId != null &&
+            removedIds.contains(e.value.linkedTaskId))
+        .map((e) => e.key)
+        .toList();
+    if (staleNotes.isNotEmpty && mounted) {
+      setState(() {
+        for (final k in staleNotes) {
+          _notes.remove(k);
+          _openNoteTabs.remove(k);
+          if (_activeNoteId == k) _activeNoteId = null;
+        }
+      });
+      await _saveNotesMeta();
+    }
+    await _saveWorkspace();
+  }
+
+  /// Deletes the files of every task in [before] that is no longer present in
+  /// [_allTasks]. Call it with a snapshot taken before the removal.
+  Future<void> _purgeRemovedTasks(List<Task> before) {
+    final alive = _allTasks.map((t) => t.id).toSet();
+    return _deleteTaskFiles(before.where((t) => !alive.contains(t.id)));
+  }
+
+  /// Runs [_purgeRemovedTasks] once the current synchronous handler (which
+  /// performs the removal) has finished.
+  void _purgeRemovedTasksAfterHandler(List<Task> before) {
+    Future.microtask(() => _purgeRemovedTasks(before));
+  }
+
   /// Persists any mutation made to [task] back to the workspace file.
   ///
   /// Previously this wrote directly into the SuperProductivity __meta_ JSON.
@@ -9637,7 +10346,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (_isVisualizerView) ...[
+              if (_isVisualizerView &&
+                  !_isTasksView &&
+                  !_isNotesView &&
+                  !_isSettingsView) ...[
                 const SizedBox(width: 6),
                 Builder(builder: (_) {
                   final tbLoc = _visualizerSelectedPath.isEmpty
@@ -9711,30 +10423,71 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final nameCtrl = TextEditingController();
     // pickedPath is mutated inside StatefulBuilder via setDlg — declared as a
     // one-element list so the inner closure can capture and mutate it.
+    // The picked path is the PARENT location; the workspace folder itself is
+    // created inside it, named after the text typed in the name field.
     final pathHolder = [''];
+    final errorHolder = [''];
+
+    // Folder-name-safe version of the workspace name.
+    String folderNameFor(String raw) {
+      var n = raw.trim().replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
+      n = n.replaceAll(RegExp(r'[. ]+$'), '');
+      return n.isEmpty ? 'Untitled' : n;
+    }
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlg) {
           final pickedPath = pathHolder[0];
+          final previewFolder = folderNameFor(nameCtrl.text);
+          final sep = Platform.pathSeparator;
+          final parentClean = pickedPath.endsWith(sep) && pickedPath.length > 1
+              ? pickedPath.substring(0, pickedPath.length - 1)
+              : pickedPath;
+          final finalPath = pickedPath.isEmpty
+              ? ''
+              : '$parentClean$sep$previewFolder';
 
           Future<void> pickFolder() async {
             final dir = await FilePicker.platform.getDirectoryPath(
-              dialogTitle: 'Choose workspace folder',
+              dialogTitle: 'Choose where the workspace folder will be created',
             );
-            if (dir != null) setDlg(() => pathHolder[0] = dir);
+            if (dir != null) {
+              setDlg(() {
+                pathHolder[0] = dir;
+                errorHolder[0] = '';
+              });
+            }
           }
 
           Future<void> doCreate() async {
             if (pathHolder[0].isEmpty) return;
+            final name = nameCtrl.text.trim().isNotEmpty
+                ? nameCtrl.text.trim()
+                : 'Untitled';
+            final wsDir = Directory(finalPath);
+            try {
+              if (await wsDir.exists()) {
+                final hasContent = await wsDir.list().isEmpty == false;
+                if (hasContent) {
+                  setDlg(() => errorHolder[0] =
+                      'A non-empty folder named "$previewFolder" already exists here.');
+                  return;
+                }
+              } else {
+                await wsDir.create(recursive: true);
+              }
+            } catch (e) {
+              setDlg(() => errorHolder[0] = 'Could not create folder: $e');
+              return;
+            }
             final id = _generateId();
-            final name = nameCtrl.text.isNotEmpty ? nameCtrl.text : 'Untitled';
             final entry = {
               'id': id,
               'name': name,
               'metaPath': '',
-              'basePath': pathHolder[0],
+              'basePath': finalPath,
             };
             setState(() {
               _savedWorkspaces.add(entry);
@@ -9781,6 +10534,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       borderSide: BorderSide(color: Colors.blueAccent),
                     ),
                   ),
+                  onChanged: (_) => setDlg(() => errorHolder[0] = ''),
                   onSubmitted: (_) => doCreate(),
                 ),
 
@@ -9788,7 +10542,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
                 // ── Location picker ────────────────────────────────────────
                 const Text(
-                  'LOCATION',
+                  'CREATE IN',
                   style: TextStyle(
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
@@ -9826,7 +10580,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                         const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            pickedPath.isEmpty ? 'Select folder…' : pickedPath,
+                            pickedPath.isEmpty ? 'Select location…' : pickedPath,
                             style: TextStyle(
                               fontSize: 12,
                               color: pickedPath.isEmpty
@@ -9849,6 +10603,28 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     ),
                   ),
                 ),
+                if (pickedPath.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Workspace folder: $finalPath',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Colors.white38,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 2,
+                  ),
+                ],
+                if (errorHolder[0].isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    errorHolder[0],
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Colors.redAccent,
+                    ),
+                  ),
+                ],
               ],
             ),
             actions: [
@@ -9939,6 +10715,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 _categoriesGroups.clear();
                 _allTasks.clear();
                 _projects.clear();
+                _projectOrder.clear();
+                _groupedTasks.clear();
+                _taskIndex = {};
                 _sidebarSectionOrder.clear();
                 _favoriteProjectIds.clear();
                 _projectColors.clear();
@@ -9955,7 +10734,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
             Navigator.pop(ctx);
             _showCreateWorkspaceDialog();
           },
-          onRestoreFromFile: _restoreWorkspaceFromFile,
+          onFindFolder: _findWorkspaceFolder,
         ),
       ),
     );
@@ -14552,6 +15331,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final sp = AppTheme.of(context).colors;
     final bool isCanvasMode =
         !_isSettingsView && !_isTasksView && !_isNotesView;
+    // Categories / Projects / Search / Filter tools belong only to the
+    // Canvases tab, not to the Visualizer.
+    final bool showCanvasTools = isCanvasMode && !_isVisualizerView;
     return Container(
       width: _sidebarWidth,
       color: sp.sidebarBg,
@@ -14565,6 +15347,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               child: Row(
                 children: [
                   // ── Categories sandwich button ────────────────────────────
+                  if (showCanvasTools)
                   Tooltip(
                     message: _canvasCatPanelOpen
                         ? 'Hide categories'
@@ -14592,6 +15375,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     ),
                   ),
                   // ── Projects sandwich button ──────────────────────────────
+                  if (showCanvasTools)
                   Tooltip(
                     message: _canvasProjPanelOpen
                         ? 'Hide projects'
@@ -14628,6 +15412,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   // ── Spacer ────────────────────────────────────────────────
                   const Spacer(),
                   // ── Task-list search button ───────────────────────────────
+                  if (showCanvasTools)
                   Tooltip(
                     message: _sidebarTaskSearchOpen
                         ? 'Close search'
@@ -14662,6 +15447,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     ),
                   ),
                   // ── Filter / Group / Sort button ──────────────────────────
+                  if (showCanvasTools)
                   Builder(
                     builder: (context) {
                       final totalRules =
@@ -14731,7 +15517,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
             ),
 
           // ── Task-list search bar (slides in under the topbar) ─────────────
-          if (isCanvasMode)
+          if (showCanvasTools)
             AnimatedSize(
               duration: const Duration(milliseconds: 160),
               curve: Curves.easeInOut,
@@ -14794,7 +15580,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
             ),
 
           // ── Selected-project banner ───────────────────────────────────────
-          if (isCanvasMode && _sidebarSelectedProjectId != null)
+          if (showCanvasTools && _sidebarSelectedProjectId != null)
             GestureDetector(
               onTap: () => setState(() => _sidebarSelectedProjectId = null),
               child: Container(
@@ -14859,10 +15645,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       // ── Inner category-circles sidebar ─────────────────
-                      if (isCanvasMode && _canvasCatPanelOpen)
+                      if (showCanvasTools && _canvasCatPanelOpen)
                         _buildCatCirclesSidebar(),
                       // ── Inner project-circles sidebar ──────────────────
-                      if (isCanvasMode && _canvasProjPanelOpen)
+                      if (showCanvasTools && _canvasProjPanelOpen)
                         _buildProjCirclesSidebar(),
                       // ── Main content ───────────────────────────────────
                       Expanded(
@@ -16336,12 +17122,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
             });
             break;
           case 'delete':
+            if (_interceptSeriesDelete(task)) break;
+            _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
             setState(() {
               final subIds = List<String>.from(
                 task.subTaskIds.map((s) => s.toString()),
               );
               _allTasks.removeWhere((t) => subIds.contains(t.id));
-              _clearRepeatInstances(task.id);
+              if (task.isSeriesParent) _clearRepeatInstances(task.seriesKey);
               for (final t in _allTasks) {
                 if (t.subTaskIds.any((id) => id.toString() == task.id)) {
                   t.subTaskIds.remove(task.id);
@@ -16350,7 +17138,6 @@ class _ResizableScreenState extends State<ResizableScreen> {
               }
               _allTasks.remove(task);
             });
-            _saveTaskToMeta(task);
             break;
         }
       },
@@ -17734,9 +18521,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
         _saveTaskToMeta(task);
       },
       onDelete: (task) {
+        if (_interceptSeriesDelete(task)) return;
+        _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
         // If deleting the series parent, promote the next instance first.
         if (task.isSeriesParent) {
-          _promoteNextSeriesParent(task.id, task.repeatConfig);
+          _promoteNextSeriesParent(task.seriesKey, task.repeatConfig);
         }
         setState(() {
           final subIds = task.subTaskIds.map((s) => s.toString()).toSet();
@@ -18092,7 +18881,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
                         if (alreadyExists) {
                           // Toggle off — remove this task and all its descendants
                           final toRemove = {id, ...descendants(id)};
+                          final removedTasks = _allTasks
+                              .where((x) => toRemove.contains(x.id))
+                              .toList();
                           _allTasks.removeWhere((x) => toRemove.contains(x.id));
+                          _deleteTaskFiles(removedTasks);
                           return;
                         }
 
@@ -18249,7 +19042,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       });
                     },
                     onRemoveTask: (id) {
+                      final removedTasks =
+                          _allTasks.where((x) => x.id == id).toList();
                       setState(() => _allTasks.removeWhere((x) => x.id == id));
+                      _deleteTaskFiles(removedTasks);
                     },
                     allTasks: _allTasks,
                   );
@@ -18827,7 +19623,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
   /// Update mutable display properties on all instances when the parent changes.
   void _syncRepeatInstances(Task parent) {
     final children = _allTasks
-        .where((t) => t.seriesId == parent.id && !t.isSeriesParent)
+        .where((t) => t.seriesId == parent.seriesKey && !t.isSeriesParent)
         .toList();
     if (children.isEmpty) return;
     setState(() {
@@ -18842,28 +19638,37 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
   // ── Repeat propagation ────────────────────────────────────────────────────
 
-  /// Remove every auto-generated instance belonging to [parentId].
-  void _clearRepeatInstances(String parentId) {
+  /// Remove every auto-generated instance of the series [seriesKey]
+  /// (everything except the current root).
+  void _clearRepeatInstances(String seriesKey) {
     // Remove from index first (synchronous; file deletion is handled by callers).
     _allTasks
-        .where((t) => t.seriesId == parentId && t.id != parentId)
+        .where((t) => t.seriesId == seriesKey && !t.isSeriesParent)
         .forEach((t) => _taskIndex.remove(t.id));
-    _allTasks.removeWhere((t) => t.seriesId == parentId && t.id != parentId);
+    _allTasks.removeWhere((t) => t.seriesId == seriesKey && !t.isSeriesParent);
   }
 
-  /// When the series parent is deleted, promote the next chronological
-  /// instance to become the new parent of the series.
+  /// When the series root is deleted, promote the next chronological
+  /// instance to become the new root of the series.
   ///
-  /// • Finds all remaining tasks whose [seriesId] equals [deletedParentId].
-  /// • Picks the one with the earliest [scheduledDate] (the new "first").
-  /// • Copies the repeat config from the old parent (passed in as [cfg]).
-  /// • Sets its [seriesId] = its own [id] (making it the new parent).
-  /// • Updates every other instance's [seriesId] and [repeatParentId] to
-  ///   point to the new parent.
+  /// • Finds the remaining members of series [seriesKey] (anything that is not
+  ///   the current root).
+  /// • Picks the one with the earliest [scheduledDate].
+  /// • Gives it the repeat config of the old root (passed in as [cfg]) and
+  ///   clears its [repeatParentId], which makes it the root.
+  /// • The fixed [seriesKey] is kept, so no other instance (loaded or not)
+  ///   needs to be rewritten.
   /// • Re-runs propagation so the timeline stays correct.
-  void _promoteNextSeriesParent(String deletedParentId, RepeatConfig? cfg) {
+  void _promoteNextSeriesParent(
+    String seriesKey,
+    RepeatConfig? cfg, {
+    Set<String> excluding = const {},
+  }) {
     final remaining = _allTasks
-        .where((t) => t.seriesId == deletedParentId && t.id != deletedParentId)
+        .where((t) =>
+            t.seriesId == seriesKey &&
+            !t.isSeriesParent &&
+            !excluding.contains(t.id))
         .toList()
       ..sort((a, b) {
         final da = a.scheduledDate ?? DateTime(2099);
@@ -18878,15 +19683,17 @@ class _ResizableScreenState extends State<ResizableScreen> {
     setState(() {
       // Promote: give it the series config (keep its own override if it has one).
       newParent.repeatConfig ??= cfg;
-      newParent.seriesId = newParent.id;
-      newParent.repeatParentId = null;
-
-      // Re-point every other instance to the new parent.
-      for (final t in remaining.skip(1)) {
-        t.seriesId = newParent.id;
-        t.repeatParentId = newParent.id;
+      // Carry the deleted-occurrence dates over to the new root's config.
+      if (cfg != null && !identical(newParent.repeatConfig, cfg)) {
+        for (final d in cfg.exceptionDates) {
+          if (!newParent.repeatConfig!.exceptionDates.contains(d)) {
+            newParent.repeatConfig!.exceptionDates.add(d);
+          }
+        }
       }
+      newParent.repeatParentId = null;
     });
+    _saveTaskToMeta(newParent);
 
     _propagateRepeat(newParent);
   }
@@ -18911,12 +19718,23 @@ class _ResizableScreenState extends State<ResizableScreen> {
   /// [_generateWeekInstances] creates instances for the **current Mon–Sun
   /// week** only.  Instances for other weeks are generated on demand by
   /// [_loadWeekTasks] when the user navigates the schedule.
-  Future<void> _propagateRepeat(Task parent) async {
+  Future<void> _propagateRepeat(Task parent, {String? seriesKey}) async {
+    // [seriesKey] is passed explicitly when the caller already cleared
+    // parent.seriesId (repeat removed) but the old instances must still be found.
+    final key = seriesKey ?? parent.seriesKey;
     if (parent.repeatConfig == null || parent.repeatConfig!.cleared) {
+      // Include instances that only exist in the index so their files go too.
+      await _loadSeriesIndexInstances(key);
       final toDelete = _allTasks
-          .where((t) => t.seriesId == parent.id && t.id != parent.id)
+          .where((t) => t.seriesId == key && t.id != parent.id)
           .toList();
-      setState(() => _clearRepeatInstances(parent.id));
+      setState(() {
+        _clearRepeatInstances(key);
+        // The task is no longer part of a series.
+        parent.seriesId = null;
+        parent.repeatParentId = null;
+      });
+      _saveTaskToMeta(parent);
       for (final t in toDelete) {
         try {
           final f = File(_taskMdPath(t));
@@ -18930,14 +19748,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
     // Collect non-anchor instances to remove.
     final toRemove = _allTasks
         .where((t) {
-          if (t.seriesId != parent.id || t.id == parent.id) return false;
+          if (t.seriesId != key || t.id == parent.id) return false;
           return t.repeatConfig == null || t.repeatConfig!.cleared;
         })
         .toList();
 
     setState(() {
       _allTasks.removeWhere((t) {
-        if (t.seriesId != parent.id || t.id == parent.id) return false;
+        if (t.seriesId != key || t.id == parent.id) return false;
         return t.repeatConfig == null || t.repeatConfig!.cleared;
       });
     });
@@ -18968,7 +19786,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final allSegmentAnchors = _allTasks
         .where(
           (t) =>
-              t.seriesId == parent.id &&
+              t.seriesId == key &&
               t.repeatConfig != null &&
               !t.repeatConfig!.cleared,
         )
@@ -19012,18 +19830,22 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     // Generate instances for the current week.
     await _generateWeekInstances(parent, currentWeekStart, currentWeekEnd);
+
+    // Also populate the series' upcoming occurrences (full horizon, in memory)
+    // right away. Previously this only happened after reopening the app (or
+    // re-entering the project page), so the following instances of a freshly
+    // created / edited repeating task did not show up until a restart.
+    if (mounted) await _generateProjectSeriesInstances(parent.projectId);
   }
 
   /// Delegates to full [_propagateRepeat] so all segments stay consistent.
   Future<void> _propagateRepeatFromInstance(Task instance) async {
     // Resolve the series parent via seriesId (unified field), falling back
     // to the legacy repeatParentId for tasks loaded before the migration.
-    final parentId = instance.isSeriesParent
-        ? instance.id
-        : (instance.repeatParentId ?? instance.seriesId);
-    if (parentId == null) return;
+    final key = instance.seriesId ?? instance.repeatParentId;
+    if (key == null) return;
     final parent = _allTasks.firstWhere(
-      (t) => t.id == parentId,
+      (t) => t.seriesId == key && t.isSeriesParent,
       orElse: () => instance,
     );
     _propagateRepeat(parent);
@@ -19034,11 +19856,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
   /// The instance becomes an **anchor point**: [newCfg] is stored directly on
   /// it. All non-anchor future instances are pruned, then [_propagateRepeat]
   /// regenerates every segment (past anchor segments are untouched).
-  void _applyForwardFromInstance(Task instance, RepeatConfig newCfg) {
+  Future<void> _applyForwardFromInstance(Task instance, RepeatConfig newCfg) async {
     final sid = instance.seriesId;
     if (sid == null) return;
 
     final instanceDate = instance.scheduledDate;
+    final beforePrune = List<Task>.from(_allTasks);
 
     setState(() {
       // Store config on the instance — it becomes an anchor.
@@ -19054,9 +19877,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
         return tDate.isAfter(instanceDate);
       });
     });
+    await _purgeRemovedTasks(beforePrune);
 
     final parent = _allTasks.firstWhere(
-      (t) => t.id == sid && t.isSeriesParent,
+      (t) => t.seriesId == sid && t.isSeriesParent,
       orElse: () => instance,
     );
     _propagateRepeat(parent);
@@ -19081,6 +19905,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
       DateTime.now().day,
     );
 
+    // Capture the fixed series key before seriesId may be cleared below.
+    final seriesKey = parent.seriesKey;
+
     setState(() {
       parent.repeatConfig = newCfg;
       // Keep seriesId in sync with repeatConfig state.
@@ -19091,7 +19918,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       }
       if (scope != _RepeatPropagateScope.current) {
         final series = _allTasks
-            .where((t) => t.seriesId == parent.id && !t.isSeriesParent)
+            .where((t) => t.seriesId == seriesKey && !t.isSeriesParent)
             .toList();
 
         for (final t in series) {
@@ -19119,7 +19946,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       }
     });
 
-    _propagateRepeat(parent);
+    _propagateRepeat(parent, seriesKey: seriesKey);
   }
 
   /// Sync mutable fields from [instance] to siblings according to [scope].
@@ -19186,14 +20013,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
   ///
   /// After deletion the series is re-propagated so the timeline stays
   /// consistent (except when [scope] is `all`, which wipes the whole series).
-  void _deleteScopedRepeat(Task task, _RepeatPropagateScope scope) {
+  Future<void> _deleteScopedRepeat(Task task, _RepeatPropagateScope scope) async {
     final seriesId = task.seriesId ?? task.id;
+    // Series members that exist only in the index must take part in the
+    // deletion (otherwise their files would survive and come back).
+    await _loadSeriesIndexInstances(seriesId);
     final taskDate = task.scheduledDate;
-    final today = DateTime(
-      DateTime.now().year,
-      DateTime.now().month,
-      DateTime.now().day,
-    );
+    final idsBefore = _allTasks.map((t) => t.id).toSet();
 
     // Collect IDs to remove.
     final toDelete = <String>{};
@@ -19227,7 +20053,23 @@ class _ResizableScreenState extends State<ResizableScreen> {
         break;
     }
 
-    // If the series parent is being deleted, promote the next survivor first.
+    // Remember what the user removed so the generator does not recreate it:
+    //  • current / backward → the deleted dates are excluded individually;
+    //  • forward            → the series is truncated (end date) before [taskDate].
+    if (scope == _RepeatPropagateScope.current ||
+        scope == _RepeatPropagateScope.backward) {
+      final dates = <DateTime>[];
+      for (final t in _allTasks) {
+        if (!toDelete.contains(t.id)) continue;
+        final d = t.scheduledDate;
+        if (d != null) dates.add(d);
+      }
+      _markOccurrencesAsExceptions(seriesId, dates);
+    } else if (scope == _RepeatPropagateScope.forward && taskDate != null) {
+      _truncateSeriesBefore(seriesId, taskDate);
+    }
+
+    // If the series root is being deleted, promote the next survivor first.
     final parent = _allTasks.firstWhere(
       (t) => t.seriesId == seriesId && t.isSeriesParent,
       orElse: () => task,
@@ -19235,27 +20077,257 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final parentIsDeleted = toDelete.contains(parent.id);
 
     if (parentIsDeleted && scope != _RepeatPropagateScope.all) {
-      // Find the earliest remaining task (not in toDelete) to promote.
       _promoteNextSeriesParent(
-        parent.id,
+        seriesId,
         parent.repeatConfig,
+        excluding: toDelete,
       );
     }
 
+    final beforeDelete = List<Task>.from(_allTasks);
     setState(() {
       _allTasks.removeWhere((t) => toDelete.contains(t.id));
     });
+    await _purgeRemovedTasks(beforeDelete);
 
-    // Re-propagate from the (possibly new) parent, unless the whole series was wiped.
+    // Drop the deleted tasks from canvases / selection.
+    final removedIds = idsBefore.difference(_allTasks.map((t) => t.id).toSet());
+    _forgetDeletedTasks(removedIds);
+
+    // Re-propagate from the (possibly new) root, unless the whole series was wiped.
     if (scope != _RepeatPropagateScope.all) {
-      final newParent = _allTasks.firstWhere(
-        (t) => t.seriesId == seriesId && t.isSeriesParent,
-        orElse: () => task,
-      );
-      if (_allTasks.contains(newParent)) {
-        _propagateRepeat(newParent);
+      Task? newParent;
+      for (final t in _allTasks) {
+        if (t.seriesId == seriesId && t.isSeriesParent) {
+          newParent = t;
+          break;
+        }
+      }
+      if (newParent != null) _propagateRepeat(newParent);
+    }
+  }
+
+  /// All exception dates of series [key] (union over every config holder),
+  /// sorted ascending.
+  List<DateTime> _seriesExceptionDates(String key) {
+    final set = <String>{};
+    for (final t in _allTasks) {
+      if (t.seriesId != key || t.repeatConfig == null) continue;
+      set.addAll(t.repeatConfig!.exceptionDates);
+    }
+    final out = <DateTime>[];
+    for (final iso in set) {
+      final d = DateTime.tryParse(iso);
+      if (d != null) out.add(DateTime(d.year, d.month, d.day));
+    }
+    out.sort();
+    return out;
+  }
+
+  /// Removes [date] from the exception dates of series [key] and recreates
+  /// the occurrence if the repeat rule produces one on that day. Returns false
+  /// (and keeps the exception) when no occurrence can exist on that date, e.g.
+  /// it is before the first occurrence, after the end date, or off-pattern.
+  Future<bool> _restoreExceptionDate(String key, DateTime date) async {
+    final day = DateTime(date.year, date.month, date.day);
+    final iso = day.toIso8601String().split('T').first;
+    final holders = _allTasks
+        .where((t) =>
+            t.seriesId == key &&
+            t.repeatConfig != null &&
+            t.repeatConfig!.exceptionDates.contains(iso))
+        .toList();
+    for (final t in holders) {
+      t.repeatConfig!.exceptionDates.remove(iso);
+    }
+    Task? root;
+    for (final t in _allTasks) {
+      if (t.seriesId == key && t.isSeriesParent) {
+        root = t;
+        break;
       }
     }
+    if (root != null) await _generateWeekInstances(root, day, day);
+
+    final restored = _allTasks.any((t) {
+      if (t.seriesId != key) return false;
+      final d = t.scheduledDate;
+      return d != null && DateTime(d.year, d.month, d.day) == day;
+    });
+    if (!restored) {
+      // Nothing can be generated there: keep the exception as it was.
+      for (final t in holders) {
+        if (!t.repeatConfig!.exceptionDates.contains(iso)) {
+          t.repeatConfig!.exceptionDates.add(iso);
+        }
+      }
+      return false;
+    }
+    for (final t in holders) {
+      await _saveTaskToMeta(t);
+    }
+    return true;
+  }
+
+  /// Loads the members of series [key] that exist only in [_taskIndex] into
+  /// [_allTasks].
+  Future<void> _loadSeriesIndexInstances(String key) async {
+    if (_workspaceId.isEmpty) return;
+    final filesDir = _wsFilesDir(_workspaceId);
+    final loadedIds = _allTasks.map((t) => t.id).toSet();
+    final prefix = 'repeat_${key}_';
+    final loaded = <Task>[];
+    for (final kv in _taskIndex.entries) {
+      if (!kv.key.startsWith(prefix) || loadedIds.contains(kv.key)) continue;
+      final rel = kv.value['path'] as String?;
+      if (rel == null || rel.isEmpty) continue;
+      final abs = rel.startsWith('/') ? rel : '$filesDir/$rel';
+      try {
+        final f = File(abs);
+        if (!await f.exists()) continue;
+        final t = _loadTaskFromMd(abs, await f.readAsString());
+        if (t != null) loaded.add(t);
+      } catch (e) {
+        debugPrint('_loadSeriesIndexInstances: error reading $abs: $e');
+      }
+    }
+    if (loaded.isNotEmpty && mounted) {
+      setState(() => _allTasks = [..._allTasks, ...loaded]);
+    }
+  }
+
+  /// True if the series of [root] has any other member, loaded or index-only.
+  bool _seriesHasOtherMembers(Task root) {
+    final key = root.seriesKey;
+    if (_allTasks.any((t) => t.seriesId == key && t.id != root.id)) return true;
+    final prefix = 'repeat_${key}_';
+    return _taskIndex.keys.any((k) => k.startsWith(prefix) && k != root.id);
+  }
+
+  /// Adds [dates] to the excluded dates of the series so they are not
+  /// regenerated. Stored on the series root's [RepeatConfig].
+  void _markOccurrencesAsExceptions(String key, Iterable<DateTime> dates) {
+    Task? holder;
+    for (final t in _allTasks) {
+      if (t.seriesId == key && t.isSeriesParent && t.repeatConfig != null) {
+        holder = t;
+        break;
+      }
+    }
+    holder ??= _allTasks
+        .where((t) => t.seriesId == key && t.repeatConfig != null)
+        .cast<Task?>()
+        .firstWhere((_) => true, orElse: () => null);
+    if (holder == null) return;
+    final cfg = holder.repeatConfig!;
+    var changed = false;
+    for (final d in dates) {
+      final iso = DateTime(d.year, d.month, d.day).toIso8601String().split('T').first;
+      if (!cfg.exceptionDates.contains(iso)) {
+        cfg.exceptionDates.add(iso);
+        changed = true;
+      }
+    }
+    if (changed) _saveTaskToMeta(holder);
+  }
+
+  /// Ends the segment that governs [date] on the day before it.
+  void _truncateSeriesBefore(String key, DateTime date) {
+    final day = DateTime(date.year, date.month, date.day);
+    final holders = _allTasks
+        .where((t) =>
+            t.seriesId == key &&
+            t.repeatConfig != null &&
+            !t.repeatConfig!.cleared &&
+            t.scheduledDate != null &&
+            t.scheduledDate!.isBefore(day))
+        .toList()
+      ..sort((a, b) => a.scheduledDate!.compareTo(b.scheduledDate!));
+    if (holders.isEmpty) return;
+    final holder = holders.last;
+    final cfg = holder.repeatConfig!;
+    final newEnd = day.subtract(const Duration(days: 1));
+    if (cfg.endDate == null || cfg.endDate!.isAfter(newEnd)) {
+      cfg.endDate = newEnd;
+      _saveTaskToMeta(holder);
+    }
+  }
+
+  /// Removes deleted task ids from canvases, selection and open detail panels.
+  void _forgetDeletedTasks(Set<String> ids) {
+    if (ids.isEmpty || !mounted) return;
+    setState(() {
+      _canvasTasks.removeWhere((t) => ids.contains(t.id));
+      _taskPositions.removeWhere((k, _) => ids.contains(k));
+      _taskRelations.removeWhere(
+        (r) => ids.contains(r.sourceId) || ids.contains(r.targetId),
+      );
+      if (ids.contains(_selectedCanvasTaskId)) _selectedCanvasTaskId = null;
+      _selectedTaskIds.removeAll(ids);
+      if (_taskListDetailTask != null && ids.contains(_taskListDetailTask!.id)) {
+        _taskListDetailOpen = false;
+        _taskListDetailTask = null;
+        _taskDetailExpanded.clear();
+      }
+    });
+  }
+
+  /// Called before a task is deleted.
+  ///  • not in a series → returns false (caller deletes normally);
+  ///  • series instance → its date is recorded as excluded and false is
+  ///    returned (caller deletes normally);
+  ///  • series root with other members → asks what to delete and returns true
+  ///    (the caller must stop; the deletion is handled here).
+  bool _interceptSeriesDelete(Task task) {
+    if (!task.isPartOfSeries) return false;
+    if (!task.isSeriesParent) {
+      final d = task.scheduledDate;
+      if (d != null) _markOccurrencesAsExceptions(task.seriesKey, [d]);
+      return false;
+    }
+    if (!_seriesHasOtherMembers(task)) return false;
+    _confirmDeleteSeriesRoot(task);
+    return true;
+  }
+
+  Future<void> _confirmDeleteSeriesRoot(Task task) async {
+    final choice = await showDialog<_RepeatPropagateScope>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF252525),
+        title: const Text(
+          'Delete repeating task',
+          style: TextStyle(color: Colors.white, fontSize: 16),
+        ),
+        content: Text(
+          '"${task.title}" is the first task of a repeating series. '
+          'What do you want to delete?',
+          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, _RepeatPropagateScope.current),
+            child: const Text(
+              'Only this occurrence',
+              style: TextStyle(color: Colors.blueAccent),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, _RepeatPropagateScope.all),
+            child: const Text(
+              'Entire series',
+              style: TextStyle(color: Colors.redAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _deleteScopedRepeat(task, choice);
   }
   /// Returns null if no next date is determinable.
   DateTime? _nextRepeatDate(RepeatConfig cfg, DateTime from) {
@@ -20251,6 +21323,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     isCollapsed: isCollapsed,
                     showDragHandle: true,
                     dragHandleIndex: listIdx,
+                    folderColor: _projectFolderColors[folderName],
+                    onSecondaryTapDown: (d) =>
+                        _showProjectFolderColorMenu(folderName, d),
                     onToggle: () {
                       setState(() {
                         if (isCollapsed)
@@ -20329,6 +21404,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 itemCount: effectiveProjOrder.length,
                 itemBuilder: (ctx, i) {
                   final key = effectiveProjOrder[i];
+                  if (_hiddenProjectFolders.contains(key)) {
+                    return SizedBox.shrink(
+                      key: ValueKey('proj_reorder_$key'),
+                    );
+                  }
                   final child = key == standardKey
                       ? buildStandardProjFolder(i)
                       : buildNamedProjFolder(key, i);
@@ -20516,6 +21596,16 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     isCollapsed: collapsed,
                     isStandard: isStandard,
                     dot: dot,
+                    folderColor: (isStandard || dot != null)
+                        ? null
+                        : _tagFolderColors[folderKey],
+                    onSecondaryTapDown: (isStandard || dot != null)
+                        ? null
+                        : (d) => _showProjectFolderColorMenu(
+                            folderKey,
+                            d,
+                            tags: true,
+                          ),
                     showDragHandle: true,
                     dragHandleIndex: listIdx,
                     onToggle: () => setState(() {
@@ -20582,6 +21672,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   () {
                     final boardName = b['title'] as String? ?? '';
                     if (boardName.isEmpty) return const SizedBox.shrink();
+                    if (_hiddenTagFolders.contains(boardName)) {
+                      return const SizedBox.shrink();
+                    }
                     final boardTags = _tagFolders[boardName] ?? {};
                     if (boardTags.isEmpty) return const SizedBox.shrink();
                     return tagFolderWidget(
@@ -20612,6 +21705,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   itemCount: effectiveTagOrder.length,
                   itemBuilder: (ctx, i) {
                     final key = effectiveTagOrder[i];
+                    if (_hiddenTagFolders.contains(key)) {
+                      return SizedBox.shrink(
+                        key: ValueKey('tag_reorder_$key'),
+                      );
+                    }
                     final child = key == unfolderedKey
                         ? tagFolderWidget(
                             folderKey: unfolderedKey,
@@ -20734,8 +21832,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                         _openNoteTabs.add(noteId);
                     }),
                     onDelete: (task) {
+                      if (_interceptSeriesDelete(task)) return;
+                      _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
                       if (task.isSeriesParent) {
-                        _promoteNextSeriesParent(task.id, task.repeatConfig);
+                        _promoteNextSeriesParent(task.seriesKey, task.repeatConfig);
                       }
                       setState(() {
                         final subIds =
@@ -20898,8 +21998,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       _openNoteTabs.add(noteId);
                   }),
                   onDelete: (task) {
+                    if (_interceptSeriesDelete(task)) return;
+                    _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
                     if (task.isSeriesParent) {
-                      _promoteNextSeriesParent(task.id, task.repeatConfig);
+                      _promoteNextSeriesParent(task.seriesKey, task.repeatConfig);
                     }
                     setState(() {
                       final subIds =
@@ -21571,6 +22673,77 @@ class _ResizableScreenState extends State<ResizableScreen> {
         ),
       );
 
+  /// Right-click menu on a project folder (Tasks tab): change / reset colour.
+  Future<void> _showProjectFolderColorMenu(
+    String folderName,
+    TapDownDetails details, {
+    bool tags = false,
+  }) async {
+    final screenSize = MediaQuery.of(context).size;
+    final colors = tags ? _tagFolderColors : _projectFolderColors;
+    final hasColor = colors.containsKey(folderName);
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        details.globalPosition.dx,
+        details.globalPosition.dy,
+        screenSize.width - details.globalPosition.dx,
+        screenSize.height - details.globalPosition.dy,
+      ),
+      color: const Color(0xFF1E2124),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(color: Colors.white.withOpacity(0.08)),
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'color',
+          height: 38,
+          child: _projectMenuRow(
+            Icons.palette_outlined,
+            'Folder color',
+            const Color(0xFF9E9E9E),
+          ),
+        ),
+        if (hasColor)
+          PopupMenuItem<String>(
+            value: 'reset',
+            height: 38,
+            child: _projectMenuRow(
+              Icons.restart_alt_rounded,
+              'Reset color',
+              const Color(0xFF9E9E9E),
+            ),
+          ),
+      ],
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'color') {
+      _showProjectFolderColorPicker(folderName, tags: tags);
+    } else if (choice == 'reset') {
+      setState(() => colors.remove(folderName));
+      unawaited(_saveWorkspace());
+    }
+  }
+
+  void _showProjectFolderColorPicker(String folderName, {bool tags = false}) {
+    final colors = tags ? _tagFolderColors : _projectFolderColors;
+    _showUnifiedColorPicker(
+      title: 'Folder Color',
+      initialColor: colors[folderName] ?? const Color(0xFFEBCB8B),
+      showRecentColors: true,
+      colorContext: tags ? 'tagFolderColor' : 'projectFolderColor',
+      onApply: (color) {
+        setState(() => colors[folderName] = color);
+        unawaited(_saveWorkspace());
+      },
+      onReset: () {
+        setState(() => colors.remove(folderName));
+        unawaited(_saveWorkspace());
+      },
+    );
+  }
+
   // ── Spec §3+4: shared folder widget — identical styling for Projects & Tags ─
   //
   // Parameters
@@ -21595,10 +22768,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
     // folder can be grabbed for ReorderableListView reordering.
     bool showDragHandle = false,
     int dragHandleIndex = 0,
+    // Custom folder colour (null = default yellow) + right-click handler.
+    Color? folderColor,
+    void Function(TapDownDetails)? onSecondaryTapDown,
   }) {
     // ── Colour tokens ──────────────────────────────────────────────────────
     const accent = Color(0xFF4FC3F7);
-    const folderYellow = Color(0xFFEBCB8B);
+    final folderYellow = folderColor ?? const Color(0xFFEBCB8B);
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 120),
@@ -21616,6 +22792,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           // ── Header row ────────────────────────────────────────────────
           InkWell(
             onTap: onToggle,
+            onSecondaryTapDown: onSecondaryTapDown,
             hoverColor: Colors.white.withOpacity(0.04),
             borderRadius: BorderRadius.circular(5),
             child: Padding(
@@ -21845,6 +23022,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
       projects: _projects,
       projectOrder: _projectOrder,
       projectFolders: _projectFolders,
+      projectFolderOrder: _projectFolderOrder,
+      tagFolderOrder: _tagFolderOrder,
+      tagOrder: _tagOrder,
+      hiddenFolders: isProjects ? _hiddenProjectFolders : _hiddenTagFolders,
+      projectFolderColors: _projectFolderColors,
+      tagFolderColors: _tagFolderColors,
       tagFolders: _tagFolders,
       hiddenTags: _hiddenTags,
       projectHiddenFromMenu: _projectHiddenFromMenu,
@@ -21854,6 +23037,23 @@ class _ResizableScreenState extends State<ResizableScreen> {
       onChanged: () {
         setState(() {});
         _saveWorkspace();
+      },
+      onFolderChanged: (isProjects, oldKey, newKey) {
+        final order = isProjects ? _projectFolderOrder : _tagFolderOrder;
+        final idx = order.indexOf(oldKey);
+        if (idx >= 0) {
+          if (newKey != null) {
+            order[idx] = newKey;
+          } else {
+            order.removeAt(idx);
+          }
+        }
+        final hf = isProjects ? _hiddenProjectFolders : _hiddenTagFolders;
+        if (hf.remove(oldKey) && newKey != null) hf.add(newKey);
+        final fc = isProjects ? _projectFolderColors : _tagFolderColors;
+        final c = fc.remove(oldKey);
+        if (c != null && newKey != null) fc[newKey] = c;
+        // _saveWorkspace is triggered by the view's onChanged right after.
       },
       onProjectCreated: (id, color) {
         setState(() => _projectColors[id] = color);
@@ -22982,7 +24182,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       size: 13,
                       color: isStandard
                           ? Colors.white24
-                          : folderYellow.withOpacity(0.7),
+                          : (_projectFolderColors[folderKey] ?? folderYellow)
+                                .withOpacity(0.7),
                     ),
                     const SizedBox(width: 7),
                     // Folder name / inline rename field
@@ -23006,6 +24207,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                   final items =
                                       _projectFolders.remove(folderKey) ?? {};
                                   _projectFolders[n] = items;
+                                  final fc = _projectFolderColors.remove(
+                                    folderKey,
+                                  );
+                                  if (fc != null) _projectFolderColors[n] = fc;
                                   final idx = _projectFolderOrder.indexOf(
                                     folderKey,
                                   );
@@ -23087,6 +24292,23 @@ class _ResizableScreenState extends State<ResizableScreen> {
                           ),
                         ),
                       ),
+                      // Folder colour
+                      Tooltip(
+                        message: 'Folder color',
+                        child: InkWell(
+                          onTap: () => _showProjectFolderColorPicker(folderKey),
+                          borderRadius: BorderRadius.circular(4),
+                          child: Padding(
+                            padding: const EdgeInsets.all(4),
+                            child: Icon(
+                              Icons.palette_outlined,
+                              size: 12,
+                              color: _projectFolderColors[folderKey] ??
+                                  Colors.white24,
+                            ),
+                          ),
+                        ),
+                      ),
                       // Rename
                       Tooltip(
                         message: 'Rename folder',
@@ -23114,6 +24336,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                         child: InkWell(
                           onTap: () {
                             _projectFolders.remove(folderKey);
+                            _projectFolderColors.remove(folderKey);
                             _projectFolderOrder.remove(folderKey);
                             _notesOrgTasksCollapsed.remove(folderKey);
                             _saveWorkspace();
@@ -29031,7 +30254,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     // Repeat instances: future occurrences belonging to this parent, sorted by date
     final repeatInstances =
-        _allTasks.where((t) => t.seriesId == task.id && !t.isSeriesParent).toList()
+        _allTasks.where((t) => task.isSeriesParent && t.seriesId == task.seriesId && !t.isSeriesParent).toList()
           ..sort((a, b) {
             final da = DateTime.tryParse(a.dueDay ?? '') ?? DateTime(9999);
             final db = DateTime.tryParse(b.dueDay ?? '') ?? DateTime(9999);
@@ -29166,9 +30389,76 @@ class _ResizableScreenState extends State<ResizableScreen> {
           onShowRepeatTimeline: isRecurringTask
               ? () => showDialog(
                   context: context,
-                  builder: (_) => _RecurringTimelineModal(
+                  builder: (_) => StatefulBuilder(
+                   builder: (dlgCtx, setModal) => _RecurringTimelineModal(
                     chain: _buildRepeatChain(),
+                    unloaded: task.seriesId == null
+                        ? const []
+                        : _unloadedRepeatInstances(task.seriesId!),
+                    exceptions: task.seriesId == null
+                        ? const []
+                        : _seriesExceptionDates(task.seriesId!),
+                    onRestoreException: (date) async {
+                      final ok =
+                          await _restoreExceptionDate(task.seriesKey, date);
+                      if (!dlgCtx.mounted) return;
+                      setModal(() {});
+                      if (!ok) {
+                        await showDialog<void>(
+                          context: dlgCtx,
+                          builder: (c) => AlertDialog(
+                            backgroundColor: const Color(0xFF252525),
+                            title: const Text(
+                              'Cannot restore',
+                              style: TextStyle(color: Colors.white, fontSize: 15),
+                            ),
+                            content: const Text(
+                              'The repeat rule has no occurrence on that date '
+                              '(it is before the first occurrence, after the '
+                              'end date, or off the repeat pattern).',
+                              style: TextStyle(
+                                  color: Colors.white70, fontSize: 13),
+                            ),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(c),
+                                child: const Text('OK'),
+                              ),
+                            ],
+                          ),
+                        );
+                      }
+                    },
+                    onSkipOccurrence: (instance) async {
+                      await _deleteScopedRepeat(
+                        instance,
+                        _RepeatPropagateScope.current,
+                      );
+                      if (!dlgCtx.mounted) return;
+                      if (_buildRepeatChain().isEmpty) {
+                        Navigator.of(dlgCtx).pop();
+                      } else {
+                        setModal(() {});
+                      }
+                    },
                     focusedTaskId: task.id,
+                    onGenerateMore: ({int? count, DateTime? until}) async {
+                      final msg = await _generateMoreRepeatInstances(
+                        task,
+                        count: count,
+                        until: until,
+                      );
+                      if (dlgCtx.mounted) setModal(() {});
+                      return msg;
+                    },
+                    onStatusSelect: (instance, status) {
+                      setState(() {
+                        instance.status = status;
+                        instance.isDone = status == TaskStatus.done;
+                      });
+                      _saveTaskToMeta(instance);
+                      setModal(() {});
+                    },
                     onEditInstance: (instance) => setState(() {
                       _taskDetailExpanded.clear();
                       _taskListDetailTask = instance;
@@ -29181,7 +30471,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       final sid = task.seriesId;
                       final parent = (sid != null)
                           ? _allTasks.firstWhere(
-                              (t) => t.id == sid,
+                              (t) => t.seriesId == sid && t.isSeriesParent,
                               orElse: () => task,
                             )
                           : task;
@@ -29192,6 +30482,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                         _taskDetailExpanded[parent.id] = true;
                       });
                     },
+                   ),
                   ),
                 )
               : null,
@@ -30087,6 +31378,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         break;
 
       case 'delete':
+        if (_interceptSeriesDelete(task)) break;
+        _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
         setState(() {
           // Delete all subtasks of this task first
           final subIds = List<String>.from(
@@ -30094,7 +31387,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           );
           _allTasks.removeWhere((t) => subIds.contains(t.id));
           // Cascade-delete repeat instances if this is a repeat parent
-          _clearRepeatInstances(task.id);
+          if (task.isSeriesParent) _clearRepeatInstances(task.seriesKey);
           // Remove this task from any parent's subTaskIds
           for (final t in _allTasks) {
             if (t.subTaskIds.any((id) => id.toString() == task.id)) {
@@ -30138,7 +31431,6 @@ class _ResizableScreenState extends State<ResizableScreen> {
             }
           }
         });
-        _saveTaskToMeta(task);
         break;
 
       case 'convert_to_parent':
@@ -35797,6 +37089,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       if (confirmed != true || !mounted) return;
       // Capture the project directory path *before* removing from _projects.
       final projectDirPath = _projectDir(projectId);
+      final beforeProjectDelete = List<Task>.from(_allTasks);
       setState(() {
         _allTasks.removeWhere((t) => t.projectId == projectId);
         _projects.remove(projectId);
@@ -35810,7 +37103,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           cat.remove(projectId);
         }
       });
-      _saveWorkspace();
+      await _purgeRemovedTasks(beforeProjectDelete);
       // Delete the project folder from disk (skip if it resolved to inbox).
       if (projectDirPath != _inboxDir) {
         try {
@@ -39544,8 +40837,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
         if (!_openNoteTabs.contains(noteId)) _openNoteTabs.add(noteId);
       }),
       onDelete: (task) {
+        if (_interceptSeriesDelete(task)) return;
+        _purgeRemovedTasksAfterHandler(List<Task>.from(_allTasks));
         if (task.isSeriesParent) {
-          _promoteNextSeriesParent(task.id, task.repeatConfig);
+          _promoteNextSeriesParent(task.seriesKey, task.repeatConfig);
         }
         setState(() {
           final subIds = task.subTaskIds.map((s) => s.toString()).toSet();
@@ -43743,6 +45038,768 @@ class _WorklogViewState extends State<_WorklogView> {
       ),
     ],
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schedule day export (PDF / PNG)
+//
+// Dependency-free: the day is laid out as an agenda with dart:ui paragraphs
+// (so every title wraps fully — nothing is ever truncated), rasterised, and
+// for PDF the page images are wrapped in a minimal hand-written PDF file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _DayExportItem {
+  final String id;
+  final String title;
+  final String? project;
+  final TaskStatus status;
+  final bool done;
+  final Color color;
+  final DateTime? start; // null => all-day
+  final int durationMinutes;
+  const _DayExportItem({
+    required this.id,
+    required this.title,
+    required this.project,
+    required this.status,
+    required this.done,
+    required this.color,
+    required this.start,
+    required this.durationMinutes,
+  });
+}
+
+class _ExBlock {
+  final double h;
+  final bool keepWithNext;
+  final void Function(ui.Canvas c, double y) paint;
+  const _ExBlock(this.h, this.paint, {this.keepWithNext = false});
+}
+
+class _ScheduleDayExporter {
+  static const double pageW = 900;
+  static const double _m = 44;
+  static const double _footerH = 44;
+  static const double _timeColW = 112;
+  static const Color _ink = Color(0xFF1B1B1F);
+  static const Color _muted = Color(0xFF6E7076);
+  static const Color _line = Color(0xFFE2E3E6);
+
+  static const _weekdays = [
+    'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+    'Friday', 'Saturday', 'Sunday',
+  ];
+  static const _months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+
+  // ── text helpers ───────────────────────────────────────────────────────────
+  static ui.Paragraph _para(
+    String text, {
+    required double width,
+    double size = 14,
+    FontWeight weight = FontWeight.w400,
+    Color color = _ink,
+    double letterSpacing = 0,
+    bool strike = false,
+    String? fontFamily,
+  }) {
+    final b = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textDirection: ui.TextDirection.ltr,
+        fontSize: size,
+        fontWeight: weight,
+      ),
+    )
+      ..pushStyle(
+        ui.TextStyle(
+          color: color,
+          fontSize: size,
+          fontWeight: weight,
+          letterSpacing: letterSpacing,
+          fontFamily: fontFamily,
+          decoration: strike ? TextDecoration.lineThrough : TextDecoration.none,
+          decorationColor: color,
+        ),
+      )
+      ..addText(text);
+    return b.build()..layout(ui.ParagraphConstraints(width: width));
+  }
+
+  static ui.Paragraph _iconPara(IconData ic, double size, Color color) {
+    final family = ic.fontPackage == null
+        ? ic.fontFamily
+        : 'packages/${ic.fontPackage}/${ic.fontFamily}';
+    return _para(
+      String.fromCharCode(ic.codePoint),
+      width: size * 2,
+      size: size,
+      color: color,
+      fontFamily: family,
+    );
+  }
+
+  static String _t12(DateTime d) {
+    final p = d.hour < 12 ? 'AM' : 'PM';
+    final hh = d.hour == 0 ? 12 : (d.hour > 12 ? d.hour - 12 : d.hour);
+    return '$hh:${d.minute.toString().padLeft(2, '0')} $p';
+  }
+
+  static String _dur(int m) {
+    if (m < 60) return '$m min';
+    final h = m ~/ 60, r = m % 60;
+    return r == 0 ? '${h}h' : '${h}h ${r}m';
+  }
+
+  static Color _darken(Color c) =>
+      HSLColor.fromColor(c).withLightness(0.28).toColor();
+
+  // ── blocks ─────────────────────────────────────────────────────────────────
+  static _ExBlock _section(String text) {
+    final p = _para(
+      text,
+      width: 400,
+      size: 11,
+      weight: FontWeight.w700,
+      color: _muted,
+      letterSpacing: 1.4,
+    );
+    return _ExBlock(p.height + 18, (c, y) {
+      c.drawParagraph(p, Offset(_m, y + 4));
+      final ly = y + 4 + p.height / 2;
+      c.drawLine(
+        Offset(_m + p.longestLine + 12, ly),
+        Offset(pageW - _m, ly),
+        Paint()
+          ..color = _line
+          ..strokeWidth = 1,
+      );
+    }, keepWithNext: true);
+  }
+
+  static _ExBlock _row(_DayExportItem it, {required bool timed}) {
+    const bar = 6.0, padL = 16.0, padR = 16.0, padV = 12.0, radius = 10.0;
+    final cardX = _m + (timed ? _timeColW + 14 : 0);
+    final cardW = pageW - _m - cardX;
+    final innerW = cardW - bar - padL - padR;
+    final color = it.color;
+
+    final hasProject = it.project != null && it.project!.trim().isNotEmpty;
+    final projP = hasProject
+        ? _para(
+            it.project!,
+            width: innerW,
+            size: 11.5,
+            weight: FontWeight.w700,
+            color: _darken(color),
+            letterSpacing: 0.3,
+          )
+        : null;
+    final titleP = _para(
+      it.title.trim().isEmpty ? '(untitled)' : it.title,
+      width: innerW,
+      size: 16,
+      weight: FontWeight.w600,
+      color: it.done ? _muted : _ink,
+      strike: it.done,
+    );
+    final statusLabel = it.status == TaskStatus.none
+        ? (it.done ? 'Done' : null)
+        : it.status.label;
+    final stP = statusLabel == null
+        ? null
+        : _para(statusLabel, width: innerW - 22, size: 12, color: _muted);
+    final stIcon = statusLabel == null
+        ? null
+        : _iconPara(it.status.icon, 14, color);
+
+    final contentH =
+        (projP != null ? projP.height + 2 : 0) +
+        titleP.height +
+        (stP != null ? 6 + stP.height : 0);
+    final cardH = math.max(contentH + padV * 2, 54.0);
+
+    // time column (timed rows only)
+    final DateTime? s0 = timed ? it.start : null;
+    final DateTime? e0 = s0?.add(Duration(minutes: it.durationMinutes));
+    final bool sameDay =
+        s0 != null &&
+        e0 != null &&
+        e0.year == s0.year &&
+        e0.month == s0.month &&
+        e0.day == s0.day;
+    final ui.Paragraph? startP = s0 == null
+        ? null
+        : _para(_t12(s0), width: _timeColW, size: 15, weight: FontWeight.w700);
+    final ui.Paragraph? endP = e0 == null
+        ? null
+        : _para(
+            'to ${_t12(e0)}${sameDay ? '' : ' (+1d)'}',
+            width: _timeColW,
+            size: 12,
+            color: _muted,
+          );
+    final ui.Paragraph? durP = s0 == null
+        ? null
+        : _para(
+            _dur(it.durationMinutes),
+            width: _timeColW,
+            size: 11.5,
+            color: _muted,
+          );
+    final double timeH = (startP == null || endP == null || durP == null)
+        ? 0.0
+        : startP.height + 2 + endP.height + 2 + durP.height;
+    final rowH = math.max(cardH, timeH);
+
+    return _ExBlock(rowH + 12, (c, y) {
+      if (startP != null && endP != null && durP != null) {
+        double ty = y + 2;
+        c.drawParagraph(startP, Offset(_m, ty));
+        ty += startP.height + 2;
+        c.drawParagraph(endP, Offset(_m, ty));
+        ty += endP.height + 2;
+        c.drawParagraph(durP, Offset(_m, ty));
+      }
+      final rect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(cardX, y, cardW, cardH),
+        const Radius.circular(radius),
+      );
+      c.drawRRect(
+        rect,
+        Paint()..color = Color.alphaBlend(color.withOpacity(0.10), Colors.white),
+      );
+      c.save();
+      c.clipRRect(rect);
+      c.drawRect(
+        Rect.fromLTWH(cardX, y, bar, cardH),
+        Paint()..color = color,
+      );
+      c.restore();
+      c.drawRRect(
+        rect,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2
+          ..color = color.withOpacity(0.45),
+      );
+
+      final x = cardX + bar + padL;
+      double yy = y + (cardH - contentH) / 2;
+      if (projP != null) {
+        c.drawParagraph(projP, Offset(x, yy));
+        yy += projP.height + 2;
+      }
+      c.drawParagraph(titleP, Offset(x, yy));
+      yy += titleP.height;
+      if (stP != null && stIcon != null) {
+        yy += 6;
+        c.drawParagraph(stIcon, Offset(x, yy + (stP.height - 14) / 2 - 1));
+        c.drawParagraph(stP, Offset(x + 22, yy));
+      }
+    });
+  }
+
+  static List<_ExBlock> _buildBlocks(DateTime day, List<_DayExportItem> items) {
+    const cw = pageW - 2 * _m;
+    final blocks = <_ExBlock>[];
+
+    int byTitle(_DayExportItem a, _DayExportItem b) =>
+        a.title.toLowerCase().compareTo(b.title.toLowerCase());
+    final allDay = items.where((i) => i.start == null).toList()..sort(byTitle);
+    final timed = items.where((i) => i.start != null).toList()
+      ..sort((a, b) {
+        final c = a.start!.compareTo(b.start!);
+        return c != 0 ? c : byTitle(a, b);
+      });
+
+    // header
+    final brand = _para(
+      'CHAOS CONTROL  ·  SCHEDULE',
+      width: cw,
+      size: 11,
+      weight: FontWeight.w700,
+      color: const Color(0xFF3A8DB5),
+      letterSpacing: 1.4,
+    );
+    final wd = _para(
+      _weekdays[day.weekday - 1],
+      width: cw,
+      size: 34,
+      weight: FontWeight.w800,
+    );
+    final dt = _para(
+      '${_months[day.month - 1]} ${day.day}, ${day.year}',
+      width: cw,
+      size: 17,
+      weight: FontWeight.w500,
+      color: _muted,
+    );
+    final totalMin = timed.fold<int>(0, (s, i) => s + i.durationMinutes);
+    final doneCount = items.where((i) => i.done).length;
+    final parts = <String>[
+      '${items.length} ${items.length == 1 ? 'task' : 'tasks'}',
+      if (allDay.isNotEmpty) '${allDay.length} all-day',
+      if (timed.isNotEmpty) '${_dur(totalMin)} scheduled',
+      if (items.isNotEmpty) '$doneCount done',
+    ];
+    final summary = _para(parts.join('   ·   '), width: cw, size: 13.5, color: _muted);
+    final headH =
+        brand.height + 10 + wd.height + 2 + dt.height + 12 + summary.height + 18 + 1.5 + 22;
+    blocks.add(
+      _ExBlock(headH, (c, y) {
+        double yy = y;
+        c.drawParagraph(brand, Offset(_m, yy));
+        yy += brand.height + 10;
+        c.drawParagraph(wd, Offset(_m, yy));
+        yy += wd.height + 2;
+        c.drawParagraph(dt, Offset(_m, yy));
+        yy += dt.height + 12;
+        c.drawParagraph(summary, Offset(_m, yy));
+        yy += summary.height + 18;
+        c.drawLine(
+          Offset(_m, yy),
+          Offset(pageW - _m, yy),
+          Paint()
+            ..color = _line
+            ..strokeWidth = 1.5,
+        );
+      }),
+    );
+
+    if (items.isEmpty) {
+      final p = _para(
+        'Nothing scheduled for this day.',
+        width: cw,
+        size: 15,
+        color: _muted,
+      );
+      blocks.add(_ExBlock(70, (c, y) => c.drawParagraph(p, Offset(_m, y + 20))));
+      return blocks;
+    }
+
+    if (allDay.isNotEmpty) {
+      blocks.add(_section('ALL DAY'));
+      for (final it in allDay) {
+        blocks.add(_row(it, timed: false));
+      }
+    }
+    if (timed.isNotEmpty) {
+      blocks.add(_section('SCHEDULED'));
+      for (final it in timed) {
+        blocks.add(_row(it, timed: true));
+      }
+    }
+    return blocks;
+  }
+
+  // ── render ─────────────────────────────────────────────────────────────────
+  /// Renders the day to one tall image (used for PNG export).
+  static Future<List<ui.Image>> render(
+    DateTime day,
+    List<_DayExportItem> items, {
+    double pixelRatio = 2.0,
+  }) async {
+    final blocks = _buildBlocks(day, items);
+    final pages = <List<_ExBlock>>[blocks];
+    final totalH =
+        _m + blocks.fold<double>(0, (s, b) => s + b.h) + _footerH + 6;
+    var pr = pixelRatio;
+    if (totalH * pr > 16000) pr = 16000 / totalH; // GPU texture limit
+
+    final now = AppClock.now();
+    final stamp =
+        'Exported ${_months[now.month - 1].substring(0, 3)} ${now.day}, '
+        '${now.year}  ${_t12(now)}';
+
+    final images = <ui.Image>[];
+    for (int pi = 0; pi < pages.length; pi++) {
+      final rec = ui.PictureRecorder();
+      final c = ui.Canvas(rec);
+      c.scale(pr);
+      c.drawRect(
+        Rect.fromLTWH(0, 0, pageW, totalH),
+        Paint()..color = Colors.white,
+      );
+      double y = _m;
+      for (final b in pages[pi]) {
+        b.paint(c, y);
+        y += b.h;
+      }
+      // footer
+      final fy = totalH - _footerH + 8;
+      c.drawLine(
+        Offset(_m, fy - 6),
+        Offset(pageW - _m, fy - 6),
+        Paint()
+          ..color = _line
+          ..strokeWidth = 1,
+      );
+      c.drawParagraph(
+        _para(stamp, width: 500, size: 10.5, color: _muted),
+        Offset(_m, fy),
+      );
+      if (pages.length > 1) {
+        final pg = _para(
+          'Page ${pi + 1} / ${pages.length}',
+          width: 200,
+          size: 10.5,
+          color: _muted,
+        );
+        c.drawParagraph(pg, Offset(pageW - _m - 200 + (200 - pg.longestLine), fy));
+      }
+      images.add(
+        await rec.endRecording().toImage(
+          (pageW * pr).round(),
+          (totalH * pr).round(),
+        ),
+      );
+    }
+    return images;
+  }
+
+  static Future<Uint8List> toPng(ui.Image img) async {
+    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+    return bd!.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+  }
+
+  // ── vector PDF (real, selectable text) via package:pdf ─────────────────────
+  // Tries a system TrueType family so accents/Unicode work; falls back to the
+  // built-in Helvetica (Latin-1 only) if none is found.
+  static const List<List<String>> _fontPairs = [
+    ['/usr/share/fonts/TTF/DejaVuSans.ttf', '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf'],
+    ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'],
+    ['/usr/share/fonts/dejavu/DejaVuSans.ttf', '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf'],
+    ['/usr/share/fonts/noto/NotoSans-Regular.ttf', '/usr/share/fonts/noto/NotoSans-Bold.ttf'],
+    ['/usr/share/fonts/TTF/LiberationSans-Regular.ttf', '/usr/share/fonts/TTF/LiberationSans-Bold.ttf'],
+    ['/usr/share/fonts/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/liberation/LiberationSans-Bold.ttf'],
+    ['C:\\Windows\\Fonts\\segoeui.ttf', 'C:\\Windows\\Fonts\\segoeuib.ttf'],
+    ['C:\\Windows\\Fonts\\arial.ttf', 'C:\\Windows\\Fonts\\arialbd.ttf'],
+    ['/System/Library/Fonts/Supplemental/Arial.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf'],
+    ['/Library/Fonts/Arial.ttf', '/Library/Fonts/Arial Bold.ttf'],
+  ];
+
+  static Future<List<pw.Font>?> _loadFontPair() async {
+    for (final pair in _fontPairs) {
+      try {
+        final fr = File(pair[0]);
+        final fb = File(pair[1]);
+        if (!await fr.exists() || !await fb.exists()) continue;
+        final r = await fr.readAsBytes();
+        final b = await fb.readAsBytes();
+        return [
+          pw.Font.ttf(ByteData.view(r.buffer, r.offsetInBytes, r.lengthInBytes)),
+          pw.Font.ttf(ByteData.view(b.buffer, b.offsetInBytes, b.lengthInBytes)),
+        ];
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  static pdfc.PdfColor _pc(Color c) =>
+      pdfc.PdfColor(c.red / 255, c.green / 255, c.blue / 255);
+
+  static Future<Uint8List> buildVectorPdf(
+    DateTime day,
+    List<_DayExportItem> items, {
+    bool fillable = false,
+  }) async {
+    final fonts = await _loadFontPair();
+    final regular = fonts != null ? fonts[0] : pw.Font.helvetica();
+    final bold = fonts != null ? fonts[1] : pw.Font.helveticaBold();
+
+    final ink = _pc(_ink);
+    final muted = _pc(_muted);
+    final line = _pc(_line);
+
+    int byTitle(_DayExportItem a, _DayExportItem b) =>
+        a.title.toLowerCase().compareTo(b.title.toLowerCase());
+    final allDay = items.where((i) => i.start == null).toList()..sort(byTitle);
+    final timed = items.where((i) => i.start != null).toList()
+      ..sort((a, b) {
+        final c = a.start!.compareTo(b.start!);
+        return c != 0 ? c : byTitle(a, b);
+      });
+
+    pw.TextStyle ts(
+      double size, {
+      bool isBold = false,
+      pdfc.PdfColor? color,
+      bool strike = false,
+      double? spacing,
+    }) => pw.TextStyle(
+      font: isBold ? bold : regular,
+      fontSize: size,
+      color: color ?? ink,
+      letterSpacing: spacing,
+      decoration: strike ? pw.TextDecoration.lineThrough : pw.TextDecoration.none,
+    );
+
+    // Form fields use the built-in Helvetica: viewers render typed text with
+    // it directly (an embedded TTF subset would miss characters typed later).
+    final fieldFont = pw.Font.helvetica();
+    final fieldStyle = pw.TextStyle(font: fieldFont, fontSize: 10, color: ink);
+    final fieldBorder = pw.Border.all(
+      color: _pc(const Color(0xFF9AA0A6)),
+      width: 0.6,
+    );
+
+    pw.Widget tf(
+      String name, {
+      double? w,
+      double h = 16,
+      bool multiline = false,
+      int? maxLen,
+    }) => pw.TextField(
+      name: name,
+      width: w ?? 100,
+      height: h,
+      textStyle: fieldStyle,
+      maxLength: maxLen,
+      fieldFlags: multiline ? {pdfc.PdfFieldFlags.multiline} : null,
+      child: pw.Container(
+        width: w,
+        height: h,
+        decoration: pw.BoxDecoration(
+          color: pdfc.PdfColors.white,
+          border: fieldBorder,
+        ),
+      ),
+    );
+
+    List<pw.Widget> fillBlock(_DayExportItem it, bool isTimed) => [
+      pw.SizedBox(height: 8),
+      pw.Row(
+        crossAxisAlignment: pw.CrossAxisAlignment.center,
+        children: [
+          pw.Checkbox(
+            name: 'done_${it.id}',
+            value: it.done,
+            width: 12,
+            height: 12,
+          ),
+          pw.SizedBox(width: 4),
+          pw.Text('Done', style: ts(9, color: muted)),
+          if (isTimed) ...[
+            pw.SizedBox(width: 16),
+            pw.Text('Actual', style: ts(9, color: muted)),
+            pw.SizedBox(width: 5),
+            tf('start_${it.id}', w: 52, maxLen: 8),
+            pw.Padding(
+              padding: const pw.EdgeInsets.symmetric(horizontal: 4),
+              child: pw.Text('-', style: ts(9, color: muted)),
+            ),
+            tf('end_${it.id}', w: 52, maxLen: 8),
+          ],
+        ],
+      ),
+      pw.SizedBox(height: 6),
+      pw.Row(
+        crossAxisAlignment: pw.CrossAxisAlignment.center,
+        children: [
+          pw.Text('Notes', style: ts(9, color: muted)),
+          pw.SizedBox(width: 5),
+          pw.Expanded(child: tf('notes_${it.id}', h: 28, multiline: true)),
+        ],
+      ),
+    ];
+
+    pw.Widget heading(String t) => pw.Padding(
+      padding: const pw.EdgeInsets.only(top: 6, bottom: 8),
+      child: pw.Row(
+        crossAxisAlignment: pw.CrossAxisAlignment.center,
+        children: [
+          pw.Text(t, style: ts(8, isBold: true, color: muted, spacing: 1.2)),
+          pw.SizedBox(width: 8),
+          pw.Expanded(child: pw.Container(height: 0.6, color: line)),
+        ],
+      ),
+    );
+
+    pw.Widget itemRow(_DayExportItem it, bool isTimed) {
+      final color = it.color;
+      final fill = _pc(Color.alphaBlend(color.withOpacity(0.10), Colors.white));
+      final edge = _pc(Color.alphaBlend(color.withOpacity(0.45), Colors.white));
+      final proj = (it.project ?? '').trim();
+      final statusLabel = it.status == TaskStatus.none
+          ? (it.done ? 'Done' : null)
+          : it.status.label;
+
+      pw.Widget? timeCol;
+      if (isTimed) {
+        final s = it.start!;
+        final e = s.add(Duration(minutes: it.durationMinutes));
+        final same = e.year == s.year && e.month == s.month && e.day == s.day;
+        timeCol = pw.SizedBox(
+          width: 78,
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              pw.Text(_t12(s), style: ts(11, isBold: true)),
+              pw.SizedBox(height: 1),
+              pw.Text(
+                'to ${_t12(e)}${same ? "" : " (+1d)"}',
+                style: ts(9, color: muted),
+              ),
+              pw.Text(_dur(it.durationMinutes), style: ts(8.5, color: muted)),
+            ],
+          ),
+        );
+      }
+
+      final card = pw.Container(
+        decoration: pw.BoxDecoration(
+          color: fill,
+          border: pw.Border(
+            left: pw.BorderSide(color: _pc(color), width: 4),
+            top: pw.BorderSide(color: edge, width: 0.6),
+            right: pw.BorderSide(color: edge, width: 0.6),
+            bottom: pw.BorderSide(color: edge, width: 0.6),
+          ),
+        ),
+        padding: const pw.EdgeInsets.fromLTRB(12, 8, 12, 8),
+        child: pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            if (proj.isNotEmpty)
+              pw.Text(
+                proj,
+                style: ts(8.5, isBold: true, color: _pc(_darken(color))),
+              ),
+            if (proj.isNotEmpty) pw.SizedBox(height: 2),
+            pw.Text(
+              it.title.trim().isEmpty ? '(untitled)' : it.title,
+              style: ts(12, isBold: true, color: it.done ? muted : ink, strike: it.done),
+            ),
+            if (statusLabel != null) pw.SizedBox(height: 5),
+            if (statusLabel != null)
+              pw.Row(
+                crossAxisAlignment: pw.CrossAxisAlignment.center,
+                children: [
+                  pw.Container(
+                    width: 6,
+                    height: 6,
+                    decoration: pw.BoxDecoration(
+                      color: _pc(color),
+                      shape: pw.BoxShape.circle,
+                    ),
+                  ),
+                  pw.SizedBox(width: 5),
+                  pw.Text(statusLabel, style: ts(9, color: muted)),
+                ],
+              ),
+            if (fillable) ...fillBlock(it, isTimed),
+          ],
+        ),
+      );
+
+      return pw.Padding(
+        padding: const pw.EdgeInsets.only(bottom: 8),
+        child: pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            if (timeCol != null) timeCol,
+            if (timeCol != null) pw.SizedBox(width: 10),
+            pw.Expanded(child: card),
+          ],
+        ),
+      );
+    }
+
+    final totalMin = timed.fold<int>(0, (s, i) => s + i.durationMinutes);
+    final doneCount = items.where((i) => i.done).length;
+    final summary = <String>[
+      '${items.length} ${items.length == 1 ? "task" : "tasks"}',
+      if (allDay.isNotEmpty) '${allDay.length} all-day',
+      if (timed.isNotEmpty) '${_dur(totalMin)} scheduled',
+      if (items.isNotEmpty) '$doneCount done',
+    ].join('   ·   ');
+
+    final children = <pw.Widget>[
+      pw.Text(
+        'CHAOS CONTROL  ·  SCHEDULE',
+        style: ts(8, isBold: true, color: pdfc.PdfColor.fromInt(0xFF3A8DB5), spacing: 1.2),
+      ),
+      pw.SizedBox(height: 6),
+      pw.Text(_weekdays[day.weekday - 1], style: ts(26, isBold: true)),
+      pw.Text(
+        '${_months[day.month - 1]} ${day.day}, ${day.year}',
+        style: ts(13, color: muted),
+      ),
+      pw.SizedBox(height: 8),
+      pw.Text(summary, style: ts(10, color: muted)),
+      pw.SizedBox(height: 12),
+      pw.Container(height: 1, color: line),
+      pw.SizedBox(height: 14),
+    ];
+
+    if (items.isEmpty) {
+      children.add(
+        pw.Text('Nothing scheduled for this day.', style: ts(11, color: muted)),
+      );
+    }
+
+    // Heading + first row are wrapped in a Row (not splittable) so a section
+    // title is never left alone at the bottom of a page.
+    void addSection(String label, List<_DayExportItem> list, bool isTimed) {
+      for (int i = 0; i < list.length; i++) {
+        if (i == 0) {
+          children.add(
+            pw.Row(
+              children: [
+                pw.Expanded(
+                  child: pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [heading(label), itemRow(list[i], isTimed)],
+                  ),
+                ),
+              ],
+            ),
+          );
+        } else {
+          children.add(itemRow(list[i], isTimed));
+        }
+      }
+    }
+
+    addSection('ALL DAY', allDay, false);
+    addSection('SCHEDULED', timed, true);
+
+    final now = AppClock.now();
+    final stamp =
+        'Exported ${_months[now.month - 1].substring(0, 3)} ${now.day}, '
+        '${now.year}  ${_t12(now)}';
+
+    final doc = pw.Document(
+      title:
+          'Schedule - ${_months[day.month - 1]} ${day.day}, ${day.year}',
+      author: 'Chaos Control',
+    );
+    doc.addPage(
+      pw.MultiPage(
+        pageFormat: pdfc.PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.fromLTRB(40, 40, 40, 44),
+        maxPages: 500,
+        theme: pw.ThemeData.withFont(base: regular, bold: bold),
+        build: (ctx) => children,
+        footer: (ctx) => pw.Padding(
+          padding: const pw.EdgeInsets.only(top: 10),
+          child: pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            children: [
+              pw.Text(stamp, style: ts(8, color: muted)),
+              pw.Text(
+                'Page ${ctx.pageNumber} / ${ctx.pagesCount}',
+                style: ts(8, color: muted),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return Uint8List.fromList(await doc.save());
+  }
 }
 
 // ── Worklog data models ───────────────────────────────────────────────────────
@@ -48041,6 +50098,13 @@ class _ChainDotsPainter extends CustomPainter {
 //   centered on the task that was tapped.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A repeat instance known only from the task index (not loaded in memory).
+class _UnloadedRepeatInstance {
+  final String id;
+  final DateTime date;
+  const _UnloadedRepeatInstance(this.id, this.date);
+}
+
 class _RecurringTimelineModal extends StatelessWidget {
   final List<Task> chain;
   final String focusedTaskId;
@@ -48052,11 +50116,41 @@ class _RecurringTimelineModal extends StatelessWidget {
   /// Called (after the dialog pops) when the user taps "Details" on an item.
   final void Function(Task instance)? onEditInstance;
 
+  /// Called when the user picks a new status for an item in the list.
+  /// The caller is responsible for mutating/persisting the task.
+  final void Function(Task instance, TaskStatus status)? onStatusSelect;
+
+  /// When provided, a "Generate more instances" button is shown at the bottom.
+  /// Called with either [count] or [until]; returns a result message.
+  final Future<String> Function({int? count, DateTime? until})? onGenerateMore;
+
+  /// Index-only (not loaded) instances, shown grayed out. Those dated before
+  /// the first loaded instance go in a collapsible section above the list,
+  /// those after the last one in a collapsible section under the footer
+  /// button, and those in between inline in the list.
+  final List<_UnloadedRepeatInstance> unloaded;
+
+  /// Dates the user removed from the series (exception dates). Shown struck
+  /// through in the list with a "Restore" button.
+  final List<DateTime> exceptions;
+
+  /// Restores an exception date (recreates the occurrence).
+  final Future<void> Function(DateTime date)? onRestoreException;
+
+  /// Skips (deletes) an occurrence and records its date as an exception.
+  final Future<void> Function(Task instance)? onSkipOccurrence;
+
   const _RecurringTimelineModal({
     required this.chain,
     required this.focusedTaskId,
     this.onEditRepeatConfig,
     this.onEditInstance,
+    this.onStatusSelect,
+    this.onGenerateMore,
+    this.unloaded = const [],
+    this.exceptions = const [],
+    this.onRestoreException,
+    this.onSkipOccurrence,
   });
 
   @override
@@ -48077,6 +50171,29 @@ class _RecurringTimelineModal extends StatelessWidget {
       orElse: () => chain.first,
     );
     final repeatLabel = parent.repeatConfig?.label ?? 'Recurring';
+
+    // Split the index-only instances around the loaded range.
+    DateTime? firstLoaded;
+    DateTime? lastLoaded;
+    for (final t in chain) {
+      final d = t.scheduledDate;
+      if (d == null) continue;
+      final day = DateTime(d.year, d.month, d.day);
+      if (firstLoaded == null || day.isBefore(firstLoaded)) firstLoaded = day;
+      if (lastLoaded == null || day.isAfter(lastLoaded)) lastLoaded = day;
+    }
+    final earlier = <_UnloadedRepeatInstance>[];
+    final middle = <_UnloadedRepeatInstance>[];
+    final later = <_UnloadedRepeatInstance>[];
+    for (final u in unloaded) {
+      if (firstLoaded != null && u.date.isBefore(firstLoaded)) {
+        earlier.add(u);
+      } else if (lastLoaded != null && u.date.isAfter(lastLoaded)) {
+        later.add(u);
+      } else {
+        middle.add(u);
+      }
+    }
 
     return Dialog(
       backgroundColor: bg,
@@ -48166,22 +50283,487 @@ class _RecurringTimelineModal extends StatelessWidget {
               ),
             ),
 
+            // ── Earlier (not loaded) instances ────────────────────────────
+            if (earlier.isNotEmpty)
+              _UnloadedInstancesSection(
+                label: 'earlier instances',
+                items: earlier,
+                startNumber: 1,
+                title: parent.title,
+                accent: accent,
+                borderOnTop: false,
+              ),
+
             // ── Timeline list ─────────────────────────────────────────────
             Flexible(
               child: _RecurringTimelineList(
                 chain: chain,
                 focusedIndex: initialIndex,
+                middleUnloaded: middle,
+                exceptions: exceptions,
+                onRestoreException: onRestoreException,
+                onSkipOccurrence: onSkipOccurrence,
+                seriesTitle: parent.title,
+                numberOffset: earlier.length,
                 cardBg: cardBg,
                 accent: accent,
                 lineColor: lineColor,
                 onEditInstance: onEditInstance,
+                onStatusSelect: onStatusSelect,
               ),
             ),
+
+            // ── Footer: generate more instances ───────────────────────────
+            if (onGenerateMore != null)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: const BoxDecoration(
+                  border: Border(top: BorderSide(color: Color(0xFF2C2F35))),
+                ),
+                child: TextButton.icon(
+                  style: TextButton.styleFrom(
+                    foregroundColor: accent,
+                    backgroundColor: accent.withOpacity(0.08),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      side: BorderSide(color: accent.withOpacity(0.25)),
+                    ),
+                  ),
+                  icon: const Icon(Icons.add_rounded, size: 16),
+                  label: const Text(
+                    'Generate more instances',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  onPressed: () =>
+                      _showGenerateMoreInstancesDialog(context, onGenerateMore!),
+                ),
+              ),
+
+            // ── Later (not loaded) instances ──────────────────────────────
+            if (later.isNotEmpty)
+              _UnloadedInstancesSection(
+                label: 'later instances',
+                items: later,
+                startNumber: earlier.length + chain.length + middle.length + 1,
+                title: parent.title,
+                accent: accent,
+                borderOnTop: true,
+              ),
           ],
         ),
       ),
     );
   }
+}
+
+/// Card used for an instance that is only in the task index (grayed out by the
+/// caller via Opacity).
+class _UnloadedInstanceCard extends StatelessWidget {
+  final int number;
+  final String title;
+  final DateTime date;
+  final Color cardBg;
+  final EdgeInsets margin;
+
+  const _UnloadedInstanceCard({
+    required this.number,
+    required this.title,
+    required this.date,
+    required this.cardBg,
+    required this.margin,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: margin,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF2C2F35)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 22,
+            height: 22,
+            margin: const EdgeInsets.only(right: 10),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(5),
+            ),
+            child: Center(
+              child: Text(
+                '$number',
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white38,
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 3),
+                const Text(
+                  'Not loaded',
+                  style: TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(5),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.calendar_today_outlined,
+                    size: 9, color: Colors.white30),
+                const SizedBox(width: 4),
+                Text(
+                  _fmtDateChip(date),
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Collapsible section listing index-only instances, grayed out.
+class _UnloadedInstancesSection extends StatefulWidget {
+  final String label;
+  final List<_UnloadedRepeatInstance> items;
+  final int startNumber;
+  final String title;
+  final Color accent;
+  final bool borderOnTop;
+
+  const _UnloadedInstancesSection({
+    required this.label,
+    required this.items,
+    required this.startNumber,
+    required this.title,
+    required this.accent,
+    required this.borderOnTop,
+  });
+
+  @override
+  State<_UnloadedInstancesSection> createState() =>
+      _UnloadedInstancesSectionState();
+}
+
+class _UnloadedInstancesSectionState extends State<_UnloadedInstancesSection> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    const line = BorderSide(color: Color(0xFF2C2F35));
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          top: widget.borderOnTop ? line : BorderSide.none,
+          bottom: widget.borderOnTop ? BorderSide.none : line,
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+              child: Row(
+                children: [
+                  Icon(
+                    _expanded
+                        ? Icons.expand_less_rounded
+                        : Icons.expand_more_rounded,
+                    size: 16,
+                    color: Colors.white38,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${widget.items.length} ${widget.label} (not loaded)',
+                      style: const TextStyle(
+                          fontSize: 11, color: Colors.white38),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded)
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 200),
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                itemCount: widget.items.length,
+                itemBuilder: (_, i) => Opacity(
+                  opacity: 0.45,
+                  child: SizedBox(
+                    height: 56,
+                    child: _UnloadedInstanceCard(
+                      number: widget.startNumber + i,
+                      title: widget.title,
+                      date: widget.items[i].date,
+                      cardBg: const Color(0xFF252830),
+                      margin: const EdgeInsets.symmetric(vertical: 3),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Prompts for how many more instances (or up to which date) to generate and
+/// runs [onGenerate]; the result message is shown in the same dialog.
+Future<void> _showGenerateMoreInstancesDialog(
+  BuildContext context,
+  Future<String> Function({int? count, DateTime? until}) onGenerate,
+) {
+  const accent = Color(0xFF4FC3F7);
+  final countCtrl = TextEditingController(text: '10');
+  var byCount = true;
+  DateTime? untilDate;
+  var running = false;
+  String? result;
+  String? error;
+
+  return showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDlg) {
+        Widget modeChip(String label, bool selected, VoidCallback onTap) {
+          return Expanded(
+            child: GestureDetector(
+              onTap: running || result != null ? null : onTap,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: selected
+                      ? accent.withOpacity(0.15)
+                      : Colors.white.withOpacity(0.04),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: selected ? accent.withOpacity(0.6) : Colors.white12,
+                  ),
+                ),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: selected ? accent : Colors.white54,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        Future<void> run() async {
+          int? count;
+          if (byCount) {
+            count = int.tryParse(countCtrl.text.trim());
+            if (count == null || count < 1 || count > 500) {
+              setDlg(() => error = 'Enter a number between 1 and 500.');
+              return;
+            }
+          } else if (untilDate == null) {
+            setDlg(() => error = 'Pick a date.');
+            return;
+          }
+          setDlg(() {
+            error = null;
+            running = true;
+          });
+          String msg;
+          try {
+            msg = await onGenerate(
+              count: byCount ? count : null,
+              until: byCount ? null : untilDate,
+            );
+          } catch (e) {
+            msg = 'Could not generate instances: $e';
+          }
+          setDlg(() {
+            running = false;
+            result = msg;
+          });
+        }
+
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E2126),
+          title: const Text(
+            'Generate more instances',
+            style: TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          content: SizedBox(
+            width: 340,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (result != null)
+                  Text(
+                    result!,
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                  )
+                else ...[
+                  const Text(
+                    'New instances are created after the last existing one.',
+                    style: TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      modeChip('By quantity', byCount,
+                          () => setDlg(() => byCount = true)),
+                      const SizedBox(width: 8),
+                      modeChip('Until date', !byCount,
+                          () => setDlg(() => byCount = false)),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  if (byCount)
+                    TextField(
+                      controller: countCtrl,
+                      enabled: !running,
+                      autofocus: true,
+                      keyboardType: TextInputType.number,
+                      style: const TextStyle(color: Colors.white),
+                      onSubmitted: (_) => run(),
+                      decoration: const InputDecoration(
+                        labelText: 'Number of instances',
+                        labelStyle: TextStyle(color: Colors.white54),
+                        enabledBorder: UnderlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white24),
+                        ),
+                        focusedBorder: UnderlineInputBorder(
+                          borderSide: BorderSide(color: accent),
+                        ),
+                      ),
+                    )
+                  else
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: running
+                          ? null
+                          : () async {
+                              final now = DateTime.now();
+                              final picked = await showDatePicker(
+                                context: ctx,
+                                initialDate:
+                                    untilDate ?? now.add(const Duration(days: 30)),
+                                firstDate: now,
+                                lastDate: now.add(const Duration(days: 3650)),
+                              );
+                              if (picked != null) {
+                                setDlg(() => untilDate = picked);
+                              }
+                            },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 11),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.05),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: untilDate == null
+                                ? Colors.white24
+                                : accent.withOpacity(0.6),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.calendar_today_outlined,
+                                size: 14,
+                                color:
+                                    untilDate == null ? Colors.white38 : accent),
+                            const SizedBox(width: 10),
+                            Text(
+                              untilDate == null
+                                  ? 'Select date…'
+                                  : _fmtDateChip(untilDate!),
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: untilDate == null
+                                    ? Colors.white38
+                                    : Colors.white70,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  if (error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      error!,
+                      style: const TextStyle(
+                          color: Colors.redAccent, fontSize: 11),
+                    ),
+                  ],
+                  if (running) ...[
+                    const SizedBox(height: 14),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            if (result != null)
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Close', style: TextStyle(color: accent)),
+              )
+            else ...[
+              TextButton(
+                onPressed: running ? null : () => Navigator.pop(ctx),
+                child: const Text('Cancel',
+                    style: TextStyle(color: Colors.white38)),
+              ),
+              TextButton(
+                onPressed: running ? null : run,
+                child: Text('Generate',
+                    style: TextStyle(color: running ? Colors.white24 : accent)),
+              ),
+            ],
+          ],
+        );
+      },
+    ),
+  );
 }
 
 // Separate stateful widget so we can auto-scroll to focused item.
@@ -48196,6 +50778,23 @@ class _RecurringTimelineList extends StatefulWidget {
   /// the dialog and calls this with the tapped task.
   final void Function(Task instance)? onEditInstance;
 
+  /// If provided, the status chip next to each item's number becomes
+  /// interactive and calls this with the chosen status.
+  final void Function(Task instance, TaskStatus status)? onStatusSelect;
+
+  /// Index-only instances dated between the first and last loaded instance;
+  /// rendered inline, grayed out.
+  final List<_UnloadedRepeatInstance> middleUnloaded;
+
+  /// Exception dates, rendered inline (struck through) with a Restore button.
+  final List<DateTime> exceptions;
+  final Future<void> Function(DateTime date)? onRestoreException;
+  final Future<void> Function(Task instance)? onSkipOccurrence;
+  final String seriesTitle;
+
+  /// Number of instances listed before this list (for the number badges).
+  final int numberOffset;
+
   const _RecurringTimelineList({
     required this.chain,
     required this.focusedIndex,
@@ -48203,6 +50802,13 @@ class _RecurringTimelineList extends StatefulWidget {
     required this.accent,
     required this.lineColor,
     this.onEditInstance,
+    this.onStatusSelect,
+    this.middleUnloaded = const [],
+    this.exceptions = const [],
+    this.onRestoreException,
+    this.onSkipOccurrence,
+    this.seriesTitle = '',
+    this.numberOffset = 0,
   });
 
   @override
@@ -48215,6 +50821,44 @@ class _RecurringTimelineListState extends State<_RecurringTimelineList> {
 
   static const double _itemHeight = 72.0;
 
+  /// Loaded tasks plus inline (middle) unloaded instances, by date.
+  List<({Task? task, _UnloadedRepeatInstance? unloaded, DateTime? date})>
+      _entries() {
+    final list = <({Task? task, _UnloadedRepeatInstance? unloaded, DateTime? date})>[];
+    for (final t in widget.chain) {
+      final d = t.scheduledDate;
+      list.add((
+        task: t,
+        unloaded: null,
+        date: d == null ? null : DateTime(d.year, d.month, d.day),
+      ));
+    }
+    for (final u in widget.middleUnloaded) {
+      list.add((task: null, unloaded: u, date: u.date));
+    }
+    for (final d in widget.exceptions) {
+      list.add((task: null, unloaded: null, date: d));
+    }
+    // Stable sort: undated loaded tasks keep their original order at the end.
+    final indexed = list.asMap().entries.toList()
+      ..sort((a, b) {
+        final da = a.value.date;
+        final db = b.value.date;
+        if (da == null && db == null) return a.key.compareTo(b.key);
+        if (da == null) return 1;
+        if (db == null) return -1;
+        final c = da.compareTo(db);
+        return c != 0 ? c : a.key.compareTo(b.key);
+      });
+    return indexed.map((e) => e.value).toList();
+  }
+
+  int _focusedEntryIndex() {
+    final focusedId = widget.chain[widget.focusedIndex].id;
+    final i = _entries().indexWhere((e) => e.task?.id == focusedId);
+    return i < 0 ? widget.focusedIndex : i;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -48225,7 +50869,7 @@ class _RecurringTimelineListState extends State<_RecurringTimelineList> {
   void _scrollToFocused() {
     if (!_scroll.hasClients) return;
     final maxScrollExtent = _scroll.position.maxScrollExtent;
-    final targetOffset = widget.focusedIndex * _itemHeight;
+    final targetOffset = _focusedEntryIndex() * _itemHeight;
     // Center the focused item in the viewport
     final viewportHeight = _scroll.position.viewportDimension;
     final centered = targetOffset - (viewportHeight / 2) + (_itemHeight / 2);
@@ -48243,18 +50887,244 @@ class _RecurringTimelineListState extends State<_RecurringTimelineList> {
     super.dispose();
   }
 
+  /// Row for an exception date: an occurrence the user removed from the series.
+  Widget _buildExceptionRow(
+    DateTime date, {
+    required bool isFirst,
+    required bool isLast,
+  }) {
+    const warn = Color(0xFFFFB74D);
+    return SizedBox(
+      height: _itemHeight,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            width: 44,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (!isFirst)
+                  Positioned(
+                    top: 0,
+                    bottom: _itemHeight / 2,
+                    left: 21,
+                    width: 2,
+                    child: Container(color: widget.lineColor),
+                  ),
+                if (!isLast)
+                  Positioned(
+                    top: _itemHeight / 2,
+                    bottom: 0,
+                    left: 21,
+                    width: 2,
+                    child: Container(color: widget.lineColor),
+                  ),
+                Positioned(
+                  left: 10,
+                  top: (_itemHeight / 2) - 11,
+                  child: Container(
+                    width: 22,
+                    height: 22,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: warn.withOpacity(0.08),
+                      border: Border.all(
+                          color: warn.withOpacity(0.45), width: 1.5),
+                    ),
+                    child: Icon(Icons.event_busy_rounded,
+                        size: 11, color: warn.withOpacity(0.8)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Container(
+              margin: const EdgeInsets.only(right: 16, top: 6, bottom: 6),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: widget.cardBg.withOpacity(0.5),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: warn.withOpacity(0.25)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          widget.seriesTitle,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white30,
+                            decoration: TextDecoration.lineThrough,
+                            decorationColor: Colors.white30,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          'Exception — ${_fmtDateChip(date)}',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: warn.withOpacity(0.8),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (widget.onRestoreException != null)
+                    GestureDetector(
+                      onTap: () => widget.onRestoreException!(date),
+                      child: MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: widget.accent.withOpacity(0.10),
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(
+                                color: widget.accent.withOpacity(0.30)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.restore_rounded,
+                                  size: 10,
+                                  color: widget.accent.withOpacity(0.85)),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Restore',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                  color: widget.accent.withOpacity(0.9),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Grayed-out row for an instance that exists only in the task index.
+  Widget _buildUnloadedRow(
+    _UnloadedRepeatInstance u,
+    int number, {
+    required bool isFirst,
+    required bool isLast,
+  }) {
+    return SizedBox(
+      height: _itemHeight,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            width: 44,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (!isFirst)
+                  Positioned(
+                    top: 0,
+                    bottom: _itemHeight / 2,
+                    left: 21,
+                    width: 2,
+                    child: Container(color: widget.lineColor),
+                  ),
+                if (!isLast)
+                  Positioned(
+                    top: _itemHeight / 2,
+                    bottom: 0,
+                    left: 21,
+                    width: 2,
+                    child: Container(color: widget.lineColor),
+                  ),
+                Positioned(
+                  left: 10,
+                  top: (_itemHeight / 2) - 11,
+                  child: Container(
+                    width: 22,
+                    height: 22,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.white.withOpacity(0.03),
+                      border: Border.all(color: Colors.white12, width: 1.5),
+                    ),
+                    child: const Icon(Icons.more_horiz,
+                        size: 11, color: Colors.white24),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Opacity(
+              opacity: 0.45,
+              child: _UnloadedInstanceCard(
+                number: number,
+                title: widget.seriesTitle,
+                date: u.date,
+                cardBg: widget.cardBg,
+                margin: const EdgeInsets.only(right: 16, top: 6, bottom: 6),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final chain = widget.chain;
+    final entries = _entries();
+    // Numbers count real occurrences only (exceptions are not numbered).
+    final numbers = <int>[];
+    var running = widget.numberOffset;
+    for (final e in entries) {
+      final isException = e.task == null && e.unloaded == null;
+      if (!isException) running++;
+      numbers.add(running);
+    }
     return ListView.builder(
       controller: _scroll,
       padding: const EdgeInsets.symmetric(vertical: 8),
-      itemCount: chain.length,
+      itemCount: entries.length,
       itemBuilder: (context, index) {
-        final task = chain[index];
+        final entry = entries[index];
+        if (entry.task == null && entry.unloaded == null) {
+          return _buildExceptionRow(
+            entry.date!,
+            isFirst: index == 0,
+            isLast: index == entries.length - 1,
+          );
+        }
+        if (entry.task == null) {
+          return _buildUnloadedRow(
+            entry.unloaded!,
+            numbers[index],
+            isFirst: index == 0,
+            isLast: index == entries.length - 1,
+          );
+        }
+        final task = entry.task!;
         final isFocused = task.id == chain[widget.focusedIndex].id;
         final isFirst = index == 0;
-        final isLast = index == chain.length - 1;
+        final isLast = index == entries.length - 1;
         final isDone = task.status == TaskStatus.done ||
             task.status == TaskStatus.cancelled ||
             task.status == TaskStatus.surpassed;
@@ -48380,13 +51250,75 @@ class _RecurringTimelineListState extends State<_RecurringTimelineList> {
                         ),
                         child: Center(
                           child: Text(
-                            '${index + 1}',
+                            '${numbers[index]}',
                             style: TextStyle(
                               fontSize: 10,
                               fontWeight: FontWeight.w700,
                               color: isFocused
                                   ? widget.accent
                                   : Colors.white38,
+                            ),
+                          ),
+                        ),
+                      ),
+                      // Interactive status picker (next to the number)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 10),
+                        child: PopupMenuButton<TaskStatus>(
+                          enabled: widget.onStatusSelect != null,
+                          tooltip: 'Change status',
+                          padding: EdgeInsets.zero,
+                          color: const Color(0xFF252830),
+                          position: PopupMenuPosition.under,
+                          onSelected: (st) {
+                            widget.onStatusSelect?.call(task, st);
+                            setState(() {});
+                          },
+                          itemBuilder: (_) => TaskStatus.values
+                              .map(
+                                (st) => PopupMenuItem<TaskStatus>(
+                                  value: st,
+                                  height: 34,
+                                  child: Row(
+                                    children: [
+                                      Icon(st.icon, size: 14, color: st.color),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        st.label,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: st == task.status
+                                              ? st.color
+                                              : Colors.white70,
+                                          fontWeight: st == task.status
+                                              ? FontWeight.w600
+                                              : FontWeight.normal,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          child: MouseRegion(
+                            cursor: widget.onStatusSelect != null
+                                ? SystemMouseCursors.click
+                                : MouseCursor.defer,
+                            child: Container(
+                              width: 24,
+                              height: 22,
+                              decoration: BoxDecoration(
+                                color: task.status.color.withOpacity(0.14),
+                                borderRadius: BorderRadius.circular(5),
+                                border: Border.all(
+                                  color: task.status.color.withOpacity(0.45),
+                                ),
+                              ),
+                              child: Icon(
+                                task.status.icon,
+                                size: 13,
+                                color: task.status.color,
+                              ),
                             ),
                           ),
                         ),
@@ -48475,6 +51407,38 @@ class _RecurringTimelineListState extends State<_RecurringTimelineList> {
                             style: TextStyle(
                               fontSize: 9,
                               color: widget.accent.withOpacity(0.8),
+                            ),
+                          ),
+                        ),
+                      ],
+                      // "Skip" button — hover-reveal: removes this occurrence from
+                      // the series and records its date as an exception.
+                      if (isHovered && widget.onSkipOccurrence != null) ...[
+                        const SizedBox(width: 6),
+                        Tooltip(
+                          message: 'Skip this occurrence',
+                          child: GestureDetector(
+                            onTap: () => widget.onSkipOccurrence!(task),
+                            child: MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              child: Container(
+                                padding: const EdgeInsets.all(5),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFFFB74D)
+                                      .withOpacity(0.10),
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(
+                                    color: const Color(0xFFFFB74D)
+                                        .withOpacity(0.30),
+                                  ),
+                                ),
+                                child: Icon(
+                                  Icons.event_busy_rounded,
+                                  size: 11,
+                                  color: const Color(0xFFFFB74D)
+                                      .withOpacity(0.85),
+                                ),
+                              ),
                             ),
                           ),
                         ),
@@ -50616,7 +53580,7 @@ class _WorkspaceSwitcherDialog extends StatefulWidget {
   final void Function(Map<String, String>, String) onRename;
   final void Function(Map<String, String>) onDelete;
   final VoidCallback onCreateNew;
-  final VoidCallback onRestoreFromFile;
+  final VoidCallback onFindFolder;
 
   const _WorkspaceSwitcherDialog({
     required this.workspaces,
@@ -50627,7 +53591,7 @@ class _WorkspaceSwitcherDialog extends StatefulWidget {
     required this.onRename,
     required this.onDelete,
     required this.onCreateNew,
-    required this.onRestoreFromFile,
+    required this.onFindFolder,
   });
 
   @override
@@ -50994,9 +53958,9 @@ class _WorkspaceSwitcherDialogState extends State<_WorkspaceSwitcherDialog> {
                         elevation: 0,
                         minimumSize: const Size(0, 38),
                       ),
-                      icon: const Icon(Icons.restore_page_outlined, size: 16),
-                      label: const Text('Restore From File'),
-                      onPressed: widget.onRestoreFromFile,
+                      icon: const Icon(Icons.folder_open_rounded, size: 16),
+                      label: const Text('Find Folder'),
+                      onPressed: widget.onFindFolder,
                     ),
                   ),
                 ],
@@ -51905,8 +54869,9 @@ class _TaskDetailsPanelState extends State<_TaskDetailsPanel> {
                                           ? widget.allTasks
                                                 .firstWhere(
                                                   (t) =>
-                                                      t.id ==
-                                                      target.seriesId,
+                                                      t.seriesId ==
+                                                          target.seriesId &&
+                                                      t.isSeriesParent,
                                                   orElse: () => target,
                                                 )
                                                 .repeatConfig
@@ -51939,8 +54904,9 @@ class _TaskDetailsPanelState extends State<_TaskDetailsPanel> {
                                               final parent = widget.allTasks
                                                   .firstWhere(
                                                     (t) =>
-                                                        t.id ==
-                                                        target.seriesId,
+                                                        t.seriesId ==
+                                                            target.seriesId &&
+                                                        t.isSeriesParent,
                                                     orElse: () => target,
                                                   );
                                               openDialog(parent);
@@ -51955,11 +54921,11 @@ class _TaskDetailsPanelState extends State<_TaskDetailsPanel> {
                                       target.repeatConfig = result.cleared
                                           ? null
                                           : result;
-                                      // Keep seriesId in sync: clear when repeat removed,
-                                      // ensure it equals own id when repeat is set.
-                                      if (result.cleared) {
-                                        target.seriesId = null;
-                                      } else {
+                                      // Keep seriesId in sync. When the repeat is
+                                      // removed the (fixed) series key is kept for
+                                      // now: _propagateRepeat uses it to delete the
+                                      // series' instances and then clears it.
+                                      if (!result.cleared) {
                                         target.seriesId ??= target.id;
                                       }
                                       final anchor = result.anchorDate;
@@ -52019,7 +54985,8 @@ class _TaskDetailsPanelState extends State<_TaskDetailsPanel> {
                                           final parent = widget.allTasks
                                               .firstWhere(
                                                 (t) =>
-                                                    t.id == task.seriesId,
+                                                    t.seriesId == task.seriesId &&
+                                                    t.isSeriesParent,
                                                 orElse: () => task,
                                               );
                                           label =
@@ -60360,6 +63327,17 @@ class _OrgSettingsView extends StatefulWidget {
   final Map<String, Project> projects;
   final List<String> projectOrder;
   final Map<String, Set<String>> projectFolders;
+  /// Sidebar order of project folders (includes the '__standard__' sentinel).
+  final List<String> projectFolderOrder;
+  /// Sidebar order of tag folders (uses '__unfoldered__' for Standard) and of
+  /// the tags inside the Standard folder.
+  final List<String> tagFolderOrder;
+  final List<String> tagOrder;
+  /// Folders (of the current mode) hidden entirely from the sidebar.
+  final Set<String> hiddenFolders;
+  /// Custom project-folder colours (shared by reference with the sidebar).
+  final Map<String, Color> projectFolderColors;
+  final Map<String, Color> tagFolderColors;
   final Map<String, Set<String>> tagFolders;
   final Set<String> hiddenTags;
   final Map<String, bool> projectHiddenFromMenu;
@@ -60370,6 +63348,11 @@ class _OrgSettingsView extends StatefulWidget {
   /// Called when a new project is created, passing (id, color) so the parent
   /// can register the color in _projectColors.
   final void Function(String id, Color color)? onProjectCreated;
+
+  /// Called after a folder is renamed / deleted so the parent can keep the
+  /// sidebar order and folder colour in sync. (isProjects, oldKey, newKey?)
+  final void Function(bool isProjects, String oldKey, String? newKey)?
+  onFolderChanged;
 
   /// Feature 4: callback to open the app-level unified color picker.
   final void Function({
@@ -60390,6 +63373,12 @@ class _OrgSettingsView extends StatefulWidget {
     required this.projects,
     required this.projectOrder,
     required this.projectFolders,
+    this.projectFolderOrder = const [],
+    this.tagFolderOrder = const [],
+    this.tagOrder = const [],
+    required this.hiddenFolders,
+    this.projectFolderColors = const {},
+    this.tagFolderColors = const {},
     required this.tagFolders,
     required this.hiddenTags,
     required this.projectHiddenFromMenu,
@@ -60398,6 +63387,7 @@ class _OrgSettingsView extends StatefulWidget {
     required this.savedBoards,
     required this.onChanged,
     this.onProjectCreated,
+    this.onFolderChanged,
     this.onShowColorPicker,
     this.onBack,
   }) : super(key: key);
@@ -60428,8 +63418,9 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
   Color _newProjectColor = Colors.blueAccent;
 
   // Feature 5: sort state for the org panel
-  // sortField values: 'name' | 'taskCount' | 'usageCount'
-  String _sortField = 'name';
+  // sortField values: 'manual' (sidebar order) | 'name' |
+  // 'taskCount' | 'usageCount'
+  String _sortField = 'manual';
   bool _sortAsc = true;
 
   @override
@@ -60474,6 +63465,9 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
   List<String> _sortedFilteredItems(List<String> items) {
     final filtered = _filteredItems(items);
     final sorted = List<String>.from(filtered);
+    // 'manual' = keep the order the Tasks sidebar uses (caller supplies items
+    // already in sidebar order); direction is ignored.
+    if (_sortField == 'manual') return sorted;
     sorted.sort((a, b) {
       int cmp;
       if (_sortField == 'taskCount') {
@@ -60515,6 +63509,26 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
     setState(() {});
     widget.onChanged();
   }
+
+  // Key under which a folder is stored in hiddenFolders (matches the sidebar
+  // sentinel: tags use '__unfoldered__' for Standard).
+  String _hiddenFolderKey(String folderKey) =>
+      (!widget.isProjects && folderKey == '__standard__')
+      ? '__unfoldered__'
+      : folderKey;
+
+  bool _isFolderHidden(String folderKey) =>
+      widget.hiddenFolders.contains(_hiddenFolderKey(folderKey));
+
+  void _toggleFolderHidden(String folderKey) {
+    final k = _hiddenFolderKey(folderKey);
+    if (!widget.hiddenFolders.remove(k)) widget.hiddenFolders.add(k);
+    setState(() {});
+    widget.onChanged();
+  }
+
+  Map<String, Color> get _folderColors =>
+      widget.isProjects ? widget.projectFolderColors : widget.tagFolderColors;
 
   bool _isProtected(String folderKey) {
     if (!widget.isProjects &&
@@ -60611,6 +63625,7 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
     final items = _folders.remove(oldKey) ?? {};
     _folders[n] = items;
     if (_collapsed.remove(oldKey)) _collapsed.add(n);
+    widget.onFolderChanged?.call(widget.isProjects, oldKey, n);
     setState(() => _renamingFolder = null);
     widget.onChanged();
   }
@@ -60618,6 +63633,7 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
   void _deleteFolder(String key) {
     _folders.remove(key); // items fall back to Standard automatically
     _collapsed.remove(key);
+    widget.onFolderChanged?.call(widget.isProjects, key, null);
     setState(() {});
     widget.onChanged();
   }
@@ -60766,9 +63782,14 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
     final isCollapsed = _collapsed.contains(folderKey);
     final isRenaming = _renamingFolder == folderKey;
     final allHidden = items.isNotEmpty && items.every(_isHidden);
+    final folderHidden = _isFolderHidden(folderKey);
 
     // Folder colour / badge
     Color folderColor = _accent.withOpacity(0.6);
+    // Project folders use the same colour as in the Tasks sidebar.
+    if (!isStandard && !isTrello) {
+      folderColor = _folderColors[folderKey] ?? const Color(0xFFEBCB8B);
+    }
     Widget? badge;
     if (isTrello) {
       folderColor = const Color(0xFF0052CC).withOpacity(0.8);
@@ -60865,7 +63886,14 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
                                 style: TextStyle(
                                   fontSize: 12,
                                   fontWeight: FontWeight.w600,
-                                  color: isTrello ? _accent : Colors.white70,
+                                  color: isTrello
+                                      ? _accent
+                                      : (folderHidden
+                                            ? Colors.white30
+                                            : Colors.white70),
+                                  fontStyle: folderHidden
+                                      ? FontStyle.italic
+                                      : FontStyle.normal,
                                 ),
                               ),
                       ),
@@ -60897,6 +63925,108 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
                           size: 12,
                           color: _accent.withOpacity(0.7),
                         ),
+                      // Folder colour (projects) — same colour as the sidebar
+                      if (!isStandard && !isTrello)
+                        PopupMenuButton<String>(
+                          tooltip: 'Folder color',
+                          color: const Color(0xFF1E2124),
+                          padding: EdgeInsets.zero,
+                          iconSize: 13,
+                          icon: Icon(
+                            Icons.palette_outlined,
+                            size: 13,
+                            color: _folderColors[folderKey] ?? Colors.white30,
+                          ),
+                          itemBuilder: (_) => [
+                            const PopupMenuItem<String>(
+                              value: 'color',
+                              height: 34,
+                              child: Text(
+                                'Folder color',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
+                            if (_folderColors.containsKey(folderKey))
+                              const PopupMenuItem<String>(
+                                value: 'reset',
+                                height: 34,
+                                child: Text(
+                                  'Reset color',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ),
+                          ],
+                          onSelected: (v) {
+                            if (v == 'reset') {
+                              _folderColors.remove(folderKey);
+                              setState(() {});
+                              widget.onChanged();
+                            } else {
+                              widget.onShowColorPicker?.call(
+                                title: 'Folder Color',
+                                initialColor:
+                                    _folderColors[folderKey] ??
+                                    const Color(0xFFEBCB8B),
+                                onApply: (c) {
+                                  _folderColors[folderKey] = c;
+                                  setState(() {});
+                                  widget.onChanged();
+                                },
+                                colorContext: widget.isProjects
+                                    ? 'projectFolderColor'
+                                    : 'tagFolderColor',
+                              );
+                            }
+                          },
+                        ),
+                      // Eye — hide the folder itself from the sidebar
+                      Tooltip(
+                        message: folderHidden
+                            ? 'Show folder in sidebar'
+                            : 'Hide folder from sidebar',
+                        child: InkWell(
+                          onTap: () => _toggleFolderHidden(folderKey),
+                          borderRadius: BorderRadius.circular(4),
+                          child: Padding(
+                            padding: const EdgeInsets.all(4),
+                            // Eye drawn inside a folder outline
+                            child: SizedBox(
+                              width: 18,
+                              height: 16,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.folder_outlined,
+                                    size: 18,
+                                    color: folderHidden
+                                        ? _accent.withOpacity(0.7)
+                                        : Colors.white30,
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Icon(
+                                      folderHidden
+                                          ? Icons.visibility_off_outlined
+                                          : Icons.visibility_outlined,
+                                      size: 8,
+                                      color: folderHidden
+                                          ? _accent.withOpacity(0.7)
+                                          : Colors.white30,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                       // Eye (whole folder)
                       Tooltip(
                         message: allHidden
@@ -61020,6 +64150,51 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
               .toList();
     final userFolders =
         folders.keys.where((k) => !trelloKeys.contains(k)).toList()..sort();
+
+    // Mirror the Tasks sidebar: folders (incl. the Standard catch-all) follow
+    // the sidebar folder order; items keep their sidebar order.
+    const standardKey = '__standard__';
+    final bool manualOrder = _sortField == 'manual';
+    final nonTrelloKeys = folders.keys
+        .where((k) => !trelloKeys.contains(k))
+        .toList();
+    List<String> orderedFolderKeys;
+    if (manualOrder) {
+      final saved = widget.isProjects
+          ? widget.projectFolderOrder
+          : widget.tagFolderOrder
+                .map((k) => k == '__unfoldered__' ? standardKey : k)
+                .toList();
+      final allKeys = widget.isProjects
+          ? <String>[...nonTrelloKeys, standardKey]
+          : <String>[standardKey, ...nonTrelloKeys];
+      orderedFolderKeys = [
+        ...saved.where(allKeys.contains),
+        ...allKeys.where((k) => !saved.contains(k)),
+      ];
+    } else {
+      orderedFolderKeys = [standardKey, ...userFolders];
+    }
+    List<String> folderItems(String k) {
+      final l = (folders[k] ?? {}).toList();
+      return manualOrder ? l : (l..sort());
+    }
+    // Standard items in sidebar order (tags: _tagOrder first, then the rest
+    // in discovery order — same as the sidebar).
+    List<String> standardOrdered() {
+      if (widget.isProjects || !manualOrder) return standardItems;
+      final inStd = standardItems.toSet();
+      final discovery = <String>{
+        for (final t in widget.allTasks) ...t.tagIds.map((e) => e.toString()),
+        ...widget.customTags,
+      };
+      return [
+        ...widget.tagOrder.where(inStd.contains),
+        ...discovery.where(
+          (t) => inStd.contains(t) && !widget.tagOrder.contains(t),
+        ),
+      ];
+    }
 
     return Container(
       color: _bg,
@@ -61147,8 +64322,16 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
                       if (box == null) return;
                       final pos = box.localToGlobal(Offset.zero);
                       final fields = widget.isProjects
-                          ? [('name', 'Name'), ('taskCount', 'Task Count')]
-                          : [('name', 'Name'), ('taskCount', 'Usage Count')];
+                          ? [
+                              ('manual', 'Sidebar order'),
+                              ('name', 'Name'),
+                              ('taskCount', 'Task Count'),
+                            ]
+                          : [
+                              ('manual', 'Sidebar order'),
+                              ('name', 'Name'),
+                              ('taskCount', 'Usage Count'),
+                            ];
                       final picked = await showMenu<String>(
                         context: context,
                         color: const Color(0xFF1E2124),
@@ -61265,7 +64448,7 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
                       child: Icon(
                         Icons.sort_rounded,
                         size: 15,
-                        color: (_sortField != 'name' || !_sortAsc)
+                        color: (_sortField != 'manual' || !_sortAsc)
                             ? _accent
                             : Colors.white38,
                       ),
@@ -61715,28 +64898,23 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
             child: ListView(
               padding: const EdgeInsets.only(top: 6, bottom: 24),
               children: [
-                // 1. Standard folder (always first)
-                _folderBlock(
-                  folderKey: '__standard__',
-                  items: _sortedFilteredItems(standardItems),
-                  isStandard: true,
-                ),
-                // 2. User-created folders
-                ...userFolders.map(
-                  (k) => _folderBlock(
-                    folderKey: k,
-                    items: _sortedFilteredItems(
-                      (folders[k] ?? {}).toList()..sort(),
-                    ),
-                  ),
+                ...orderedFolderKeys.map(
+                  (k) => k == standardKey
+                      ? _folderBlock(
+                          folderKey: standardKey,
+                          items: _sortedFilteredItems(standardOrdered()),
+                          isStandard: true,
+                        )
+                      : _folderBlock(
+                          folderKey: k,
+                          items: _sortedFilteredItems(folderItems(k)),
+                        ),
                 ),
                 // 4. Trello board folders
                 ...trelloKeys.map(
                   (k) => _folderBlock(
                     folderKey: k,
-                    items: _sortedFilteredItems(
-                      (folders[k] ?? {}).toList()..sort(),
-                    ),
+                    items: _sortedFilteredItems(folderItems(k)),
                   ),
                 ),
                 if (_searchQuery.isNotEmpty &&
@@ -66286,6 +69464,8 @@ class _RepeatConfigDialogState extends State<_RepeatConfigDialog> {
     anchorDate: _anchorDate,
     endDate: _endDate,
     propagationDays: _propagationDays, // null = no days cap
+    // Preserve deleted-occurrence dates when the user edits the rule.
+    exceptionDates: List<String>.from(widget.initial?.exceptionDates ?? const []),
   );
 
   String _weekDayName(int d) =>
@@ -67006,8 +70186,6 @@ class _RepeatConfigDialogState extends State<_RepeatConfigDialog> {
   Widget _buildInstanceTimeline() {
     final sid = widget.task.seriesId;
     if (sid == null) return const SizedBox.shrink();
-    // The series parent always has id == seriesId.
-    final parentId = sid;
     // Collect all series members sorted by scheduled date
     final series =
         widget.allTasks
@@ -67054,7 +70232,7 @@ class _RepeatConfigDialogState extends State<_RepeatConfigDialog> {
           //   current dot = 14 px  (only at currentIdx, so not in this loop)
           double pixelOffset = 0;
           for (int i = 0; i < currentIdx; i++) {
-            final isParent = series[i].id == parentId;
+            final isParent = series[i].isSeriesParent;
             pixelOffset += (isParent ? 10.0 : 8.0) + 20.0;
           }
           pixelOffset += 7.0; // half of the current dot (14 px / 2)
@@ -67125,7 +70303,7 @@ class _RepeatConfigDialogState extends State<_RepeatConfigDialog> {
                   _buildTimelineDot(
                     task: series[i],
                     isCurrent: series[i].id == widget.task.id,
-                    isParent: series[i].id == parentId,
+                    isParent: series[i].isSeriesParent,
                     shortDate: _shortDate(series[i].scheduledDate),
                   ),
                   if (i < series.length - 1)
@@ -67538,7 +70716,7 @@ class _RepeatConfigDialogState extends State<_RepeatConfigDialog> {
     final parentId = widget.task.seriesId ?? widget.task.repeatParentId;
     final parent = parentId != null
         ? widget.allTasks.firstWhere(
-            (t) => t.id == parentId,
+            (t) => t.seriesId == parentId && t.isSeriesParent,
             orElse: () => widget.task,
           )
         : widget.task;
@@ -69595,7 +72773,7 @@ class _PlannerViewState extends State<_PlannerView> {
       if (!t.isSeriesParent && t.isPartOfSeries && t.projectId == 'INBOX_PROJECT') {
         try {
           final parent = widget.allTasks.firstWhere(
-            (p) => p.id == t.repeatParentId,
+            (p) => p.seriesId == t.repeatParentId && p.isSeriesParent,
           );
           if (parent.projectId != 'INBOX_PROJECT') {
             effectiveProjectIds[t.id] = parent.projectId;
