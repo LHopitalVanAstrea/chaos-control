@@ -73,6 +73,36 @@ class AppClock {
   ).add(Duration(minutes: offsetMinutes));
 }
 
+/// Runtime copies of user preferences that code living outside the main State
+/// class (models, standalone widgets, pickers) needs to read. The State keeps
+/// the persisted values and mirrors them here whenever they change or load.
+class AppPrefs {
+  /// First day of the week: 1 = Monday … 7 = Sunday.
+  static int firstDayOfWeek = 1;
+
+  /// Size given to NEW task cards (existing cards are never resized).
+  static double newCardWidth = 250;
+  static double newCardHeight = 250;
+
+  /// Fixed SnackBar duration in seconds. 0 = automatic (each message keeps its
+  /// own built-in duration).
+  static int snackBarSeconds = 0;
+
+  /// Midnight of the first day of the week that contains [d], honouring
+  /// [firstDayOfWeek]. Built with the DateTime constructor so DST changes
+  /// can never shift the result by an hour.
+  static DateTime weekStartOf(DateTime d) {
+    final diff = (d.weekday - firstDayOfWeek + 7) % 7;
+    return DateTime(d.year, d.month, d.day - diff);
+  }
+}
+
+/// Duration for a SnackBar: the user's fixed value when set, otherwise the
+/// message's own default.
+Duration snackDur(Duration fallback) => AppPrefs.snackBarSeconds > 0
+    ? Duration(seconds: AppPrefs.snackBarSeconds)
+    : fallback;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppTheme — InheritedWidget that propagates isLight to all descendants.
 // Use AppTheme.of(context).isLight to query the current mode anywhere.
@@ -287,13 +317,15 @@ class Task {
     this.repeatParentId,
     this.seriesId,
     this.isExpanded = false,
-    this.cardWidth = 250,
-    this.cardHeight = 250,
+    double? cardWidth,
+    double? cardHeight,
     Set<String>? visibleProperties,
     Map<String, double>? propertyHeights,
     this.titleWrap = false,
     this.cardManualHeight,
   }) : timeSpentOriginal = timeSpent,
+       cardWidth = cardWidth ?? AppPrefs.newCardWidth,
+       cardHeight = cardHeight ?? AppPrefs.newCardHeight,
        visibleProperties = visibleProperties ?? {},
        propertyHeights = propertyHeights ?? {};
 
@@ -904,8 +936,7 @@ class GroupContainer {
       final sd = t.scheduledDate;
       if (sd == null) return false;
       final day = DateTime(sd.year, sd.month, sd.day);
-      final weekStart = DateTime(today.year, today.month, today.day)
-          .subtract(Duration(days: today.weekday - 1));
+      final weekStart = AppPrefs.weekStartOf(today);
       final weekEnd = weekStart.add(const Duration(days: 6));
       final inWeek = !day.isBefore(weekStart) && !day.isAfter(weekEnd);
       if (repeatingWeekMatch! != inWeek) return false;
@@ -1461,6 +1492,10 @@ class Note {
   /// Stored as text rather than byte-offsets so they survive content edits.
   List<String> collapsedHeadings;
 
+  /// Chaves do frontmatter do .md além de `id` (ex.: `tags` de uma nota vinda
+  /// do Obsidian). Só são preservadas: o app grava `id` + estas chaves.
+  Map<String, dynamic> frontExtra;
+
   Note({
     required this.id,
     required this.type,
@@ -1471,8 +1506,10 @@ class Note {
     DateTime? updatedAt,
     this.folderId,
     List<String>? collapsedHeadings,
+    Map<String, dynamic>? frontExtra,
   }) : updatedAt = updatedAt ?? DateTime.now(),
-       collapsedHeadings = collapsedHeadings ?? [];
+       collapsedHeadings = collapsedHeadings ?? [],
+       frontExtra = frontExtra ?? {};
 }
 
 // ── Note folder (common notes only) ──────────────────────────────────────────
@@ -3239,6 +3276,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
       0; // elapsed seconds in the interrupted phase
   bool _settingsNotesExpanded = false;
   bool _settingsCanvasExpanded = false;
+  bool _settingsAutosaveExpanded = false;
+  bool _settingsNewCardExpanded = false;
+  bool _settingsPlannerExpanded = false;
 
   // ── Canvas Time Gradation / Gantt-Like Diagram ───────────────────────────
   bool _ganttEnabled = false;
@@ -3288,6 +3328,23 @@ class _ResizableScreenState extends State<ResizableScreen> {
   int _firstDayOfWeek = 1; // 1=Monday … 7=Sunday
   int _nextDayStartHour = 0; // 0 = midnight
   String _taskDescTemplate = '';
+
+  // ── General: autosave & notifications ─────────────────────────────────────
+  static const List<int> _autoSaveOptions = [1, 3, 10, 30];
+  static const List<int> _snackBarOptions = [0, 2, 4, 6, 10];
+  static const List<int> _plannerDayOptions = [1, 2, 3, 4, 5, 6, 7, 10, 14];
+  int _autoSaveSeconds = 3; // one of _autoSaveOptions
+  bool _autoSaveBusy = false; // guards against overlapping periodic saves
+  int _snackBarSeconds = 0; // 0 = automatic (per message), else fixed seconds
+
+  // ── Canvas: default size of NEW task cards ────────────────────────────────
+  double _newCardWidth = 250;
+  double _newCardHeight = 250;
+
+  // ── Planner / Schedule ────────────────────────────────────────────────────
+  int _plannerDefaultDays = 7; // columns shown at default zoom
+  int _plannerStartHour = 0; // first hour that can be scrolled to (0–23)
+  int _plannerEndHour = 24; // end of the visible range (1–24)
 
   // ── Time Tracking ─────────────────────────────────────────────────────────
   int _defaultTimeEstimateMin = 0;
@@ -3472,10 +3529,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
   // Sidebar Navigation State
   bool _isSettingsView = false;
   String _settingsSection =
-      'general'; // general | tasks | notes | canvas | projects | preferences
+      'general'; // general | tasks | notes | canvas | visualizers | projects
   bool _isTasksView = false;
   bool _isNotesView = false;
   bool _isVisualizerView = false;
+  bool _isFilesView = false; // Files tab (TagSpaces-style)
+  FilesController? _filesController;
+  String _filesControllerWsId = '';
   // Visualizer
   String _visualizerSection = ''; // id de um tipo raiz de entidade | 'works' | 'personal_memory'
   String _visualizerPersonSearch = '';
@@ -3510,6 +3570,15 @@ class _ResizableScreenState extends State<ResizableScreen> {
   Note?   _personFileNote;      // in-memory Note for the _NotesEditor
   // Notes
   final Map<String, Note> _notes = {}; // noteId → Note
+
+  // ── Referências [[id|Título]] (ver refs.dart / refs_ui.dart) ──────────────
+  late final RefsController _refs = RefsController()
+    ..onOpen = _openRefTarget
+    ..onRefreshEntities = _refreshEntityRefs
+    ..onRegenerateId = _regenerateEntityId;
+  int? _refsNotesSig;
+  bool _refsEntitiesBusy = false;
+  DateTime _refsEntitiesAt = DateTime.fromMillisecondsSinceEpoch(0);
   final Map<String, NoteFolder> _noteFolders = {}; // folderId → NoteFolder
   String? _activeNoteId;
   bool _notesDetailOpen = false; // sidebar detail panel for task/project notes
@@ -3574,6 +3643,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
   // Sort / Group / Filter state
   bool _filterSidebarOpen = false;
+  // F/G/S applied to the Projects / Tags LISTS in the Tasks left sidebar.
+  final _SidebarListFgs _projListFgs = _SidebarListFgs();
+  final _SidebarListFgs _tagListFgs = _SidebarListFgs();
+  final TextEditingController _projFgsNameCtrl = TextEditingController();
+  final TextEditingController _tagFgsNameCtrl = TextEditingController();
   // Collapsible section state for the Filter/Group/Sort sidebar
   bool _fgsSectionFilterCollapsed = false;
   bool _fgsSectionGroupCollapsed = false;
@@ -3893,23 +3967,38 @@ class _ResizableScreenState extends State<ResizableScreen> {
       _showSwitchWorkspaceDialog(allowDismiss: false);
     });
 
-    // Autosave timer set to trigger every 3 seconds to save layout/modifications
-    _autoSaveTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      _saveWorkspace();
-    });
+    // Autosave timer (interval is a user setting: Settings → General).
+    _restartAutoSaveTimer();
 
-    // Schedule view init
-    final now = DateTime.now();
-    final weekday = now.weekday; // 1=Mon
-    _scheduleWeekStart = DateTime(now.year, now.month, now.day - (weekday - 1));
+    // Schedule view init (first day of the week follows the user setting)
+    _scheduleWeekStart = AppPrefs.weekStartOf(DateTime.now());
+  }
+
+  /// (Re)starts the periodic autosave using [_autoSaveSeconds].
+  void _restartAutoSaveTimer() {
+    _autoSaveTimer?.cancel();
+    _autoSaveTimer = Timer.periodic(Duration(seconds: _autoSaveSeconds), (
+      _,
+    ) async {
+      if (_autoSaveBusy) return; // previous save still running
+      _autoSaveBusy = true;
+      try {
+        await _saveWorkspace();
+      } finally {
+        _autoSaveBusy = false;
+      }
+    });
   }
 
   @override
   void dispose() {
     _autoSaveTimer?.cancel();
+    _filesController?.dispose(); // flushes pending .ts sidecar writes
     _taskTimer?.cancel();
     _generalTimer?.cancel();
     _generalOverlayEntry?.remove();
+    _projFgsNameCtrl.dispose();
+    _tagFgsNameCtrl.dispose();
     _canvasNameController.dispose();
     _categoriesGroupNameController.dispose();
     _notesOrgTasksSearchCtrl.dispose();
@@ -4966,12 +5055,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
       if (mounted) Navigator.of(context, rootNavigator: true).pop();
       messenger.showSnackBar(
-        SnackBar(content: Text('Exported to $outPath')),
+        SnackBar(
+          duration: snackDur(const Duration(seconds: 4)), content: Text('Exported to $outPath')),
       );
     } catch (e, st) {
       debugPrint('_exportScheduleDay failed: $e\n$st');
       if (mounted) Navigator.of(context, rootNavigator: true).pop();
-      messenger.showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      messenger.showSnackBar(SnackBar(
+          duration: snackDur(const Duration(seconds: 4)), content: Text('Export failed: $e')));
     }
   }
 
@@ -5145,7 +5236,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           }),
           _tasksIconBtn(Icons.today_outlined, 'Today', () {
             final n = DateTime.now();
-            final newStart = DateTime(n.year, n.month, n.day - (n.weekday - 1));
+            final newStart = AppPrefs.weekStartOf(n);
             _scheduleCanvasKey.currentState?.navigateTo(newStart);
             setState(() {
               _scheduleWeekStart = newStart;
@@ -5612,6 +5703,128 @@ class _ResizableScreenState extends State<ResizableScreen> {
   String _wsMetaDir(String id) => '${_wsRoot(id)}/metadata';
   String _workspaceFilePath(String id) =>
       '${_wsMetaDir(id)}/workspace_$id.json';
+
+  // ── Workspace manifest: <root>/.cc/workspace.yaml ───────────────────────
+  // Identidade do workspace que viaja com a pasta (HD externo, cópia, etc.).
+  // Só o app grava; chaves desconhecidas são preservadas. O `workspace_id` é
+  // o mesmo id de `workspace_<id>.json`, então nada muda para o que já existe.
+  static const int _kWorkspaceSchema = 1;
+  String _manifestNameWritten = '';
+
+  // Estado de interface (cache local): o que já foi gravado, para não regravar.
+  String _uiWritten = '';
+  String _foldsWritten = '';
+
+  String _wsManifestPath(String id) => '${_wsRoot(id)}/.cc/workspace.yaml';
+
+  /// Cria `.cc/workspace.yaml` se não existir; mantém `name` sincronizado.
+  /// Nunca sobrescreve um manifesto cujo `workspace_id` seja outro (pasta
+  /// copiada): só registra no log, a detecção de duplicata vem depois.
+  Future<void> _ensureWorkspaceManifest() async {
+    if (_workspaceId.isEmpty) return;
+    CcData.workspaceId = _workspaceId; // refs de relações levam o workspace
+    try {
+      final root = _wsRoot(_workspaceId);
+      // Não cria a raiz: com o HD desconectado o caminho não existe e criá-lo
+      // geraria uma pasta fantasma no disco do PC.
+      if (!await Directory(root).exists()) return;
+      final f = File(_wsManifestPath(_workspaceId));
+      _manifestNameWritten = _workspaceName;
+      if (await f.exists()) {
+        final text = await f.readAsString();
+        final doc = loadYaml(text);
+        if (doc is YamlMap) {
+          final mid = WorkspaceManifest.parse(text)?.id ??
+              (doc['workspace_id'] ?? '').toString();
+          if (mid.isNotEmpty && mid != _workspaceId) {
+            debugPrint(
+              'WORKSPACE MANIFEST: workspace_id $mid != $_workspaceId '
+              '(pasta copiada?) — manifesto preservado',
+            );
+            return;
+          }
+          if ((doc['name'] ?? '').toString() == _workspaceName) return;
+          // Só a linha `name:` muda; o resto do arquivo fica intacto.
+          final line = 'name: ${jsonEncode(_workspaceName)}';
+          final re = RegExp(r'^name:.*$', multiLine: true);
+          final next = re.hasMatch(text)
+              ? text.replaceFirstMapped(re, (_) => line)
+              : '$text${text.endsWith('\n') ? '' : '\n'}$line\n';
+          await _writeAtomic(f, next);
+          return;
+        }
+      }
+      final body = StringBuffer()
+        ..writeln('workspace_id: ${jsonEncode(_workspaceId)}')
+        ..writeln('name: ${jsonEncode(_workspaceName)}')
+        ..writeln('schema: $_kWorkspaceSchema')
+        ..writeln('created: ${DateTime.now().toUtc().toIso8601String()}');
+      await _writeAtomic(f, body.toString());
+    } catch (e) {
+      debugPrint('_ensureWorkspaceManifest ERROR: $e');
+    }
+  }
+
+  /// Workspaces anexados a este (`.cc/attached.yaml`) e o estado de montagem.
+  Future<void> _loadAttachedWorkspaces() async {
+    if (_workspaceId.isEmpty) return;
+    try {
+      await AttachedWorkspaces.instance.load(
+        _wsRoot(_workspaceId),
+        _workspaceId,
+      );
+      if (!_attachedHooked) {
+        _attachedHooked = true;
+        AttachedWorkspaces.instance.revision.addListener(_onAttachedChanged);
+      }
+      unawaited(_refreshEntityRefs(force: true));
+    } catch (e) {
+      debugPrint('_loadAttachedWorkspaces ERROR: $e');
+    }
+  }
+
+  bool _attachedHooked = false;
+
+  /// Um anexo ligou/desligou (ou a lista mudou): refaz o índice (cinza ↔ normal).
+  void _onAttachedChanged() {
+    if (!mounted) return;
+    RelationIndex.touch();
+    setState(() => _entityTabRefresh++);
+    unawaited(_refreshEntityRefs(force: true));
+  }
+
+  /// Registros de propriedades e views do workspace aberto.
+  Future<void> _loadWorkspaceRegistries() async {
+    if (_workspaceId.isEmpty) return;
+    try {
+      final root = _wsRoot(_workspaceId);
+      await PropertyRegistry.instance.load(
+        root,
+        scanFilesDir: _wsFilesDir(_workspaceId),
+      );
+      await ViewsStore.instance.load(root);
+    } catch (e) {
+      debugPrint('_loadWorkspaceRegistries ERROR: $e');
+    }
+  }
+
+  /// Carrega o registro de predicados do workspace aberto.
+  Future<void> _loadPredicateRegistry() async {
+    if (_workspaceId.isEmpty) return;
+    try {
+      await PredicateRegistry.instance.load(_wsRoot(_workspaceId));
+    } catch (e) {
+      debugPrint('_loadPredicateRegistry ERROR: $e');
+    }
+  }
+
+  /// Grava via arquivo temporário + rename (o disco pode sumir no meio).
+  Future<void> _writeAtomic(File f, String content) async {
+    await f.parent.create(recursive: true);
+    final tmp = File('${f.path}.tmp');
+    await tmp.writeAsString(content);
+    await tmp.rename(f.path);
+  }
 
   // files/ — portable user content
   String _wsFilesDir(String id) => '${_wsRoot(id)}/files';
@@ -6502,6 +6715,15 @@ class _ResizableScreenState extends State<ResizableScreen> {
         'firstDayOfWeek': _firstDayOfWeek,
         'nextDayStartHour': _nextDayStartHour,
         'taskDescTemplate': _taskDescTemplate,
+        'autoSaveSeconds': _autoSaveSeconds,
+        'snackBarSeconds': _snackBarSeconds,
+        'newCardWidth': _newCardWidth,
+        'newCardHeight': _newCardHeight,
+        'plannerDefaultDays': _plannerDefaultDays,
+        'plannerStartHour': _plannerStartHour,
+        'plannerEndHour': _plannerEndHour,
+        'projListFgs': _projListFgs.toJson(),
+        'tagListFgs': _tagListFgs.toJson(),
         'defaultTimeEstimateMin': _defaultTimeEstimateMin,
         'defaultSubTimeEstimateMin': _defaultSubTimeEstimateMin,
         'trackNextOnDone': _trackNextOnDone,
@@ -6575,6 +6797,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         'isNotesView': _isNotesView,
         'isSettingsView': _isSettingsView,
         'isVisualizerView': _isVisualizerView,
+        'isFilesView': _isFilesView,
         'tasksNavSection': _tasksNavSection,
         'notesNavSection': _notesNavSection,
         'noteCommonFolderOrder': _noteCommonFolderOrder,
@@ -6587,9 +6810,33 @@ class _ResizableScreenState extends State<ResizableScreen> {
         'fgsPlannerSortCollapsed': _fgsPlannerSortCollapsed,
       };
 
+      // Estado de interface não pertence ao workspace: vai para o cache local.
+      final ui = <String, dynamic>{
+        for (final k in kUiStateKeys)
+          if (data.containsKey(k)) k: data[k],
+      };
+      for (final k in kUiStateKeys) {
+        data.remove(k);
+      }
+
       final wsFile = File(_workspaceFilePath(_workspaceId));
       await wsFile.parent.create(recursive: true);
+      // Cópia única do arquivo no formato anterior (com as chaves de interface).
+      final bak = File('${wsFile.path}.pre-phase5.bak');
+      if (!await bak.exists() && await wsFile.exists()) {
+        try {
+          await wsFile.copy(bak.path);
+        } catch (_) {}
+      }
       await wsFile.writeAsString(jsonEncode(data));
+      final uiJson = jsonEncode(ui);
+      if (uiJson != _uiWritten) {
+        _uiWritten = uiJson;
+        unawaited(LocalState.update(_workspaceId, (m) => m.addAll(ui)));
+      }
+      if (_workspaceName != _manifestNameWritten) {
+        unawaited(_ensureWorkspaceManifest());
+      }
     } catch (e) {
       debugPrint('AUTOSAVE ERROR: $e');
     }
@@ -6810,6 +7057,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     // Load workspace config and notes
     await _loadWorkspace();
+    await _ensureWorkspaceManifest();
+    await _loadPredicateRegistry();
+    await _loadWorkspaceRegistries();
+    await _loadAttachedWorkspaces();
     await _loadNotes();
     await _syncProjectsFromFilesystem(); // import folders in files/ as projects
     await _syncProjectDirs(); // ensure files/<project>/{tasks,common,workspace}/ exist
@@ -6864,10 +7115,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
   /// is re-applied so task cards that were already on the canvas reappear.
   Future<void> _loadTasksFromIndex(Map<String, dynamic> rawIndex) async {
     final today = DateTime.now();
-    // Monday of the current week (weekday == 1).
-    final weekStart = DateTime(today.year, today.month, today.day)
-        .subtract(Duration(days: today.weekday - 1));
-    // Sunday of the current week (weekday == 7).
+    // First day of the current week (per Settings → First day of the week).
+    final weekStart = AppPrefs.weekStartOf(today);
+    // Last day of the current week.
     final weekEnd = weekStart.add(const Duration(days: 6));
 
     final filesDir = _wsFilesDir(_workspaceId);
@@ -7135,10 +7385,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
   ///
   /// Idempotent — safe to call when the week is already fully loaded.
   Future<void> _loadWeekTasks(DateTime anyDayInWeek) async {
-    // Normalise to Monday of the requested week.
-    final d = anyDayInWeek;
-    final weekStart =
-        DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
+    // Normalise to the first day of the requested week.
+    final weekStart = AppPrefs.weekStartOf(anyDayInWeek);
     final weekEnd = weekStart.add(const Duration(days: 6));
 
     final filesDir = _wsFilesDir(_workspaceId);
@@ -7620,6 +7868,18 @@ class _ResizableScreenState extends State<ResizableScreen> {
       final data =
           jsonDecode(await file.readAsString()) as Map<String, dynamic>;
 
+      // Estado de interface vem do cache local desta máquina. Sem ele (primeira
+      // abertura aqui, ou workspace no formato antigo) valem as chaves que o
+      // arquivo do workspace ainda tiver.
+      final localUi = await LocalState.read(_workspaceId);
+      for (final k in kUiStateKeys) {
+        if (localUi.containsKey(k)) data[k] = localUi[k];
+      }
+      _uiWritten = jsonEncode(<String, dynamic>{
+        for (final k in kUiStateKeys)
+          if (data.containsKey(k)) k: data[k],
+      });
+
       setState(() {
         // Identity
         if (data['workspaceName'] != null) {
@@ -7783,9 +8043,47 @@ class _ResizableScreenState extends State<ResizableScreen> {
         AppClock.offsetMinutes = _timezoneOffsetMinutes;
         AppClock.clockDeltaMs = _clockDeltaMs;
         _markParentDoneOnSubtasks = data['markParentDoneOnSubtasks'] ?? false;
-        _firstDayOfWeek = data['firstDayOfWeek'] ?? 1;
+        _firstDayOfWeek = ((data['firstDayOfWeek'] as num?)?.toInt() ?? 1)
+            .clamp(1, 7);
+        if (AppPrefs.firstDayOfWeek != _firstDayOfWeek) {
+          AppPrefs.firstDayOfWeek = _firstDayOfWeek;
+          // The schedule was initialised with the default week start.
+          _scheduleWeekStart = AppPrefs.weekStartOf(DateTime.now());
+        }
         _nextDayStartHour = data['nextDayStartHour'] ?? 0;
         _taskDescTemplate = data['taskDescTemplate'] ?? '';
+        final loadedAutoSave = (data['autoSaveSeconds'] as num?)?.toInt() ?? 3;
+        _autoSaveSeconds =
+            _autoSaveOptions.contains(loadedAutoSave) ? loadedAutoSave : 3;
+        _restartAutoSaveTimer();
+        final loadedSnack = (data['snackBarSeconds'] as num?)?.toInt() ?? 0;
+        _snackBarSeconds = _snackBarOptions.contains(loadedSnack) ? loadedSnack : 0;
+        AppPrefs.snackBarSeconds = _snackBarSeconds;
+        _newCardWidth =
+            ((data['newCardWidth'] as num?)?.toDouble() ?? 250.0)
+                .clamp(160.0, 1200.0);
+        _newCardHeight =
+            ((data['newCardHeight'] as num?)?.toDouble() ?? 250.0)
+                .clamp(100.0, 1200.0);
+        AppPrefs.newCardWidth = _newCardWidth;
+        AppPrefs.newCardHeight = _newCardHeight;
+        final loadedDays = (data['plannerDefaultDays'] as num?)?.toInt() ?? 7;
+        _plannerDefaultDays =
+            _plannerDayOptions.contains(loadedDays) ? loadedDays : 7;
+        _plannerStartHour =
+            ((data['plannerStartHour'] as num?)?.toInt() ?? 0).clamp(0, 22);
+        _plannerEndHour =
+            ((data['plannerEndHour'] as num?)?.toInt() ?? 24).clamp(1, 24);
+        if (_plannerEndHour - _plannerStartHour < 2) {
+          _plannerStartHour = 0;
+          _plannerEndHour = 24;
+        }
+        if (data['projListFgs'] is Map) {
+          _projListFgs.applyJson(Map<String, dynamic>.from(data['projListFgs'] as Map));
+        }
+        if (data['tagListFgs'] is Map) {
+          _tagListFgs.applyJson(Map<String, dynamic>.from(data['tagListFgs'] as Map));
+        }
         _defaultTimeEstimateMin = data['defaultTimeEstimateMin'] ?? 0;
         _defaultSubTimeEstimateMin = data['defaultSubTimeEstimateMin'] ?? 0;
         _trackNextOnDone = data['trackNextOnDone'] ?? false;
@@ -8008,6 +8306,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
           _isSettingsView = data['isSettingsView'] as bool;
         if (data['isVisualizerView'] != null)
           _isVisualizerView = data['isVisualizerView'] as bool;
+        if (data['isFilesView'] != null)
+          _isFilesView = data['isFilesView'] as bool;
         if (data['tasksNavSection'] != null)
           _tasksNavSection = data['tasksNavSection'] as String;
         if (data['notesNavSection'] != null)
@@ -9429,7 +9729,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               style: const TextStyle(fontSize: 12),
             ),
             backgroundColor: const Color(0xFF8B0000),
-            duration: const Duration(seconds: 6),
+            duration: snackDur(const Duration(seconds: 6)),
           ),
         );
       }
@@ -9994,8 +10294,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
           // ── Region 2: Canvas tabs / Tasks title ───────────────────────────
           if (_isTasksView) ...[Expanded(child: _buildTasksTitleBar())],
           if (_isNotesView) ...[Expanded(child: _buildNotesTitleBar())],
+          if (_isFilesView) ...[Expanded(child: _buildFilesTitleBar())],
           // ── Region 2: Canvas tabs — reorderable ───────────────────────────
-          if (!_isTasksView && !_isNotesView && !_isVisualizerView) ...[
+          if (!_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView) ...[
             // Builder lets us compute openTabs once and share it between
             // onReorder and the children list without leaving the Row.
             Builder(
@@ -10342,20 +10643,20 @@ class _ResizableScreenState extends State<ResizableScreen> {
             ),
           ],
 
-          // ── Region 3: Window controls (+ Profile/Files switcher when Visualizer is active) ──
+          // ── Region 3: Window controls (+ instance tabs, e.g. Profile/Files, when Visualizers is active AND an instance is selected) ──
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               if (_isVisualizerView &&
                   !_isTasksView &&
                   !_isNotesView &&
-                  !_isSettingsView) ...[
+                  !_isSettingsView &&
+                  _visualizerSelectedPath.isNotEmpty &&
+                  _entityLocator.locate(_visualizerSelectedPath) != null) ...[
                 const SizedBox(width: 6),
                 Builder(builder: (_) {
-                  final tbLoc = _visualizerSelectedPath.isEmpty
-                      ? null
-                      : _entityLocator.locate(_visualizerSelectedPath);
-                  final enabled = tbLoc != null || _visualizerSelectedPath.isEmpty;
+                  final tbLoc = _entityLocator.locate(_visualizerSelectedPath);
+                  const enabled = true;
                   final tbTabs = tbLoc?.pattern.tabs ??
                       const <TabDef>[
                         TabDef(id: 'profile', kind: 'profile', title: 'Profile'),
@@ -10726,6 +11027,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 _sectionSortAsc.clear();
                 _isSettingsView = false;
                 _isVisualizerView = false;
+                _isFilesView = false;
               }
             });
             _saveGeneral();
@@ -11414,6 +11716,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                           ? _buildNotesMainArea()
                                           : _isVisualizerView
                                           ? _buildVisualizerMainArea()
+                                          : _isFilesView
+                                          ? _buildFilesMainArea()
                                           : _workspaceId.isEmpty
                                           ? _buildNoWorkspacePlaceholder()
                                           : _showCatGroupSettings
@@ -11463,7 +11767,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                             ),
                                     ),
                                     // Thin Bottom Toggle Bar
-                                    if (!_isTasksView && !_isNotesView && !_isVisualizerView)
+                                    if (!_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView)
                                       Container(
                                         height: 32,
                                         decoration: BoxDecoration(
@@ -11709,7 +12013,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
             ],
           ),
           // ── Feature 6: Canvas Filter/Group/Sort panel ─────────────────────
-          if (_canvasFilterOpen && !_isTasksView && !_isNotesView && !_isVisualizerView)
+          if (_canvasFilterOpen && !_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView)
             Positioned(
               top: 4,
               right: (_showDetails ? 300 : 0) + 8,
@@ -11720,7 +12024,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               ),
             ),
           // ── Per-section Filter/Group/Sort panel ───────────────────────────
-          if (_activeSectionFilter != null && !_isTasksView && !_isNotesView && !_isVisualizerView)
+          if (_activeSectionFilter != null && !_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView)
             Positioned(
               top: 4,
               left: _sidebarWidth + 8,
@@ -11735,7 +12039,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
               !_isTasksView &&
               !_isNotesView &&
               !_isSettingsView &&
-              !_isVisualizerView)
+              !_isVisualizerView &&
+              !_isFilesView)
             Positioned(
               left: (_isVisible ? _sidebarWidth : 0) + 12,
               bottom: 42,
@@ -11751,7 +12056,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
               !_isTasksView &&
               !_isNotesView &&
               !_isSettingsView &&
-              !_isVisualizerView)
+              !_isVisualizerView &&
+              !_isFilesView)
             Positioned(
               right: (_showDetails ? 300 : 0) + 12,
               bottom: 42,
@@ -14144,6 +14450,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                               (_showDueDateOnCards ? 14.0 : 0) +
                               ((_showDueDateOnCards && hasTimeStr) ? 14.0 : 0) +
                               (_showCountdownOnCards && task.dueDay != null ? 14.0 : 0) +
+        (_showTimeOnCards && task.durationMinutes > 0 ? 14.0 : 0) +
                               (borderWidth * 2);
 
                           final double w = task.cardWidth;
@@ -14457,13 +14764,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                                       ScaffoldMessenger.of(
                                                         context,
                                                       ).showSnackBar(
-                                                        const SnackBar(
+                                                        SnackBar(
                                                           content: Text(
                                                             'Connection blocked: Path already exists.',
                                                           ),
-                                                          duration: Duration(
+                                                          duration: snackDur(Duration(
                                                             seconds: 2,
-                                                          ),
+                                                          )),
                                                         ),
                                                       );
                                                     }
@@ -14892,6 +15199,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                           (_showDueDateOnCards ? 14.0 : 0) +
                           ((_showDueDateOnCards && hasTimeStr) ? 14.0 : 0) +
                           (_showCountdownOnCards && task.dueDay != null ? 14.0 : 0) +
+        (_showTimeOnCards && task.durationMinutes > 0 ? 14.0 : 0) +
                           (borderWidth * 2));
 
                 double snapX = localInsideCard.dx.clamp(0.0, w);
@@ -15330,7 +15638,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
   Widget _buildGroupedSidebar() {
     final sp = AppTheme.of(context).colors;
     final bool isCanvasMode =
-        !_isSettingsView && !_isTasksView && !_isNotesView;
+        !_isSettingsView && !_isTasksView && !_isNotesView && !_isFilesView;
     // Categories / Projects / Search / Filter tools belong only to the
     // Canvases tab, not to the Visualizer.
     final bool showCanvasTools = isCanvasMode && !_isVisualizerView;
@@ -15662,6 +15970,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                               ? _buildNotesNavContent()
                               : _isVisualizerView
                               ? _buildVisualizerNavContent()
+                              : _isFilesView
+                              ? _buildFilesNavContent()
                               : _buildProjectListContent(),
                         ),
                       ),
@@ -15673,7 +15983,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           ),
 
           // Connection Point: The Selector sits directly on the Nav Icons
-          if (!_isSettingsView && !_isTasksView && !_isNotesView && !_isVisualizerView)
+          if (!_isSettingsView && !_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView)
             _buildCanvasSelector(),
 
           // Level 2: Navigation Icons Row
@@ -16103,6 +16413,24 @@ class _ResizableScreenState extends State<ResizableScreen> {
       final filesRoot = _wsFilesDir(_workspaceId);
 
       final newNotes = <String, Note>{};
+      // id → caminho relativo do .md que o ocupa (para resolver duplicatas).
+      final idToPath = <String, String>{};
+      // Dobras do editor: cache local (o notes_meta.json antigo ainda vale
+      // como reserva até o primeiro salvamento).
+      final localFoldsRaw = (await LocalState.read(_workspaceId))['noteFolds'];
+      final localFolds = localFoldsRaw is Map ? localFoldsRaw : const {};
+      // .md (caminho absoluto) → id que precisa ser gravado no frontmatter.
+      final stampJobs = <String, String>{};
+
+      String freshId(NoteType t) {
+        var ms = DateTime.now().millisecondsSinceEpoch;
+        var id = '${t.name}:$ms';
+        while (newNotes.containsKey(id)) {
+          ms++;
+          id = '${t.name}:$ms';
+        }
+        return id;
+      }
 
       // \u2500\u2500 Helper: parse one .md file into a Note \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
       Future<void> parseNote(
@@ -16111,7 +16439,17 @@ class _ResizableScreenState extends State<ResizableScreen> {
         String? linkedProjectId,
         String? folderId,
       ) async {
-        final rawContent = await entity.readAsString();
+        final rawFile = await entity.readAsString();
+        // Notas comuns e de projeto carregam o id no frontmatter. Notas de task
+        // têm frontmatter próprio (_saveTaskMd) e não passam por aqui.
+        var fm = <String, dynamic>{};
+        var rawContent = rawFile;
+        if (type != NoteType.task) {
+          fm = readFrontmatter(rawFile);
+          if (fm.isNotEmpty) rawContent = stripFrontmatter(rawFile);
+        }
+        final frontId = fm['id']?.toString();
+        final hasFrontId = frontId != null && frontId.isNotEmpty;
         String body = rawContent;
         final firstNewline = rawContent.indexOf('\n');
         if (firstNewline > 0) {
@@ -16131,12 +16469,17 @@ class _ResizableScreenState extends State<ResizableScreen> {
         final relativePath =
             entity.path.substring(filesRoot.length + 1).replaceAll('\\', '/');
         final sideMeta = meta[relativePath] as Map<String, dynamic>? ?? {};
-        final noteId =
-            sideMeta['id'] as String? ??
-            '${type.name}:${DateTime.now().millisecondsSinceEpoch}';
         final linkedTask = sideMeta['linkedTaskId'] as String?;
         final effectiveLinkedProject =
             sideMeta['linkedProjectId'] as String? ?? linkedProjectId;
+        // Prioridade: id do frontmatter (viaja com o arquivo) > id do
+        // notes_meta.json > id fixo da nota de projeto > id novo.
+        var noteId = hasFrontId
+            ? frontId!
+            : (sideMeta['id'] as String? ??
+                  (type == NoteType.project && effectiveLinkedProject != null
+                      ? 'proj:$effectiveLinkedProject'
+                      : freshId(type)));
         final updatedAt = sideMeta['updatedAt'] != null
             ? DateTime.fromMillisecondsSinceEpoch(sideMeta['updatedAt'] as int)
             : (await entity.stat()).modified;
@@ -16144,6 +16487,44 @@ class _ResizableScreenState extends State<ResizableScreen> {
         final collapsedHeadings = sideMeta['collapsedHeadings'] != null
             ? List<String>.from(sideMeta['collapsedHeadings'] as List)
             : <String>[];
+
+        final extra = Map<String, dynamic>.from(fm)..remove('id');
+
+        // Id duplicado (pasta ou nota copiada fora do app): sem isto uma das
+        // notas sumiria da lista. Vence quem é dono do id no notes_meta.json;
+        // empate, o caminho menor. A outra ganha um id novo, gravado no .md.
+        if (type != NoteType.task && newNotes.containsKey(noteId)) {
+          final priorPath = idToPath[noteId] ?? '';
+          final thisOwns = sideMeta['id'] == noteId;
+          final priorOwns =
+              (meta[priorPath] as Map<String, dynamic>?)?['id'] == noteId;
+          final thisWins = thisOwns != priorOwns
+              ? thisOwns
+              : relativePath.compareTo(priorPath) < 0;
+          debugPrint(
+            'NOTE ID DUPLICATE: $noteId em "$relativePath" e "$priorPath"',
+          );
+          if (thisWins) {
+            final prior = newNotes.remove(noteId)!;
+            final movedId = freshId(prior.type);
+            newNotes[movedId] = Note(
+              id: movedId,
+              type: prior.type,
+              title: prior.title,
+              content: prior.content,
+              linkedTaskId: prior.linkedTaskId,
+              linkedProjectId: prior.linkedProjectId,
+              updatedAt: prior.updatedAt,
+              folderId: prior.folderId,
+              collapsedHeadings: prior.collapsedHeadings,
+              frontExtra: prior.frontExtra,
+            );
+            idToPath[movedId] = priorPath;
+            stampJobs['$filesRoot/$priorPath'] = movedId;
+          } else {
+            noteId = freshId(type);
+          }
+        }
 
         newNotes[noteId] = Note(
           id: noteId,
@@ -16154,8 +16535,15 @@ class _ResizableScreenState extends State<ResizableScreen> {
           linkedProjectId: effectiveLinkedProject,
           updatedAt: updatedAt,
           folderId: effectiveFolderId,
-          collapsedHeadings: collapsedHeadings,
+          collapsedHeadings: localFolds[noteId] is List
+              ? List<String>.from(localFolds[noteId] as List)
+              : collapsedHeadings,
+          frontExtra: extra,
         );
+        idToPath[noteId] = relativePath;
+        if (type != NoteType.task && (!hasFrontId || frontId != noteId)) {
+          stampJobs[entity.path] = noteId;
+        }
       }
 
       // \u2500\u2500 Scan inbox at files/Inbox/ \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -16245,10 +16633,73 @@ class _ResizableScreenState extends State<ResizableScreen> {
         }
       }
 
+      if (_kStampNoteIds && stampJobs.isNotEmpty) {
+        await _stampNoteIds(stampJobs);
+      }
+
       setState(() => _notes.addAll(newNotes));
     } catch (e, st) {
       debugPrint('_loadNotes ERROR: $e\n$st');
     }
+  }
+
+  // ── Id da nota no frontmatter do .md (notas comuns e de projeto) ───────────
+  //
+  // O id viaja dentro do arquivo: renomear ou mover o .md por fora do app não
+  // quebra os links [[id|Título]]. O notes_meta.json continua guardando pasta,
+  // ordem e dobras. O título continua sendo o nome do arquivo.
+
+  /// Gravar o id no frontmatter dos .md existentes ao abrir o workspace.
+  /// Só acrescenta o bloco `---`; o corpo do arquivo não é alterado.
+  static const bool _kStampNoteIds = true;
+
+  /// Texto final de um .md de nota: frontmatter (id + chaves preservadas) e
+  /// em seguida o corpo.
+  String _composeNoteText(Note n) =>
+      '${_writeFrontmatter(<String, dynamic>{'id': n.id, ...n.frontExtra})}'
+      '${n.content}';
+
+  /// Grava [id] no frontmatter de [path] sem mexer no corpo. Preserva a data
+  /// de modificação (o `updatedAt` das notas sem meta vem dela).
+  Future<void> _stampNoteId(String path, String id) async {
+    final f = File(path);
+    final text = await f.readAsString();
+    final modified = (await f.stat()).modified;
+    final fm = readFrontmatter(text);
+    final String out;
+    if (fm.isNotEmpty) {
+      final merged = <String, dynamic>{'id': id, ...fm}..['id'] = id;
+      out = '${_writeFrontmatter(merged)}${stripFrontmatter(text)}';
+    } else {
+      out = '${_writeFrontmatter(<String, dynamic>{'id': id})}$text';
+    }
+    await _writeAtomic(f, out);
+    try {
+      await f.setLastModified(modified);
+    } catch (_) {}
+  }
+
+  Future<void> _stampNoteIds(Map<String, String> jobs) async {
+    try {
+      // Cópia única do notes_meta.json antes da primeira alteração em massa.
+      final meta = File(_notesMetaPath);
+      final bak = File('${_notesMetaPath}.pre-frontmatter.bak');
+      if (await meta.exists() && !await bak.exists()) {
+        await meta.copy(bak.path);
+      }
+    } catch (e) {
+      debugPrint('_stampNoteIds backup ERROR: $e');
+    }
+    var done = 0;
+    for (final e in jobs.entries) {
+      try {
+        await _stampNoteId(e.key, e.value);
+        done++;
+      } catch (err) {
+        debugPrint('_stampNoteId ERROR (${e.key}): $err');
+      }
+    }
+    debugPrint('_stampNoteIds: $done/${jobs.length} notas com id no frontmatter');
   }
 
   /// Writes a note to its .md file and updates notes_meta.json.
@@ -16300,7 +16751,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
       // Spec §1-2: write body only — title lives in the filename and in
       // notes_meta.json.  No '# Title' header is injected.
-      await file.writeAsString(note.content);
+      // Notas abertas a partir de arquivos de entidade (person_file:) já trazem
+      // o próprio frontmatter no conteúdo: não ganham o id da nota por cima.
+      await file.writeAsString(
+        note.id.startsWith('person_file:')
+            ? note.content
+            : _composeNoteText(note),
+      );
       await _saveNotesMeta();
     } catch (e) {
       debugPrint('_saveNote ERROR: $e');
@@ -16337,9 +16794,22 @@ class _ResizableScreenState extends State<ResizableScreen> {
           'linkedProjectId': note.linkedProjectId,
           'updatedAt': note.updatedAt.millisecondsSinceEpoch,
           if (note.folderId != null) 'folderId': note.folderId,
-          if (note.collapsedHeadings.isNotEmpty)
-            'collapsedHeadings': note.collapsedHeadings,
         };
+      }
+
+      // Dobras do editor são estado de interface: cache local, por id da nota.
+      if (_workspaceId.isNotEmpty && _notes.isNotEmpty) {
+        final folds = <String, dynamic>{
+          for (final n in _notes.values)
+            if (n.collapsedHeadings.isNotEmpty) n.id: n.collapsedHeadings,
+        };
+        final foldsJson = jsonEncode(folds);
+        if (foldsJson != _foldsWritten) {
+          _foldsWritten = foldsJson;
+          unawaited(
+            LocalState.update(_workspaceId, (m) => m['noteFolds'] = folds),
+          );
+        }
       }
 
       final foldersJson = _noteFolders.values
@@ -17016,7 +17486,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
             _saveTaskToMeta(task);
             break;
           case 'sched_nextweek':
-            final nw = today.add(Duration(days: 8 - today.weekday));
+            final nwStart = AppPrefs.weekStartOf(today);
+            final nw = DateTime(nwStart.year, nwStart.month, nwStart.day + 7);
             setState(() => task.dueDay = nw.toIso8601String().split('T').first);
             _saveTaskToMeta(task);
             break;
@@ -17278,6 +17749,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
             if (!_openNoteTabs.contains(noteId)) _openNoteTabs.add(noteId);
             _activeNoteId = noteId;
             _isNotesView = true;
+            _isVisualizerView = false;
+            _isFilesView = false;
             _notesNavSection = 'editor';
           });
         } catch (e) {
@@ -17310,8 +17783,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
     }
     final note = _activeNoteId != null ? _notes[_activeNoteId] : null;
 
+    _syncRefsNotes();
     return _NotesEditor(
       key: ValueKey(_activeNoteId ?? '__empty__'),
+      refs: _refs,
       note: note,
       projects: _projects,
       projectIcons: _projectIcons,
@@ -17350,6 +17825,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         }
         // Update in-memory map without full setState to avoid editor rebuild
         _notes[updatedNote.id] = updatedNote;
+        _syncRefsNotes(); // backlinks/cores dos [[links]] acompanham o texto
       },
       onDeleteNote:
           _activeNoteId != null &&
@@ -19135,6 +19611,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
       projectColors: _projectColors,
       taskSessions: _taskSessions,
       execViewMode: _scheduleExecViewMode,
+      defaultVisibleDays: _plannerDefaultDays,
+      startHour: _plannerStartHour,
+      endHour: _plannerEndHour,
       onTaskUpdated: (task) {
         setState(() {});
         _saveTaskToMeta(task);
@@ -19770,8 +20249,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     }
 
     final today = AppClock.now();
-    final currentWeekStart = DateTime(today.year, today.month, today.day)
-        .subtract(Duration(days: today.weekday - 1));
+    final currentWeekStart = AppPrefs.weekStartOf(today);
     final currentWeekEnd = currentWeekStart.add(const Duration(days: 6));
 
     // ── Backfill past weeks ───────────────────────────────────────────────
@@ -19809,11 +20287,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
 
     if (seriesStart != null && seriesStart.isBefore(currentWeekStart)) {
       // Normalise to the Monday of the anchor's week.
-      DateTime pastWeekStart = DateTime(
-        seriesStart.year,
-        seriesStart.month,
-        seriesStart.day,
-      ).subtract(Duration(days: seriesStart.weekday - 1));
+      DateTime pastWeekStart = AppPrefs.weekStartOf(seriesStart);
 
       // Safety cap: never backfill more than 2 years of history.
       const maxBackfillDays = 730;
@@ -21142,6 +21616,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               () => _projectsSectionExpanded = !_projectsSectionExpanded,
             ),
             onAdd: _showCreateProjectDialog,
+            fgsActive: _projListFgs.isActive,
             onFilterGroupSort: () => setState(() {
               _filterSidebarTitle = 'All Projects';
               _filterSidebarOpen = true;
@@ -21154,6 +21629,30 @@ class _ResizableScreenState extends State<ResizableScreen> {
               const accent = Color(0xFF4FC3F7);
 
               final placedPids = {for (final s in _projectFolders.values) ...s};
+              // F/G/S helpers (Projects header) — operate on the listed items.
+              bool isActiveStatus(Task t) =>
+                  t.status != TaskStatus.done &&
+                  t.status != TaskStatus.cancelled;
+              final fgsToday = DateTime(
+                DateTime.now().year,
+                DateTime.now().month,
+                DateTime.now().day,
+              );
+              int projOpen(String pid) => rootTasks
+                  .where((t) => t.projectId == pid && isActiveStatus(t))
+                  .length;
+              int projOverdue(String pid) => rootTasks.where((t) {
+                    if (t.projectId != pid || !isActiveStatus(t)) return false;
+                    final sd = t.scheduledDate;
+                    return sd != null && sd.isBefore(fgsToday);
+                  }).length;
+              List<String> fgsProj(Iterable<String> pids) => _applyListFgs(
+                _projListFgs,
+                pids,
+                open: projOpen,
+                overdue: projOverdue,
+                label: (pid) => _projects[pid]?.title ?? pid,
+              );
               final unfoldered = _projectOrder
                   .where(
                     (pid) {
@@ -21169,6 +21668,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     },
                   )
                   .toList();
+              final unfolderedFiltered = fgsProj(unfoldered);
 
               // ── Elevated drag feedback (shared with Tags section) ──────
               Widget projFeedback(String title) => Material(
@@ -21276,7 +21776,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               const standardKey = '__standard__';
               final allProjFolderKeys = <String>[
                 ..._projectFolders.keys,
-                if (unfoldered.isNotEmpty) standardKey,
+                if (unfolderedFiltered.isNotEmpty) standardKey,
               ];
 
               // Reconcile _projectFolderOrder: keep saved positions, append
@@ -21302,6 +21802,19 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 final isCollapsed = _collapsedNavProjectFolders.contains(
                   folderName,
                 );
+                final namedFolderPids = fgsProj(
+                  folderPids
+                      .where((pid) => _projects.containsKey(pid))
+                      .where(
+                        (pid) =>
+                            !(_projectHiddenFromMenu[pid] ?? false) ||
+                            _showHiddenProjects,
+                      ),
+                );
+                // While filtering, folders with no match are hidden.
+                if (_projListFgs.filterActive && namedFolderPids.isEmpty) {
+                  return const SizedBox.shrink();
+                }
                 return DragTarget<String>(
                   key: ValueKey('proj_folder_named_$folderName'),
                   onWillAcceptWithDetails: (d) =>
@@ -21335,15 +21848,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       });
                       unawaited(_saveWorkspace());
                     },
-                    children: folderPids
-                        .where((pid) => _projects.containsKey(pid))
-                        .where(
-                          (pid) =>
-                              !(_projectHiddenFromMenu[pid] ?? false) ||
-                              _showHiddenProjects,
-                        )
-                        .map(projItem)
-                        .toList(),
+                    children: namedFolderPids.map(projItem).toList(),
                   ),
                 );
               }
@@ -21354,13 +21859,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   standardKey,
                 );
                 final standardChildren = <Widget>[];
-                for (int i = 0; i <= unfoldered.length; i++) {
-                  final insertPos = i < unfoldered.length
-                      ? _projectOrder.indexOf(unfoldered[i])
+                for (int i = 0; i <= unfolderedFiltered.length; i++) {
+                  final insertPos = i < unfolderedFiltered.length
+                      ? _projectOrder.indexOf(unfolderedFiltered[i])
                       : _projectOrder.length;
                   standardChildren.add(reorderStrip(insertPos));
-                  if (i < unfoldered.length) {
-                    standardChildren.add(projItem(unfoldered[i]));
+                  if (i < unfolderedFiltered.length) {
+                    standardChildren.add(projItem(unfolderedFiltered[i]));
                   }
                 }
                 return DragTarget<String>(
@@ -21394,6 +21899,35 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     children: standardChildren,
                   ),
                 );
+              }
+
+              // ── Flat list when "Group by folders" is off ───────────────
+              if (!_projListFgs.groupByFolder) {
+                final hiddenFolderPids = <String>{
+                  for (final e in _projectFolders.entries)
+                    if (_hiddenProjectFolders.contains(e.key)) ...e.value,
+                };
+                final flat = fgsProj(
+                  {
+                    ..._projectOrder,
+                    for (final s in _projectFolders.values) ...s,
+                  }.where((pid) {
+                    if (!_projects.containsKey(pid)) return false;
+                    if (hiddenFolderPids.contains(pid)) return false;
+                    if ((_projectHiddenFromMenu[pid] ?? false) &&
+                        !_showHiddenProjects) return false;
+                    if (!placedPids.contains(pid) &&
+                        _hiddenProjectFolders.contains(standardKey)) {
+                      return false;
+                    }
+                    if (_tasksNavSearchQuery.isNotEmpty) {
+                      final title = (_projects[pid]?.title ?? '').toLowerCase();
+                      if (!title.contains(_tasksNavSearchQuery)) return false;
+                    }
+                    return true;
+                  }),
+                );
+                return Column(children: flat.map(projItem).toList());
               }
 
               // ── ReorderableListView wrapping all folder groups ─────────
@@ -21437,6 +21971,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
             onToggle: () =>
                 setState(() => _tagsSectionExpanded = !_tagsSectionExpanded),
             onAdd: _showCreateTagDialog,
+            fgsActive: _tagListFgs.isActive,
             onFilterGroupSort: () => setState(() {
               _filterSidebarTitle = 'All Tags';
               _filterSidebarOpen = true;
@@ -21459,6 +21994,30 @@ class _ResizableScreenState extends State<ResizableScreen> {
               final unfolderedTags = allTagStrings
                   .where((t) => !placedTags.contains(t))
                   .toSet();
+              // F/G/S helpers (Tags header) — operate on the listed tags.
+              bool tagActive(Task t) =>
+                  t.status != TaskStatus.done &&
+                  t.status != TaskStatus.cancelled;
+              final tagToday = DateTime(
+                DateTime.now().year,
+                DateTime.now().month,
+                DateTime.now().day,
+              );
+              int tagOpen(String tag) => rootTasks
+                  .where((t) => t.tagIds.contains(tag) && tagActive(t))
+                  .length;
+              int tagOverdue(String tag) => rootTasks.where((t) {
+                    if (!t.tagIds.contains(tag) || !tagActive(t)) return false;
+                    final sd = t.scheduledDate;
+                    return sd != null && sd.isBefore(tagToday);
+                  }).length;
+              List<String> fgsTag(Iterable<String> tags) => _applyListFgs(
+                _tagListFgs,
+                tags.where((t) => !_hiddenTags.contains(t)),
+                open: tagOpen,
+                overdue: tagOverdue,
+                label: (t) => t,
+              );
 
               // ── Elevated drag feedback ──────────────────────────────────
               Widget tagFeedback(String tag) => Material(
@@ -21622,9 +22181,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                             _tagOrder.removeWhere(
                               (t) => !unfolderedTags.contains(t),
                             );
-                            final ordered = _tagOrder
-                                .where((t) => !_hiddenTags.contains(t))
-                                .toList();
+                            final ordered = fgsTag(_tagOrder);
                             return <Widget>[
                               for (int i = 0; i <= ordered.length; i++) ...[
                                 tagReorderStrip(i),
@@ -21632,7 +22189,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                               ],
                             ];
                           }()
-                        : tags.map(tagNavItem).toList(),
+                        : fgsTag(tags).map(tagNavItem).toList(),
                   ),
                 );
               }
@@ -21677,6 +22234,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     }
                     final boardTags = _tagFolders[boardName] ?? {};
                     if (boardTags.isEmpty) return const SizedBox.shrink();
+                    if (_tagListFgs.filterActive && fgsTag(boardTags).isEmpty) {
+                      return const SizedBox.shrink();
+                    }
                     return tagFolderWidget(
                       folderKey: boardName,
                       tags: boardTags,
@@ -21694,6 +22254,28 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 ],
               ];
 
+              // ── Flat list when "Group by folders" is off ────────────────
+              if (!_tagListFgs.groupByFolder) {
+                final hiddenFolderTags = <String>{
+                  for (final e in _tagFolders.entries)
+                    if (_hiddenTagFolders.contains(e.key)) ...e.value,
+                };
+                final flatTags = fgsTag(
+                  allTagStrings.where((t) {
+                    if (hiddenFolderTags.contains(t)) return false;
+                    if (!placedTags.contains(t) &&
+                        _hiddenTagFolders.contains(unfolderedKey)) {
+                      return false;
+                    }
+                    return true;
+                  }),
+                );
+                return [Column(children: flatTags.map(tagNavItem).toList())];
+              }
+              // While filtering, folders with no matching tags are hidden.
+              bool tagFolderEmptyByFilter(Set<String> tags) =>
+                  _tagListFgs.filterActive && fgsTag(tags).isEmpty;
+
               // ── Build final widget list ─────────────────────────────────
               // ReorderableListView for user-controlled folders +
               // non-reorderable Trello folders pinned below.
@@ -21706,6 +22288,13 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   itemBuilder: (ctx, i) {
                     final key = effectiveTagOrder[i];
                     if (_hiddenTagFolders.contains(key)) {
+                      return SizedBox.shrink(
+                        key: ValueKey('tag_reorder_$key'),
+                      );
+                    }
+                    if (tagFolderEmptyByFilter(
+                      key == unfolderedKey ? unfolderedTags : (_tagFolders[key] ?? {}),
+                    )) {
                       return SizedBox.shrink(
                         key: ValueKey('tag_reorder_$key'),
                       );
@@ -21826,6 +22415,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       _isNotesView = true;
                       _isTasksView = false;
                       _isSettingsView = false;
+                      _isVisualizerView = false;
+                      _isFilesView = false;
                       _notesNavSection = 'editor';
                       _activeNoteId = noteId;
                       if (!_openNoteTabs.contains(noteId))
@@ -21992,6 +22583,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     _isNotesView = true;
                     _isTasksView = false;
                     _isSettingsView = false;
+                    _isVisualizerView = false;
+                    _isFilesView = false;
                     _notesNavSection = 'editor';
                     _activeNoteId = noteId;
                     if (!_openNoteTabs.contains(noteId))
@@ -22603,6 +23196,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     VoidCallback? onAdd,
     VoidCallback? onSettings,
     VoidCallback? onFilterGroupSort,
+    bool fgsActive = false,
   }) {
     return InkWell(
       onTap: onToggle,
@@ -22640,10 +23234,24 @@ class _ResizableScreenState extends State<ResizableScreen> {
             if (onAdd != null)
               _sidebarHeaderBtn(Icons.add_rounded, 'Add', onAdd),
             if (onFilterGroupSort != null)
-              _sidebarHeaderBtn(
-                Icons.filter_list_rounded,
-                'Filter / Group / Sort',
-                onFilterGroupSort,
+              Tooltip(
+                message: 'Filter / Group / Sort',
+                waitDuration: const Duration(milliseconds: 500),
+                child: InkWell(
+                  onTap: onFilterGroupSort,
+                  borderRadius: BorderRadius.circular(5),
+                  hoverColor: Colors.white.withOpacity(0.07),
+                  child: Padding(
+                    padding: const EdgeInsets.all(5),
+                    child: Icon(
+                      Icons.filter_list_rounded,
+                      size: 13,
+                      color: fgsActive
+                          ? const Color(0xFF4FC3F7)
+                          : const Color(0xFF6B7280),
+                    ),
+                  ),
+                ),
               ),
             if (onSettings != null)
               _sidebarHeaderBtn(
@@ -25139,6 +25747,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 projects: _projects,
                 execViewMode: _scheduleExecViewMode,
                 taskSessions: _taskSessions,
+                startHour: _plannerStartHour,
+                endHour: _plannerEndHour,
               ),
             ),
           ),
@@ -26752,8 +27362,269 @@ class _ResizableScreenState extends State<ResizableScreen> {
   }
 
 
+  /// Filters + sorts [keys] according to [f]. Counts/labels are supplied by
+  /// the caller so the same logic serves projects and tags.
+  List<String> _applyListFgs(
+    _SidebarListFgs f,
+    Iterable<String> keys, {
+    required int Function(String) open,
+    required int Function(String) overdue,
+    required String Function(String) label,
+  }) {
+    var out = keys.toList();
+    final q = f.nameQuery.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      out = out.where((k) => label(k).toLowerCase().contains(q)).toList();
+    }
+    if (f.onlyWithOpen) out = out.where((k) => open(k) > 0).toList();
+    if (f.onlyOverdue) out = out.where((k) => overdue(k) > 0).toList();
+    if (f.sortField != 'manual') {
+      int cmp(String a, String b) {
+        switch (f.sortField) {
+          case 'name':
+            return label(a).toLowerCase().compareTo(label(b).toLowerCase());
+          case 'open':
+            return open(a).compareTo(open(b));
+          case 'overdue':
+            return overdue(a).compareTo(overdue(b));
+        }
+        return 0;
+      }
+      out.sort((a, b) => f.sortAsc ? cmp(a, b) : cmp(b, a));
+    }
+    return out;
+  }
+
+  /// Panel opened by the F/G/S button of the Projects / Tags sidebar headers.
+  /// Everything here applies to the list shown under that header.
+  Widget _buildListFgsSidebar(bool isProjects) {
+    final f = isProjects ? _projListFgs : _tagListFgs;
+    final ctrl = isProjects ? _projFgsNameCtrl : _tagFgsNameCtrl;
+    final noun = isProjects ? 'projects' : 'tags';
+    const accent = Color(0xFF4FC3F7);
+    const bg = Color(0xFF1A1C1F);
+
+    Widget section(String title) => Padding(
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.0,
+          color: Colors.white60,
+        ),
+      ),
+    );
+
+    Widget toggleRow(String label, bool value, ValueChanged<bool> onChanged) =>
+        InkWell(
+          onTap: () => setState(() => onChanged(!value)),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            child: Row(
+              children: [
+                Icon(
+                  value
+                      ? Icons.check_box_rounded
+                      : Icons.check_box_outline_blank_rounded,
+                  size: 15,
+                  color: value ? accent : Colors.white38,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+
+    Widget chip(String label, bool selected, VoidCallback onTap) => InkWell(
+      onTap: () => setState(onTap),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: selected ? accent.withOpacity(0.18) : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected ? accent.withOpacity(0.6) : Colors.white24,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            color: selected ? accent : Colors.white60,
+          ),
+        ),
+      ),
+    );
+
+    final sortOptions = <(String, String)>[
+      ('manual', 'Sidebar order'),
+      ('name', 'Name'),
+      ('open', 'Open tasks'),
+      ('overdue', 'Overdue tasks'),
+    ];
+
+    return Container(
+      width: 264,
+      decoration: BoxDecoration(
+        color: bg,
+        border: Border(left: BorderSide(color: Colors.white.withOpacity(0.07))),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(14, 11, 10, 11),
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(color: Colors.white.withOpacity(0.07)),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.filter_list, size: 13, color: Colors.white54),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '${isProjects ? 'Projects' : 'Tags'} · Filter / Group / Sort',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white70,
+                    ),
+                  ),
+                ),
+                if (f.isActive)
+                  Tooltip(
+                    message: 'Reset',
+                    child: InkWell(
+                      onTap: () => setState(() {
+                        f.reset();
+                        ctrl.clear();
+                      }),
+                      child: const Padding(
+                        padding: EdgeInsets.only(right: 8),
+                        child: Icon(
+                          Icons.restart_alt_rounded,
+                          size: 15,
+                          color: Colors.white38,
+                        ),
+                      ),
+                    ),
+                  ),
+                GestureDetector(
+                  onTap: () => setState(() => _filterSidebarOpen = false),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    size: 15,
+                    color: Colors.white38,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.only(bottom: 20),
+              children: [
+                section('FILTER'),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: TextField(
+                    controller: ctrl,
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      hintText: 'Name contains…',
+                      hintStyle: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white30,
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        borderSide: const BorderSide(color: Colors.white24),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        borderSide: BorderSide(color: accent.withOpacity(0.6)),
+                      ),
+                    ),
+                    onChanged: (v) => setState(() => f.nameQuery = v),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                toggleRow(
+                  'Only $noun with open tasks',
+                  f.onlyWithOpen,
+                  (v) => f.onlyWithOpen = v,
+                ),
+                toggleRow(
+                  'Only $noun with overdue tasks',
+                  f.onlyOverdue,
+                  (v) => f.onlyOverdue = v,
+                ),
+                section('GROUP'),
+                toggleRow(
+                  'Group by folders',
+                  f.groupByFolder,
+                  (v) => f.groupByFolder = v,
+                ),
+                section('SORT'),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final o in sortOptions)
+                        chip(o.$2, f.sortField == o.$1, () => f.sortField = o.$1),
+                    ],
+                  ),
+                ),
+                if (f.sortField != 'manual')
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+                    child: Row(
+                      children: [
+                        chip('Ascending', f.sortAsc, () => f.sortAsc = true),
+                        const SizedBox(width: 6),
+                        chip('Descending', !f.sortAsc, () => f.sortAsc = false),
+                      ],
+                    ),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+                  child: Text(
+                    'Applies to the $noun listed in the sidebar'
+                    '${f.groupByFolder ? ', inside each folder' : ''}.',
+                    style: const TextStyle(fontSize: 10, color: Colors.white30),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildFilterSidebar() {
     if (!_filterSidebarOpen) return const SizedBox.shrink();
+
+    if (_filterSidebarTitle == 'All Projects') return _buildListFgsSidebar(true);
+    if (_filterSidebarTitle == 'All Tags') return _buildListFgsSidebar(false);
 
     if (_filterSidebarTitle == 'Notes Tasks' || _filterSidebarTitle == 'Notes Common') {
       return _buildNotesFGSSidebar(_filterSidebarTitle);
@@ -29659,7 +30530,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         SnackBar(
           content: Text('A task named "$title" already exists in $projName.'),
           backgroundColor: const Color(0xFFB71C1C),
-          duration: const Duration(seconds: 3),
+          duration: snackDur(const Duration(seconds: 3)),
         ),
       );
     }
@@ -31137,7 +32008,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         break;
 
       case 'sched_nextweek':
-        final nw = today.add(Duration(days: 8 - today.weekday));
+        final nwStart = AppPrefs.weekStartOf(today);
+        final nw = DateTime(nwStart.year, nwStart.month, nwStart.day + 7);
         setState(() => task.dueDay = nw.toIso8601String().split('T').first);
         _saveTaskToMeta(task);
         break;
@@ -31992,6 +32864,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       _visualizerFileEntries = fileEntryResult;
       _visualizerLoading = false;
     });
+    _refreshEntityRefs(force: true); // entidades mudaram → índice de referências
   }
 
   // ── File-manager helpers for Works / Personal Memory ─────────────────────
@@ -32236,7 +33109,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('Copied: $absPath', style: const TextStyle(fontSize: 12)),
-              duration: const Duration(seconds: 2),
+              duration: snackDur(const Duration(seconds: 2)),
               backgroundColor: const Color(0xFF2A2D31),
             ),
           );
@@ -32340,7 +33213,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 'Copied: $absPath',
                 style: const TextStyle(fontSize: 12),
               ),
-              duration: const Duration(seconds: 2),
+              duration: snackDur(const Duration(seconds: 2)),
               backgroundColor: const Color(0xFF2A2D31),
             ),
           );
@@ -32421,8 +33294,31 @@ class _ResizableScreenState extends State<ResizableScreen> {
   }
 
   /// Shows a confirmation dialog and deletes the entry on confirmation.
+  /// Linhas (`origem · predicado → alvo`) das relações de entrada que ficariam
+  /// sem alvo se [absPaths] fossem apagados. Vazio = nada fica pendurado.
+  Future<List<String>> _danglingIncomingLines(List<String> absPaths) async {
+    if (_workspaceId.isEmpty || absPaths.isEmpty) return const <String>[];
+    try {
+      if (_typeRegistry.rootTypes.isEmpty) await _loadTypeRegistry();
+      final roots = <String>[_wsFilesDir(_workspaceId)];
+      for (final l in _filesController?.store.locations ?? const <FilesLocation>[]) {
+        final lp = l.path.replaceAll('\\', '/');
+        if (!roots.any((r) => lp == r || lp.startsWith('$r/'))) roots.add(lp);
+      }
+      final idx = await RelationIndex.build(entities: _entityLocator, fileRoots: roots);
+      final found = await idx.danglingFor(absPaths);
+      return <String>{for (final d in found) d.text}.toList();
+    } catch (e) {
+      debugPrint('_danglingIncomingLines ERROR: $e');
+      return const <String>[];
+    }
+  }
+
   Future<void> _confirmDeleteVisualizerEntry(
       String cat, String name, bool isDir, String absPath) async {
+    // Relações de entrada (de outras entidades/arquivos) que ficariam sem alvo.
+    final dangling = await _danglingIncomingLines([absPath]);
+    if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -32434,9 +33330,22 @@ class _ResizableScreenState extends State<ResizableScreen> {
           isDir ? 'Delete Folder' : 'Delete File',
           style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600),
         ),
-        content: Text(
-          'Delete "$name"? This cannot be undone.',
-          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Delete "$name"? This cannot be undone.',
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            if (dangling.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                danglingSummary(dangling),
+                style: const TextStyle(color: Colors.amber, fontSize: 12, height: 1.4),
+              ),
+            ],
+          ],
         ),
         actions: [
           TextButton(
@@ -32454,13 +33363,20 @@ class _ResizableScreenState extends State<ResizableScreen> {
     final deletedTypeId = _entityLocator.locate('$cat/$name')?.def.id;
     try {
       if (isDir) {
+        // o `.cc/` da pasta (sidecars dela e dos itens de dentro) vai junto
         await Directory(absPath).delete(recursive: true);
       } else {
+        await CcData.removeItemSidecar(absPath); // antes: o id está no arquivo
         await File(absPath).delete();
       }
     } catch (e) {
       debugPrint('_confirmDeleteVisualizerEntry error: $e');
     }
+    RelationIndex.invalidate();
+    _entityTabFutures.clear();
+    _entityBadges.clear();
+    if (mounted) setState(() => _entityTabRefresh++);
+    _refreshEntityRefs(force: true);
     // Deselect if the deleted entry was selected
     if (_visualizerSelectedPath == '$cat/$name' ||
         _visualizerSelectedPath.startsWith('$cat/$name/')) {
@@ -33333,6 +34249,222 @@ class _ResizableScreenState extends State<ResizableScreen> {
     _loadPersonCanvas(rel);
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // REFERÊNCIAS [[id|Título]]
+  //
+  // Espaço de ids único: common:<ms> · proj:<id> · task:<id> · id da entidade
+  // (frontmatter). O link guarda o id; o título é rótulo. Backlinks são
+  // derivados do índice (RefIndex) e nunca gravados.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Reconstrói a parte de notas do índice quando algo mudou. A assinatura é
+  /// O(n) e barata; o parse de cada nota é cacheado por texto (RefParseCache).
+  void _syncRefsNotes() {
+    var sig = _notes.length;
+    for (final n in _notes.values) {
+      sig ^= Object.hash(n.id, n.title, n.updatedAt.microsecondsSinceEpoch, n.content.length);
+    }
+    if (sig == _refsNotesSig) return;
+    _refsNotesSig = sig;
+    _refs.setNoteDocs([
+      for (final n in _notes.values)
+        RefDoc(
+          RefTarget(
+            id: n.id,
+            title: n.title,
+            kind: n.type == NoteType.task
+                ? RefKind.task
+                : (n.type == NoteType.project ? RefKind.project : RefKind.common),
+            updatedMs: n.updatedAt.millisecondsSinceEpoch,
+          ),
+          n.content,
+        ),
+    ]);
+  }
+
+  /// Lê as âncoras das entidades (id, nome, texto) para o índice. Assíncrono e
+  /// limitado a uma vez a cada 20 s, salvo [force].
+  Future<void> _refreshEntityRefs({bool force = false}) async {
+    if (_workspaceId.isEmpty || _refsEntitiesBusy) return;
+    if (!force && DateTime.now().difference(_refsEntitiesAt).inSeconds < 20) return;
+    _refsEntitiesBusy = true;
+    try {
+      // Raiz offline (HD desconectado): nada é criado nem lido; o índice vem
+      // do cache local por workspace_id (fase 6).
+      final ownOnline = await Directory(_wsRoot(_workspaceId)).exists();
+      if (ownOnline && _typeRegistry.rootTypes.isEmpty) await _loadTypeRegistry();
+      final idx = ownOnline
+          ? await EntityIndex.build(_entityLocator)
+          : const EntityIndex(<EntityIndexEntry>[]);
+      final docs = <RefDoc>[];
+      for (final e in idx.entries) {
+        var text = '';
+        try {
+          text = await File(e.anchorPath).readAsString();
+        } catch (_) {}
+        docs.add(RefDoc(
+          RefTarget(
+            id: e.id,
+            title: e.name,
+            kind: RefKind.entity,
+            rel: e.rel,
+            typeLabel: _typeRegistry[e.typeId]?.label,
+            anchorPath: e.anchorPath,
+          ),
+          stripFrontmatter(text),
+        ));
+      }
+      if (ownOnline) {
+        // Cache local deste workspace (id, título, tipo, relações de saída).
+        final changed = await WorkspaceIndexCache.save(
+          WorkspaceIndexCache.fromEntityIndex(
+            _workspaceId,
+            _workspaceName,
+            idx,
+            (t) => _typeRegistry[t]?.label ?? '',
+          ),
+        );
+        if (changed) RelationIndex.touch();
+      } else {
+        final snap = await WorkspaceIndexCache.load(_workspaceId);
+        if (snap != null) {
+          for (final e in snap.entries) {
+            docs.add(RefDoc(
+              RefTarget(
+                id: e.id,
+                title: e.title,
+                kind: RefKind.entity,
+                typeLabel: e.typeLabel.isEmpty ? null : e.typeLabel,
+                ws: _workspaceId,
+                wsName: _workspaceName,
+                offline: true,
+              ),
+              '',
+            ));
+          }
+        }
+      }
+      // Workspaces anexados: online → reescaneia e grava o cache; offline →
+      // usa o que ficou guardado. Alvos em cinza quando o disco não monta.
+      final seenIds = <String>{for (final d in docs) d.target.id};
+      var cacheChanged = false;
+      for (final a in AttachedWorkspaces.instance.all) {
+        final before = WorkspaceIndexCache.peek(a.workspaceId)?.fingerprint;
+        final snap = await WorkspaceIndexCache.refreshAttached(a);
+        if (snap == null) continue;
+        if (snap.fingerprint != before) cacheChanged = true;
+        final off = !AttachedWorkspaces.instance.isOnline(a.workspaceId);
+        for (final e in snap.entries) {
+          if (!seenIds.add(e.id)) continue; // mesmo id local: o vivo vence
+          docs.add(RefDoc(
+            RefTarget(
+              id: e.id,
+              title: e.title,
+              kind: RefKind.entity,
+              typeLabel: e.typeLabel.isEmpty ? null : e.typeLabel,
+              ws: a.workspaceId,
+              wsName: a.label,
+              offline: off,
+            ),
+            '',
+          ));
+        }
+      }
+      if (cacheChanged) {
+        RelationIndex.touch();
+        if (mounted) setState(() => _entityTabRefresh++);
+      }
+      _refsEntitiesAt = DateTime.now();
+      if (mounted) _refs.setEntityDocs(docs);
+    } catch (e) {
+      debugPrint('_refreshEntityRefs ERROR: $e');
+    } finally {
+      _refsEntitiesBusy = false;
+    }
+  }
+
+  /// Abre o alvo de um link: nota/projeto/task → aba Notes; entidade → Visualizer.
+  void _openRefTarget(RefTarget t) {
+    if (t.ws.isNotEmpty) {
+      // Alvo de outro workspace (cache): offline não abre; online ainda não
+      // há navegação entre workspaces.
+      final who = t.wsName.isEmpty ? t.ws : t.wsName;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+        content: Text(t.offline
+            ? 'Workspace offline: $who'
+            : '“${t.title}” está no workspace $who.'),
+      ));
+      return;
+    }
+    if (t.kind == RefKind.entity) {
+      final rel = t.rel;
+      if (rel == null) return;
+      setState(() {
+        _isVisualizerView = true;
+        _isTasksView = false;
+        _isNotesView = false;
+        _isSettingsView = false;
+        _isFilesView = false;
+        _showCardInfoOptions = false;
+      });
+      _loadVisualizerChildren();
+      _navigateToEntity(rel);
+      return;
+    }
+    if (!_notes.containsKey(t.id)) return;
+    setState(() {
+      _isNotesView = true;
+      _isTasksView = false;
+      _isSettingsView = false;
+      _isVisualizerView = false;
+      _isFilesView = false;
+      _notesNavSection = 'editor';
+      _activeNoteId = t.id;
+      if (!_openNoteTabs.contains(t.id)) _openNoteTabs.add(t.id);
+    });
+  }
+
+  /// Id duplicado (pasta de entidade copiada): dá um id novo à cópia escolhida.
+  Future<void> _regenerateEntityId(RefTarget t) async {
+    final p = t.anchorPath;
+    if (p == null) return;
+    final newId = newEntityId();
+    final dir = File(p).parent.path;
+    // 1) clona o sidecar (`.cc/<idAntigo>.yaml` → `.cc/<idNovo>.yaml`) ANTES de
+    //    mexer no id: se o clone falhar, nada mudou e as relações não se perdem.
+    var cloned = false;
+    try {
+      cloned = await CcData.cloneIdSidecar(dir, t.id, newId);
+    } catch (e) {
+      debugPrint('_regenerateEntityId (sidecar) ERROR: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Id não alterado: o sidecar de relações não pôde ser clonado ($e)'),
+        ));
+      }
+      return;
+    }
+    // 2) id novo no frontmatter; se falhar, desfaz o clone
+    try {
+      await updateFrontmatterKey(p, 'id', newId);
+    } catch (e) {
+      debugPrint('_regenerateEntityId ERROR: $e');
+      if (cloned) await CcData.removeIdSidecar(dir, newId);
+      return;
+    }
+    // 3) o sidecar antigo, nesta pasta, ficou sem dono (a cópia tem outro id)
+    if (cloned) await CcData.removeIdSidecar(dir, t.id);
+    if (_personFileOpenPath == p) {
+      // O editor ainda tem o frontmatter antigo e o sobrescreveria ao salvar.
+      setState(() {
+        _personFileOpenPath = null;
+        _personFileNote = null;
+      });
+    }
+    _entityTabFutures.clear();
+    await _refreshEntityRefs(force: true);
+  }
+
   Future<void> _submitVisualizerAdd(String section, String raw) async {
     final name = raw.trim();
     if (name.isNotEmpty) {
@@ -33723,8 +34855,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
   }
 
   Widget _buildPersonFileEditor() {
+    _syncRefsNotes();
+    final pfId = readFrontmatter(_personFileNote?.content ?? '')['id']?.toString();
     return _NotesEditor(
       key: ValueKey(_personFileOpenPath),
+      refs: _refs,
+      selfRefId: (pfId == null || pfId.isEmpty) ? null : pfId,
       note: _personFileNote,
       projects: _projects,
       projectIcons: _projectIcons,
@@ -33734,6 +34870,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         if (_personFileOpenPath != null) {
           try {
             await File(_personFileOpenPath!).writeAsString(updatedNote.content);
+            _refreshEntityRefs(); // limitado a 1x/20 s
           } catch (e) {
             debugPrint('person file save error: $e');
           }
@@ -33786,6 +34923,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
     String? badge,
     Widget? trailing,
     VoidCallback? onTap,
+    Color? titleColor,
+    Color? subtitleColor,
   }) {
     return InkWell(
       onTap: onTap,
@@ -33800,15 +34939,17 @@ class _ResizableScreenState extends State<ResizableScreen> {
               Text(title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+                  style: TextStyle(
+                      color: titleColor ?? Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500)),
               if (subtitle != null && subtitle.isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
                   child: Text(subtitle,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white30, fontSize: 11)),
+                      style: TextStyle(color: subtitleColor ?? Colors.white30, fontSize: 11)),
                 ),
             ]),
           ),
@@ -33907,44 +35048,335 @@ class _ResizableScreenState extends State<ResizableScreen> {
   }
 
   Widget _buildEntityConnectionsTab(EntityLoc loc) {
-    return FutureBuilder<List<ResolvedConnection>>(
-      key: ValueKey('conn:${loc.rel}:$_entityTabRefresh'),
-      future: _entityTabFuture<List<ResolvedConnection>>(
-        'conn:${loc.rel}:$_entityTabRefresh',
-        () => EntityIndex.build(_entityLocator).then((idx) => idx.connectionsOf(loc.rel)),
+    String? mentionId;
+    final mentionAnchor = loc.anchorPath;
+    if (mentionAnchor != null && File(mentionAnchor).existsSync()) {
+      mentionId = readFrontmatter(File(mentionAnchor).readAsStringSync())['id']?.toString();
+    }
+    if (mentionId != null && mentionId.isEmpty) mentionId = null;
+    if (mentionId != null) _refreshEntityRefs(); // limitado a 1x/20 s
+    final String? selfMentionId = mentionId;
+    // Redesenha quando o índice de referências muda; o Future abaixo é cacheado.
+    return Column(children: [
+      _connectionsMigrationBanner(),
+      Expanded(
+        child: AnimatedBuilder(
+          animation: _refs,
+          builder: (context, _) => _entityConnectionsFuture(loc, selfMentionId),
+        ),
       ),
+    ]);
+  }
+
+  /// Aviso (só quando há `connections` no formato antigo) com o botão que
+  /// abre a migração para relações do `.cc/`.
+  Widget _connectionsMigrationBanner() {
+    final key = 'connlegacy:$_entityTabRefresh';
+    return FutureBuilder<int>(
+      key: ValueKey(key),
+      future: _entityTabFuture<int>(
+        key,
+        () => EntityIndex.build(_entityLocator).then((i) => i.legacyTotal),
+      ),
+      builder: (context, snap) {
+        final n = snap.data ?? 0;
+        if (n == 0) return const SizedBox.shrink();
+        return Container(
+          width: double.infinity,
+          margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+          padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+          decoration: BoxDecoration(
+            color: Colors.amber.withOpacity(0.08),
+            border: Border.all(color: Colors.amber.withOpacity(0.35)),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(children: [
+            const Icon(Icons.sync_alt_rounded, size: 15, color: Colors.amber),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '$n conexão(ões) ainda estão no frontmatter das âncoras.',
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ),
+            TextButton(
+              onPressed: _showConnectionsMigrationDialog,
+              child: const Text('Migrar…', style: TextStyle(fontSize: 12)),
+            ),
+          ]),
+        );
+      },
+    );
+  }
+
+  Future<void> _showConnectionsMigrationDialog() async {
+    final ConnMigrationReport report;
+    try {
+      report = await ConnectionsMigration.preview(_entityLocator);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Não foi possível ler as conexões: $e')));
+      return;
+    }
+    if (!mounted) return;
+    if (report.items.isEmpty) return;
+    ConnMigrationResult? result;
+    var running = false;
+    const body = TextStyle(color: Colors.white70, fontSize: 13, height: 1.4);
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          final res = result;
+          final missing = report.missing;
+          final List<Widget> content;
+          if (res == null) {
+            content = [
+              Text(
+                '${report.items.length} conexão(ões) em ${report.entities} '
+                'entidade(s) serão convertidas em relações "relacionado a". '
+                'O rótulo de cada uma vira a nota da relação.',
+                style: body,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Antes de cada entidade, a âncora é copiada para '
+                '.cc/backup. A chave `connections` só sai do frontmatter '
+                'depois que as relações são gravadas e conferidas.',
+                style: body,
+              ),
+              if (missing.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '${missing.length} apontam para entidades que não existem '
+                  '(mais). Elas também são mantidas:',
+                  style: body,
+                ),
+                for (final m in missing.take(6))
+                  Text('• ${m.ownerName} → ${m.ref}',
+                      style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                if (missing.length > 6)
+                  Text('… e mais ${missing.length - 6}',
+                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
+              ],
+              const SizedBox(height: 8),
+              const Text(
+                'Feche abas de texto de entidades abertas antes de migrar.',
+                style: TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ];
+          } else {
+            content = [
+              Text(
+                '${res.relations} relação(ões) em ${res.entities} entidade(s) '
+                'migradas.',
+                style: body,
+              ),
+              const SizedBox(height: 6),
+              Text('Backup: ${res.backupDir}',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              for (final w in res.warnings.take(5))
+                Text('! $w',
+                    style: const TextStyle(color: Colors.amber, fontSize: 12)),
+              for (final er in res.errors.take(8))
+                Text('✗ $er',
+                    style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+            ];
+          }
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1E1E),
+            title: const Text('Migrar conexões',
+                style: TextStyle(color: Colors.white, fontSize: 16)),
+            content: SizedBox(
+              width: 440,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: content,
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: running ? null : () => Navigator.of(ctx).pop(),
+                child: Text(res == null ? 'Cancelar' : 'Fechar'),
+              ),
+              if (res == null)
+                TextButton(
+                  onPressed: running
+                      ? null
+                      : () async {
+                          setD(() => running = true);
+                          ConnMigrationResult r;
+                          try {
+                            r = await ConnectionsMigration.apply(
+                              _entityLocator,
+                              backupRoot: '${_wsRoot(_workspaceId)}/.cc/backup',
+                            );
+                          } catch (e) {
+                            r = ConnMigrationResult()..errors.add('$e');
+                          }
+                          result = r;
+                          running = false;
+                          setD(() {});
+                        },
+                  child: Text(running ? 'Migrando…' : 'Migrar'),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+    if (!mounted) return;
+    // As âncoras mudaram: o editor de texto aberto não pode regravar o antigo.
+    _entityTabFutures.clear();
+    _entityBadges.clear();
+    setState(() {
+      _entityTabRefresh++;
+      _personFileOpenPath = null;
+      _personFileNote = null;
+    });
+  }
+
+  /// Raiz dos arquivos de Works para [loc] (a da aba `works` do padrão, se
+  /// houver). O índice de relações varre essa pasta além das entidades.
+  String _worksRootFor(EntityLoc loc) {
+    for (final t in loc.pattern.tabs) {
+      if (t.kind == 'works') {
+        return '${_wsFilesDir(_workspaceId)}/${t.from ?? 'vault/works'}';
+      }
+    }
+    return '${_wsFilesDir(_workspaceId)}/vault/works';
+  }
+
+  /// Índice de relações (4.6) — o mesmo para as abas Connections e Works.
+  /// Cacheado por aba/refresh; o cache por pasta evita reler sidecars.
+  Future<RelationIndex> _relationIndexFuture(String worksRoot) =>
+      _entityTabFuture<RelationIndex>(
+        'relidx:$worksRoot:$_entityTabRefresh',
+        () => RelationIndex.shared(
+          entities: _entityLocator,
+          fileRoots: <String>[worksRoot],
+        ),
+      );
+
+  Widget _entityConnectionsFuture(EntityLoc loc, String? mentionId) {
+    return FutureBuilder<RelationIndex>(
+      key: ValueKey('conn:${loc.rel}:$_entityTabRefresh'),
+      future: _relationIndexFuture(_worksRootFor(loc)),
       builder: (context, snap) {
         if (snap.connectionState != ConnectionState.done) {
           return const Center(
               child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
         }
-        final list = snap.data ?? const <ResolvedConnection>[];
-        if (list.isEmpty) {
-          return _entityTabEmpty(
-            Icons.hub_outlined,
-            'No connections yet.\nDeclare them in this entity\'s anchor file:\nconnections: [{ref: <id>, label: ...}]',
-          );
+        const emptyMsg =
+            'No connections yet.\nRelations live in this entity\'s .cc sidecar:\nrelations: [{pred: relacionado_a, ref: {id: <id>, ws: <ws>}}]';
+        final base = snap.data;
+        if (base == null) {
+          return _entityTabEmpty(Icons.hub_outlined, emptyMsg);
+        }
+        // Relações tipadas (sidecars) e links no texto são fontes separadas do
+        // índice. Os refs mudam em separado: trocamos a cada desenho.
+        final idx = base.withRefs(_refs.index);
+        final me = idx.byRel(loc.rel);
+        // Arquivos de Works ficam na aba Works.
+        final list = me == null
+            ? const <RelationView>[]
+            : idx.relationsOf(
+                me.key,
+                otherKinds: const <RelNodeKind>{RelNodeKind.entity},
+                includeForeign: true,
+              );
+        final hasMentions = mentionId != null && idx.mentionedIn(mentionId).isNotEmpty;
+        if (list.isEmpty && !hasMentions) {
+          return _entityTabEmpty(Icons.hub_outlined, emptyMsg);
         }
         return ListView(children: [
-          for (final c in list)
-            Builder(builder: (_) {
-              final other = c.other;
-              final otherDef = other == null ? null : _typeRegistry[other.typeId];
-              return _entityListRow(
-                icon: _iconFromName(otherDef?.icon ?? ''),
-                title: other?.name ?? '(missing entity)',
-                subtitle: otherDef?.label,
-                badge: c.label,
-                trailing: Icon(
-                  c.incoming ? Icons.call_received_rounded : Icons.call_made_rounded,
-                  size: 14,
-                  color: Colors.white30,
+          if (list.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 10, 12, 4),
+              child: Row(children: [
+                const Icon(Icons.hub_outlined, size: 13, color: Colors.white38),
+                const SizedBox(width: 6),
+                Text(
+                  'Relacionados · ${list.length}',
+                  style: const TextStyle(fontSize: 12, color: Colors.white54),
                 ),
-                onTap: other == null ? null : () => _navigateToEntity(other.rel),
-              );
-            }),
+              ]),
+            ),
+          for (final v in list) _relationRow(v),
+          if (mentionId != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 12, 12),
+              child: RefBacklinksPanel(refs: _refs, selfId: mentionId, title: 'Mentioned in'),
+            ),
         ]);
       },
+    );
+  }
+
+  /// Linha de uma relação na aba Connections. O alvo pode estar neste
+  /// workspace, no cache de outro (`{id, ws}`), sem destino (vermelho) ou num
+  /// workspace offline (cinza).
+  Widget _relationRow(RelationView v) {
+    final other = v.other;
+    final otherRel = other?.rel;
+    final st = v.otherStatus;
+    final ws = v.otherWs;
+    final wsLabel = ws.isEmpty ? '' : (AttachedWorkspaces.instance.byId(ws)?.label ?? ws);
+    final otherDef = (other == null || ws.isNotEmpty) ? null : _typeRegistry[other.typeId];
+    final typeLabel = otherDef?.label ??
+        ((other != null && other.typeLabel.isNotEmpty) ? other.typeLabel : '');
+    String title = '';
+    String subtitle = '';
+    Color? titleColor;
+    Color? subtitleColor;
+    switch (st) {
+      case RelTargetStatus.ok:
+        title = other?.name ?? '';
+        subtitle = [typeLabel, wsLabel].where((x) => x.isNotEmpty).join(' · ');
+        break;
+      case RelTargetStatus.workspaceOffline:
+        title = other?.name ?? v.edge.rel.ref.id;
+        subtitle = [typeLabel, wsLabel, 'workspace offline']
+            .where((x) => x.isNotEmpty)
+            .join(' · ');
+        titleColor = _RC.offline;
+        subtitleColor = _RC.offline;
+        break;
+      case RelTargetStatus.workspaceUnknown:
+        title = '(sem destino)';
+        subtitle = 'workspace não anexado: ${v.edge.rel.ref.ws}';
+        titleColor = _RC.bad;
+        subtitleColor = _RC.bad;
+        break;
+      case RelTargetStatus.missing:
+        title = '(sem destino)';
+        subtitle = [wsLabel, v.edge.rel.ref.id].where((x) => x.isNotEmpty).join(' · ');
+        titleColor = _RC.bad;
+        subtitleColor = _RC.bad;
+        break;
+    }
+    return _entityListRow(
+      icon: ws.isNotEmpty
+          ? (st == RelTargetStatus.workspaceOffline
+              ? Icons.cloud_off_outlined
+              : Icons.cloud_queue_rounded)
+          : _iconFromName(otherDef?.icon ?? ''),
+      title: title,
+      subtitle: subtitle,
+      titleColor: titleColor,
+      subtitleColor: subtitleColor,
+      badge: v.label,
+      trailing: Icon(
+        v.incoming ? Icons.call_received_rounded : Icons.call_made_rounded,
+        size: 14,
+        color: Colors.white30,
+      ),
+      onTap: otherRel == null ? null : () => _navigateToEntity(otherRel),
     );
   }
 
@@ -33960,19 +35392,20 @@ class _ResizableScreenState extends State<ResizableScreen> {
     }
     final String id = entityId;
     final worksRoot = '${_wsFilesDir(_workspaceId)}/${tab.from ?? 'vault/works'}';
-    return FutureBuilder<List<String>>(
+    return FutureBuilder<List<WorkLink>>(
       key: ValueKey('works:${loc.rel}:$_entityTabRefresh'),
-      future: _entityTabFuture<List<String>>(
+      future: _entityTabFuture<List<WorkLink>>(
         'works:${loc.rel}:$_entityTabRefresh',
-        () => WorksLinks.linkedTo(worksRoot, id),
+        () async => WorksLinks.fromIndex(await _relationIndexFuture(worksRoot), id),
       ),
       builder: (context, snap) {
         if (snap.connectionState != ConnectionState.done) {
           return const Center(
               child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white24));
         }
-        final files = snap.data ?? const <String>[];
+        final files = snap.data ?? const <WorkLink>[];
         return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          _worksMigrationBanner(worksRoot),
           Container(
             padding: const EdgeInsets.fromLTRB(20, 8, 12, 8),
             decoration: const BoxDecoration(
@@ -34000,15 +35433,16 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     'No linked works yet.\nUse "Link file" to attach files from Vault > Works.',
                   )
                 : ListView(children: [
-                    for (final p in files)
+                    for (final w in files)
                       _entityListRow(
-                        icon: _visualizerEntryIcon(p.split('/').last, false),
-                        title: p.split('/').last,
-                        subtitle: p.substring(worksRoot.length + 1),
-                        onTap: () => _openWithSystemApp(p),
+                        icon: _visualizerEntryIcon(w.path.split('/').last, false),
+                        title: w.path.split('/').last,
+                        subtitle: w.path.substring(worksRoot.length + 1),
+                        badge: w.roles.isEmpty ? null : w.roles.join(', '),
+                        onTap: () => _openWithSystemApp(w.path),
                         trailing: InkWell(
                           onTap: () async {
-                            await WorksLinks.unlink(p, id);
+                            await WorksLinks.unlink(w.path, id);
                             if (mounted) setState(() => _entityTabRefresh++);
                           },
                           child: const Padding(
@@ -34022,6 +35456,164 @@ class _ResizableScreenState extends State<ResizableScreen> {
         ]);
       },
     );
+  }
+
+  /// Aviso (só quando há companheiros `.cc/<arquivo>.md` no formato antigo).
+  Widget _worksMigrationBanner(String worksRoot) {
+    final key = 'worksleg:$worksRoot:$_entityTabRefresh';
+    return FutureBuilder<int>(
+      key: ValueKey(key),
+      future: _entityTabFuture<int>(key, () => WorksMigration.countLegacy(worksRoot)),
+      builder: (context, snap) {
+        final n = snap.data ?? 0;
+        if (n == 0) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+          padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+          decoration: BoxDecoration(
+            color: Colors.amber.withOpacity(0.08),
+            border: Border.all(color: Colors.amber.withOpacity(0.35)),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(children: [
+            const Icon(Icons.sync_alt_rounded, size: 15, color: Colors.amber),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '$n arquivo(s) de Works ainda usam o formato antigo de vínculo.',
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ),
+            TextButton(
+              onPressed: () => _showWorksMigrationDialog(worksRoot),
+              child: const Text('Migrar…', style: TextStyle(fontSize: 12)),
+            ),
+          ]),
+        );
+      },
+    );
+  }
+
+  Future<void> _showWorksMigrationDialog(String worksRoot) async {
+    final WorkMigReport report;
+    try {
+      final idx = await EntityIndex.build(_entityLocator);
+      report = await WorksMigration.preview(
+        worksRoot,
+        <String>{for (final e in idx.entries) e.id},
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Não foi possível ler os vínculos: $e')));
+      return;
+    }
+    if (!mounted || report.items.isEmpty) return;
+    WorkMigResult? result;
+    var running = false;
+    const body = TextStyle(color: Colors.white70, fontSize: 13, height: 1.4);
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          final res = result;
+          final ok = report.migratable;
+          final skipped = report.skipped;
+          final dangling =
+              ok.fold<int>(0, (a, i) => a + i.missingEntities);
+          final List<Widget> content;
+          if (res == null) {
+            content = [
+              Text(
+                '${ok.length} arquivo(s) com ${report.relations} vínculo(s) serão '
+                'convertidos em relações "relacionado a" no sidecar de cada '
+                'arquivo. Você pode trocar para "escrito por" ou "traduzido '
+                'por" depois.',
+                style: body,
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Antes de cada arquivo, o companheiro antigo é copiado para '
+                '.cc/backup e só é removido depois que as relações são '
+                'gravadas e conferidas.',
+                style: body,
+              ),
+              if (dangling > 0) ...[
+                const SizedBox(height: 8),
+                Text('$dangling vínculo(s) apontam para entidades que não existem '
+                    '(mais); também são mantidos.', style: body),
+              ],
+              if (skipped.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text('${skipped.length} companheiro(s) de arquivos que não '
+                    'existem mais ficam como estão.', style: body),
+              ],
+            ];
+          } else {
+            content = [
+              Text('${res.relations} vínculo(s) em ${res.files} arquivo(s) '
+                  'migrados.', style: body),
+              const SizedBox(height: 6),
+              Text('Backup: ${res.backupDir}',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              for (final w in res.warnings.take(5))
+                Text('! $w',
+                    style: const TextStyle(color: Colors.amber, fontSize: 12)),
+              for (final er in res.errors.take(8))
+                Text('✗ $er',
+                    style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+            ];
+          }
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1E1E),
+            title: const Text('Migrar vínculos de Works',
+                style: TextStyle(color: Colors.white, fontSize: 16)),
+            content: SizedBox(
+              width: 440,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: content,
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: running ? null : () => Navigator.of(ctx).pop(),
+                child: Text(res == null ? 'Cancelar' : 'Fechar'),
+              ),
+              if (res == null && ok.isNotEmpty)
+                TextButton(
+                  onPressed: running
+                      ? null
+                      : () async {
+                          setD(() => running = true);
+                          WorkMigResult r;
+                          try {
+                            r = await WorksMigration.apply(
+                              worksRoot,
+                              backupRoot: '${_wsRoot(_workspaceId)}/.cc/backup',
+                            );
+                          } catch (e) {
+                            r = WorkMigResult()..errors.add('$e');
+                          }
+                          result = r;
+                          running = false;
+                          setD(() {});
+                        },
+                  child: Text(running ? 'Migrando…' : 'Migrar'),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+    if (!mounted) return;
+    _entityTabFutures.clear();
+    _entityBadges.clear();
+    setState(() => _entityTabRefresh++);
   }
 
   Future<void> _showLinkWorkDialog(String worksRoot, String entityId) async {
@@ -34290,7 +35882,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                     SnackBar(
                       content: Text('Copied: $absPath',
                           style: const TextStyle(fontSize: 12)),
-                      duration: const Duration(seconds: 2),
+                      duration: snackDur(const Duration(seconds: 2)),
                       backgroundColor: const Color(0xFF2A2D31),
                     ),
                   );
@@ -35745,6 +37337,75 @@ class _ResizableScreenState extends State<ResizableScreen> {
     ),
   );
 
+  // ── Files tab (TagSpaces-style file manager, see files.dart) ───────────────
+
+  /// Lazily creates the Files controller for the active workspace (and
+  /// rebuilds it when the workspace changes). Tags live in `.cc/` sidecars
+  /// inside the user's folders; the tag library and the Locations live in the
+  /// workspace's `.cc/` (registry/tags.yaml, locations.yaml).
+  FilesController? _ensureFilesController() {
+    if (_workspaceId.isEmpty) return null;
+    final existing = _filesController;
+    if (existing != null && _filesControllerWsId == _workspaceId) {
+      return existing;
+    }
+    if (existing != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => existing.dispose());
+    }
+    final store = FilesMetaStore(
+      metaPath: '${_wsMetaDir(_workspaceId)}/files_meta.json',
+      builtinPath: _wsFilesDir(_workspaceId),
+      workspaceRoot: _wsRoot(_workspaceId),
+      workspaceId: _workspaceId,
+    );
+    final c = FilesController(store, toAppTime: AppClock.fromEpoch);
+    c.onDeleteCheck = _danglingIncomingLines;
+    _filesController = c;
+    _filesControllerWsId = _workspaceId;
+    Future.microtask(c.init);
+    return c;
+  }
+
+  Widget _buildFilesNavContent() {
+    final c = _ensureFilesController();
+    if (c == null) {
+      return const Center(
+        child: Text(
+          'No workspace',
+          style: TextStyle(color: Colors.white24, fontSize: 12),
+        ),
+      );
+    }
+    return FilesNavPanel(key: ValueKey('files-nav-$_workspaceId'), controller: c);
+  }
+
+  Widget _buildFilesMainArea() {
+    final c = _ensureFilesController();
+    if (c == null) return _buildNoWorkspacePlaceholder();
+    return FilesMainArea(
+      key: ValueKey('files-main-$_workspaceId'),
+      controller: c,
+    );
+  }
+
+  Widget _buildFilesTitleBar() {
+    return Row(
+      children: const [
+        SizedBox(width: 14),
+        Icon(Icons.folder_outlined, size: 14, color: Color(0xFF8896AC)),
+        SizedBox(width: 8),
+        Text(
+          'Files',
+          style: TextStyle(
+            fontSize: 12,
+            color: Color(0xFF8896AC),
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildSidebarNavIcons() {
     return Container(
       width: double.infinity,
@@ -35765,6 +37426,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
               _isTasksView = true;
               _isNotesView = false;
               _isSettingsView = false;
+              _isVisualizerView = false;
+              _isFilesView = false;
             }),
           ),
           _buildNavIcon(
@@ -35775,22 +37438,25 @@ class _ResizableScreenState extends State<ResizableScreen> {
               _isNotesView = true;
               _isTasksView = false;
               _isSettingsView = false;
+              _isVisualizerView = false;
+              _isFilesView = false;
             }),
           ),
           _buildNavIcon(
             label: "Canvases",
             icon: Icons.layers_outlined,
-            isActive: !_isSettingsView && !_isTasksView && !_isNotesView && !_isVisualizerView,
+            isActive: !_isSettingsView && !_isTasksView && !_isNotesView && !_isVisualizerView && !_isFilesView,
             onTap: () => setState(() {
               _isSettingsView = false;
               _isTasksView = false;
               _isNotesView = false;
               _isVisualizerView = false;
+              _isFilesView = false;
               _showCardInfoOptions = false;
             }),
           ),
           _buildNavIcon(
-            label: "Visualizer",
+            label: "Visualizers",
             icon: Icons.account_tree_outlined,
             isActive: _isVisualizerView,
             onTap: () {
@@ -35799,10 +37465,24 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 _isTasksView = false;
                 _isNotesView = false;
                 _isSettingsView = false;
+                _isFilesView = false;
                 _showCardInfoOptions = false;
               });
               _loadVisualizerChildren();
             },
+          ),
+          _buildNavIcon(
+            label: "Files",
+            icon: Icons.folder_outlined,
+            isActive: _isFilesView,
+            onTap: () => setState(() {
+              _isFilesView = true;
+              _isTasksView = false;
+              _isNotesView = false;
+              _isSettingsView = false;
+              _isVisualizerView = false;
+              _showCardInfoOptions = false;
+            }),
           ),
         ],
       ),
@@ -37601,9 +39281,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
     const labels = {
       'general': 'General',
       'tasks': 'Tasks',
-      'datetime': 'Date and Time',
       'notes': 'Notes',
-      'canvas': 'Canvas',
+      'canvas': 'Canvases',
+      'visualizers': 'Visualizers',
       'projects': 'Projects',
     };
     final label = labels[_settingsSection] ?? 'Settings';
@@ -37642,12 +39322,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
         return _buildSettingsSectionGeneral();
       case 'tasks':
         return _buildSettingsSectionTasks();
-      case 'datetime':
-        return _buildSettingsSectionDateTime();
       case 'notes':
         return _buildSettingsSectionNotes();
       case 'canvas':
         return _buildSettingsSectionCanvas();
+      case 'visualizers':
+        return _buildSettingsSectionVisualizers();
       case 'projects':
         return _buildSettingsSectionProjects();
       default:
@@ -37660,6 +39340,95 @@ class _ResizableScreenState extends State<ResizableScreen> {
     return ListView(
       padding: const EdgeInsets.symmetric(horizontal: 0, vertical: 0),
       children: cards,
+    );
+  }
+
+  /// Compact labelled dropdown used by the autosave / notification / planner
+  /// settings cards.
+  Widget _settingsDropdown<T>({
+    required String label,
+    String? helper,
+    required T value,
+    required List<(T, String)> items,
+    required ValueChanged<T> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: DropdownButtonFormField<T>(
+        value: value,
+        dropdownColor: const Color(0xFF1E2124),
+        style: const TextStyle(color: Colors.white70, fontSize: 13),
+        decoration: InputDecoration(
+          labelText: label,
+          helperText: helper,
+          helperMaxLines: 3,
+          helperStyle: const TextStyle(color: Colors.white38, fontSize: 10),
+          labelStyle: const TextStyle(color: Colors.white38, fontSize: 12),
+          enabledBorder: const OutlineInputBorder(
+            borderSide: BorderSide(color: Color(0xFF2C2F32)),
+          ),
+          focusedBorder: const OutlineInputBorder(
+            borderSide: BorderSide(color: Colors.blueAccent),
+          ),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 10,
+          ),
+        ),
+        items: items
+            .map(
+              (e) => DropdownMenuItem<T>(
+                value: e.$1,
+                child: Text(
+                  e.$2,
+                  style: const TextStyle(color: Colors.white70),
+                ),
+              ),
+            )
+            .toList(),
+        onChanged: (v) {
+          if (v != null) onChanged(v);
+        },
+      ),
+    );
+  }
+
+  /// Numeric px field for the "New Card Size" settings card. Only valid
+  /// values (inside [min]..[max]) are applied.
+  Widget _cardSizeField({
+    required String label,
+    required double value,
+    required int min,
+    required int max,
+    required ValueChanged<double> onValid,
+  }) {
+    return TextFormField(
+      key: ValueKey('cardsize-$label-$_workspaceId'),
+      initialValue: value.round().toString(),
+      keyboardType: TextInputType.number,
+      style: const TextStyle(color: Colors.white70, fontSize: 13),
+      decoration: InputDecoration(
+        labelText: label,
+        suffixText: 'px',
+        helperText: '$min–$max',
+        helperStyle: const TextStyle(color: Colors.white38, fontSize: 10),
+        labelStyle: const TextStyle(color: Colors.white38, fontSize: 12),
+        suffixStyle: const TextStyle(color: Colors.white38),
+        enabledBorder: const OutlineInputBorder(
+          borderSide: BorderSide(color: Color(0xFF2C2F32)),
+        ),
+        focusedBorder: const OutlineInputBorder(
+          borderSide: BorderSide(color: Colors.blueAccent),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: 10,
+        ),
+      ),
+      onChanged: (v) {
+        final n = int.tryParse(v.trim());
+        if (n != null && n >= min && n <= max) onValid(n.toDouble());
+      },
     );
   }
 
@@ -37737,12 +39506,15 @@ class _ResizableScreenState extends State<ResizableScreen> {
   }
 
   Widget _buildSettingsContent() {
-    const items = [
+    // null = divider between groups
+    const List<(String, IconData, String)?> items = [
       ('general', Icons.tune_rounded, 'General'),
+      null,
       ('tasks', Icons.check_circle_outline, 'Tasks'),
-      ('datetime', Icons.schedule_rounded, 'Date and Time'),
       ('notes', Icons.notes_rounded, 'Notes'),
-      ('canvas', Icons.dashboard_outlined, 'Canvas'),
+      ('canvas', Icons.dashboard_outlined, 'Canvases'),
+      ('visualizers', Icons.insights_rounded, 'Visualizers'),
+      null,
       ('projects', Icons.folder_outlined, 'Projects'),
     ];
     return Column(
@@ -37764,8 +39536,14 @@ class _ResizableScreenState extends State<ResizableScreen> {
         Expanded(
           child: ListView(
             padding: const EdgeInsets.symmetric(vertical: 6),
-            children: items.map((item) {
-              final (id, icon, label) = item;
+            children: items.map((entry) {
+              if (entry == null) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                  child: Divider(color: Color(0x12FFFFFF), height: 1),
+                );
+              }
+              final (id, icon, label) = entry;
               final active = _settingsSection == id;
               return InkWell(
                 onTap: () => setState(() => _settingsSection = id),
@@ -37823,7 +39601,34 @@ class _ResizableScreenState extends State<ResizableScreen> {
   // SETTINGS SECTION METHODS
   // ══════════════════════════════════════════════════════════════════════════
 
+  /// General settings page: workspace / appearance / language, followed by the
+  /// Date and Time group.
   Widget _buildSettingsSectionGeneral() {
+    Widget groupLabel(String t) => Padding(
+      padding: const EdgeInsets.fromLTRB(20, 22, 16, 8),
+      child: Text(
+        t.toUpperCase(),
+        style: const TextStyle(
+          color: Colors.white38,
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 1.5,
+        ),
+      ),
+    );
+    return _settingsPage(
+      cards: [
+        ..._generalCards(),
+        groupLabel('Date and Time'),
+        ..._dateTimeCards(),
+        groupLabel('Keyboard Shortcuts'),
+        ..._shortcutCards(),
+        const SizedBox(height: 24),
+      ],
+    );
+  }
+
+  List<Widget> _generalCards() {
     const langs = [
       ('en', 'English'),
       ('pt', 'Português'),
@@ -37835,17 +39640,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
       ('zh', '中文'),
       ('ko', '한국어'),
     ];
-    const locales = [
-      ('en_US', 'English (US) – 12h'),
-      ('en_GB', 'English (UK) – 24h'),
-      ('pt_BR', 'Português (BR) – 24h'),
-      ('de_DE', 'Deutsch – 24h'),
-      ('fr_FR', 'Français – 24h'),
-      ('ja_JP', '日本語 – 24h'),
-    ];
 
-    return _settingsPage(
-      cards: [
+    return [
         // ── Workspace ─────────────────────────────────────────────────────
         _settingsCard(
           label: 'Workspace',
@@ -37886,6 +39682,47 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 },
               ),
             ),
+          ],
+        ),
+        // ── Autosave & Notifications ──────────────────────────────────────
+        _settingsCard(
+          label: 'Autosave & Notifications',
+          expanded: _settingsAutosaveExpanded,
+          onTap: () => setState(
+            () => _settingsAutosaveExpanded = !_settingsAutosaveExpanded,
+          ),
+          children: [
+            _settingsDropdown<int>(
+              label: 'Autosave interval',
+              helper: 'How often the workspace is written to disk.',
+              value: _autoSaveSeconds,
+              items: [
+                for (final sec in _autoSaveOptions)
+                  (sec, sec == 1 ? '1 second' : '$sec seconds'),
+              ],
+              onChanged: (v) {
+                setState(() => _autoSaveSeconds = v);
+                _restartAutoSaveTimer();
+                _saveWorkspace();
+              },
+            ),
+            _settingsDropdown<int>(
+              label: 'Notification duration',
+              helper:
+                  'How long pop-up messages (SnackBars) stay on screen. '
+                  'Automatic keeps the built-in duration of each message.',
+              value: _snackBarSeconds,
+              items: [
+                for (final sec in _snackBarOptions)
+                  (sec, sec == 0 ? 'Automatic' : '$sec seconds'),
+              ],
+              onChanged: (v) {
+                setState(() => _snackBarSeconds = v);
+                AppPrefs.snackBarSeconds = v;
+                _saveWorkspace();
+              },
+            ),
+            const SizedBox(height: 8),
           ],
         ),
         // ── Dark Mode ─────────────────────────────────────────────────────
@@ -37934,20 +39771,22 @@ class _ResizableScreenState extends State<ResizableScreen> {
         ),
         // ── Language & Region ─────────────────────────────────────────────
         _settingsCard(
-          label: 'Language & Region',
+          label: 'Language',
           expanded: _showWorkspaceAppearance,
           onTap: () => setState(
             () => _showWorkspaceAppearance = !_showWorkspaceAppearance,
           ),
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
               child: DropdownButtonFormField<String>(
                 value: _appLanguage,
                 dropdownColor: const Color(0xFF1E2124),
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
                 decoration: const InputDecoration(
                   labelText: 'Application language',
+                  helperText: 'Not applied yet',
+                  helperStyle: TextStyle(color: Color(0xFFB8860B), fontSize: 10),
                   labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
                   enabledBorder: OutlineInputBorder(
                     borderSide: BorderSide(color: Color(0xFF2C2F32)),
@@ -37982,173 +39821,29 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 },
               ),
             ),
-            const SizedBox(height: 12),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: DropdownButtonFormField<String>(
-                value: _timeLocale,
-                dropdownColor: const Color(0xFF1E2124),
-                style: const TextStyle(color: Colors.white70, fontSize: 13),
-                decoration: const InputDecoration(
-                  labelText: 'Time format locale',
-                  labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
-                  helperText:
-                      'Choose a locale for time formatting. Different locales use different conventions (12h vs 24h format)',
-                  helperStyle: TextStyle(
-                    color: Color(0xFF5A5F6B),
-                    fontSize: 11,
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Color(0xFF2C2F32)),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.blueAccent),
-                  ),
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
-                  ),
-                ),
-                items: locales
-                    .map(
-                      (l) => DropdownMenuItem(
-                        value: l.$1,
-                        child: Text(
-                          l.$2,
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 13,
-                          ),
-                        ),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (v) {
-                  if (v != null) {
-                    setState(() => _timeLocale = v);
-                    _saveWorkspace();
-                  }
-                },
-              ),
-            ),
           ],
         ),
-        // ── SuperProductivity Import ───────────────────────────────────────
-        _settingsCard(
-          label: 'SuperProductivity Import',
-          expanded: _showDataSourceOptions,
-          onTap: () =>
-              setState(() => _showDataSourceOptions = !_showDataSourceOptions),
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-              child: Text(
-                'Import tasks and projects from a SuperProductivity __meta_ backup file.',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Colors.white.withOpacity(0.35),
-                  height: 1.5,
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-              child: TextField(
-                controller: _dataSourceController,
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
-                decoration: InputDecoration(
-                  labelText: '__meta_ file path',
-                  labelStyle: const TextStyle(color: Colors.white38),
-                  suffixIcon: IconButton(
-                    icon: const Icon(
-                      Icons.folder_open,
-                      color: Colors.white38,
-                      size: 18,
-                    ),
-                    onPressed: () async {
-                      final result = await FilePicker.platform.pickFiles(
-                        type: FileType.any,
-                        allowMultiple: false,
-                      );
-                      if (result != null && result.files.single.path != null) {
-                        setState(() {
-                          _sourceFilePath = result.files.single.path!;
-                          _dataSourceController.text = _sourceFilePath;
-                          for (final w in _savedWorkspaces) {
-                            if (w['id'] == _workspaceId)
-                              w['metaPath'] = _sourceFilePath;
-                          }
-                        });
-                        await _saveGeneral();
-                      }
-                    },
-                  ),
-                  enabledBorder: const UnderlineInputBorder(
-                    borderSide: BorderSide(color: Colors.white24),
-                  ),
-                  focusedBorder: const UnderlineInputBorder(
-                    borderSide: BorderSide(color: Colors.blueAccent),
-                  ),
-                ),
-                onChanged: (val) => setState(() => _sourceFilePath = val),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: Row(
-                children: [
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF1565C0),
-                      foregroundColor: Colors.white,
-                      textStyle: const TextStyle(fontSize: 12),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 10,
-                      ),
-                    ),
-                    icon: const Icon(Icons.download_rounded, size: 16),
-                    label: const Text('Import from __meta_'),
-                    onPressed: _sourceFilePath.trim().isEmpty
-                        ? null
-                        : () async {
-                            await _loadSpData();
-                            // Persist the imported tasks/projects into the
-                            // workspace file immediately so the data survives
-                            // the next launch without needing the __meta_ file.
-                            await _saveWorkspace();
-                            if (mounted)
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text(
-                                    'SP data imported and saved to workspace',
-                                  ),
-                                  backgroundColor: Color(0xFF1B5E20),
-                                  duration: Duration(seconds: 3),
-                                ),
-                              );
-                          },
-                  ),
-                  if (_allTasks.isNotEmpty) ...[
-                    const SizedBox(width: 12),
-                    Text(
-                      '${_allTasks.length} tasks · ${_projects.length} projects loaded',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: Colors.white38,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
+    ];
   }
 
-  Widget _buildSettingsSectionDateTime() {
+  List<Widget> _dateTimeCards() {
+    const weekDays = [
+      (1, 'Monday'),
+      (2, 'Tuesday'),
+      (3, 'Wednesday'),
+      (4, 'Thursday'),
+      (5, 'Friday'),
+      (6, 'Saturday'),
+      (7, 'Sunday'),
+    ];
+    const locales = [
+      ('en_US', 'English (US) – 12h'),
+      ('en_GB', 'English (UK) – 24h'),
+      ('pt_BR', 'Português (BR) – 24h'),
+      ('de_DE', 'Deutsch – 24h'),
+      ('fr_FR', 'Français – 24h'),
+      ('ja_JP', '日本語 – 24h'),
+    ];
     // Curated list of common zones with their fixed UTC offset, in minutes.
     // Fixed-offset (no IANA tz database) keeps this dependency-free; pick
     // whichever entry matches your current standard-time offset.
@@ -38182,8 +39877,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       return 'UTC$sign$h:$m';
     }
 
-    return _settingsPage(
-      cards: [
+    return [
         // ── Timezone ─────────────────────────────────────────────────────
         _settingsCard(
           label: 'Timezone',
@@ -38278,6 +39972,179 @@ class _ResizableScreenState extends State<ResizableScreen> {
           ],
         ),
         const SizedBox(height: 8),
+        const SizedBox(height: 8),
+        // ── Week & Day ────────────────────────────────────────────────────
+        _settingsCard(
+          label: 'Week & Day',
+          expanded: _settingsDateTimeExpanded,
+          onTap: () => setState(
+            () => _settingsDateTimeExpanded = !_settingsDateTimeExpanded,
+          ),
+          children: [
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: DropdownButtonFormField<int>(
+                value: _firstDayOfWeek,
+                dropdownColor: const Color(0xFF1E2124),
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+                decoration: const InputDecoration(
+                  labelText: 'First day of the week',
+                  helperText:
+                      'Used by "this week", the planner and repeating tasks',
+                  helperStyle: TextStyle(color: Colors.white38, fontSize: 10),
+                  labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
+                  enabledBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Color(0xFF2C2F32)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Colors.blueAccent),
+                  ),
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                ),
+                items: weekDays
+                    .map(
+                      (d) => DropdownMenuItem(
+                        value: d.$1,
+                        child: Text(
+                          d.$2,
+                          style: const TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (v) {
+                  if (v != null) {
+                    setState(() {
+                      _firstDayOfWeek = v;
+                      AppPrefs.firstDayOfWeek = v;
+                      _scheduleWeekStart = AppPrefs.weekStartOf(DateTime.now());
+                      _scheduleRangeEnd = null;
+                    });
+                    _scheduleCanvasKey.currentState?.navigateTo(
+                      _scheduleWeekStart,
+                    );
+                    // Week boundaries moved: make sure this week's repeat
+                    // instances exist for the new range.
+                    _loadWeekTasks(DateTime.now());
+                    _saveWorkspace();
+                  }
+                },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Start time of the next day  (not applied yet)',
+                      style: TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 80,
+                    child: TextField(
+                      controller: TextEditingController(
+                        text: '$_nextDayStartHour',
+                      ),
+                      keyboardType: TextInputType.number,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                      ),
+                      decoration: const InputDecoration(
+                        suffixText: 'h',
+                        suffixStyle: TextStyle(color: Colors.white38),
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Color(0xFF2C2F32)),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.blueAccent),
+                        ),
+                      ),
+                      onChanged: (v) {
+                        final n = int.tryParse(v);
+                        if (n != null && n >= 0 && n < 24) {
+                          setState(() => _nextDayStartHour = n);
+                          _saveWorkspace();
+                        }
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        // ── Format ────────────────────────────────────────────────────────
+        _settingsCard(
+          label: 'Format',
+          expanded: _settingsDateTimeExpanded,
+          onTap: () => setState(
+            () => _settingsDateTimeExpanded = !_settingsDateTimeExpanded,
+          ),
+          children: [
+                        Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+              child: DropdownButtonFormField<String>(
+                value: _timeLocale,
+                dropdownColor: const Color(0xFF1E2124),
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+                decoration: const InputDecoration(
+                  labelText: 'Time format locale',
+                  labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
+                  helperText:
+                      'Choose a locale for time formatting (12h vs 24h). Not applied yet.',
+                  helperStyle: TextStyle(
+                    color: Color(0xFF5A5F6B),
+                    fontSize: 11,
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Color(0xFF2C2F32)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Colors.blueAccent),
+                  ),
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                ),
+                items: locales
+                    .map(
+                      (l) => DropdownMenuItem(
+                        value: l.$1,
+                        child: Text(
+                          l.$2,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (v) {
+                  if (v != null) {
+                    setState(() => _timeLocale = v);
+                    _saveWorkspace();
+                  }
+                },
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
         // ── Internal Clock ────────────────────────────────────────────────
         _InternalClockCard(
           currentDeltaMs: _clockDeltaMs,
@@ -38290,58 +40157,18 @@ class _ResizableScreenState extends State<ResizableScreen> {
             _saveWorkspace();
           },
         ),
-      ],
-    );
+    ];
   }
 
   Widget _buildSettingsSectionTasks() {
-    const weekDays = [
-      (1, 'Monday'),
-      (2, 'Tuesday'),
-      (3, 'Wednesday'),
-      (4, 'Thursday'),
-      (5, 'Friday'),
-      (6, 'Saturday'),
-      (7, 'Sunday'),
-    ];
     const doneSounds = ['Small Ding', 'Bell', 'Chime', 'Pop', 'None'];
     const workSounds = ['', 'Bell', 'Chime', 'Tick', 'None'];
 
-    Widget kbRow(String action, String shortcut) => Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              action,
-              style: const TextStyle(color: Colors.white60, fontSize: 12),
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1A1C1E),
-              borderRadius: BorderRadius.circular(5),
-              border: Border.all(color: const Color(0xFF3A3D42)),
-            ),
-            child: Text(
-              shortcut,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 11,
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-
     return _settingsPage(
       cards: [
-        // ── Task Cards ────────────────────────────────────────────────────
+        // ── Task Lists (Tasks tab rows) ───────────────────────────────────
         _settingsCard(
-          label: 'Task Cards',
+          label: 'Task Lists',
           expanded: _settingsTasksExpanded,
           onTap: () =>
               setState(() => _settingsTasksExpanded = !_settingsTasksExpanded),
@@ -38362,7 +40189,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                       const SizedBox(width: 10),
                       const Expanded(
                         child: Text(
-                          'Card side margin',
+                          'List side margin',
                           style: TextStyle(
                             color: Colors.white70,
                             fontSize: 13,
@@ -38393,7 +40220,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    'Horizontal space between each card and the edge of the list',
+                    'Horizontal space between each task row and the edge of the Tasks list',
                     style: TextStyle(color: Colors.white38, fontSize: 11),
                   ),
                   const SizedBox(height: 6),
@@ -38454,99 +40281,6 @@ class _ResizableScreenState extends State<ResizableScreen> {
             const Divider(color: Color(0xFF2C2F32), height: 1),
             SwitchListTile(
               secondary: const Icon(
-                Icons.folder_outlined,
-                color: Colors.blueAccent,
-                size: 20,
-              ),
-              title: const Text(
-                'Show project name',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              subtitle: const Text(
-                'Display the project below the task title',
-                style: TextStyle(color: Colors.white38, fontSize: 11),
-              ),
-              value: _showProjectName,
-              activeColor: Colors.blueAccent,
-              onChanged: (v) {
-                setState(() => _showProjectName = v);
-                _saveWorkspace();
-              },
-            ),
-            SwitchListTile(
-              secondary: const Icon(
-                Icons.calendar_today_outlined,
-                color: Colors.blueAccent,
-                size: 20,
-              ),
-              title: const Text(
-                'Show due date on cards',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              value: _showDueDateOnCards,
-              activeColor: Colors.blueAccent,
-              onChanged: (v) {
-                setState(() => _showDueDateOnCards = v);
-                _saveWorkspace();
-              },
-            ),
-            SwitchListTile(
-              secondary: const Icon(
-                Icons.hourglass_bottom_rounded,
-                color: Colors.blueAccent,
-                size: 20,
-              ),
-              title: const Text(
-                'Show countdown on cards',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              subtitle: const Text(
-                'Display days/hours remaining until due date on each card',
-                style: TextStyle(color: Colors.white38, fontSize: 11),
-              ),
-              value: _showCountdownOnCards,
-              activeColor: Colors.blueAccent,
-              onChanged: (v) {
-                setState(() => _showCountdownOnCards = v);
-                _saveWorkspace();
-              },
-            ),
-            SwitchListTile(
-              secondary: const Icon(
-                Icons.timer_outlined,
-                color: Colors.blueAccent,
-                size: 20,
-              ),
-              title: const Text(
-                'Show time estimate on cards',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              value: _showTimeOnCards,
-              activeColor: Colors.blueAccent,
-              onChanged: (v) {
-                setState(() => _showTimeOnCards = v);
-                _saveWorkspace();
-              },
-            ),
-            SwitchListTile(
-              secondary: const Icon(
-                Icons.tag,
-                color: Colors.blueAccent,
-                size: 20,
-              ),
-              title: const Text(
-                'Show task ID on cards',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              value: _showIdOnCards,
-              activeColor: Colors.blueAccent,
-              onChanged: (v) {
-                setState(() => _showIdOnCards = v);
-                _saveWorkspace();
-              },
-            ),
-            SwitchListTile(
-              secondary: const Icon(
                 Icons.date_range_outlined,
                 color: Colors.blueAccent,
                 size: 20,
@@ -38562,12 +40296,33 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 _saveWorkspace();
               },
             ),
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.hourglass_bottom_rounded,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show countdown on cards',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              subtitle: const Text(
+                'Days/hours remaining until the due date (also used on Canvas cards)',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              value: _showCountdownOnCards,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showCountdownOnCards = v);
+                _saveWorkspace();
+              },
+            ),
             const Divider(color: Colors.white10),
           ],
         ),
-        // ── Misc ─────────────────────────────────────────────────────────
+        // ── Behavior ──────────────────────────────────────────────────────
         _settingsCard(
-          label: 'Misc',
+          label: 'Behavior',
           expanded: _settingsTasksExpanded,
           onTap: () =>
               setState(() => _settingsTasksExpanded = !_settingsTasksExpanded),
@@ -38582,99 +40337,16 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 'Mark parent task as done when all sub-tasks are done',
                 style: TextStyle(color: Colors.white70, fontSize: 13),
               ),
+              subtitle: const Text(
+                'Not applied yet',
+                style: const TextStyle(color: Color(0xFFB8860B), fontSize: 11),
+              ),
               value: _markParentDoneOnSubtasks,
               activeColor: Colors.blueAccent,
               onChanged: (v) {
                 setState(() => _markParentDoneOnSubtasks = v);
                 _saveWorkspace();
               },
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-              child: DropdownButtonFormField<int>(
-                value: _firstDayOfWeek,
-                dropdownColor: const Color(0xFF1E2124),
-                style: const TextStyle(color: Colors.white70, fontSize: 13),
-                decoration: const InputDecoration(
-                  labelText: 'First day of the week',
-                  labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Color(0xFF2C2F32)),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.blueAccent),
-                  ),
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
-                  ),
-                ),
-                items: weekDays
-                    .map(
-                      (d) => DropdownMenuItem(
-                        value: d.$1,
-                        child: Text(
-                          d.$2,
-                          style: const TextStyle(color: Colors.white70),
-                        ),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (v) {
-                  if (v != null) {
-                    setState(() => _firstDayOfWeek = v);
-                    _saveWorkspace();
-                  }
-                },
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-              child: Row(
-                children: [
-                  const Expanded(
-                    child: Text(
-                      'Start time of the next day',
-                      style: TextStyle(color: Colors.white70, fontSize: 13),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 80,
-                    child: TextField(
-                      controller: TextEditingController(
-                        text: '$_nextDayStartHour',
-                      ),
-                      keyboardType: TextInputType.number,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 13,
-                      ),
-                      decoration: const InputDecoration(
-                        suffixText: 'h',
-                        suffixStyle: TextStyle(color: Colors.white38),
-                        isDense: true,
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderSide: BorderSide(color: Color(0xFF2C2F32)),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderSide: BorderSide(color: Colors.blueAccent),
-                        ),
-                      ),
-                      onChanged: (v) {
-                        final n = int.tryParse(v);
-                        if (n != null && n >= 0 && n < 24) {
-                          setState(() => _nextDayStartHour = n);
-                          _saveWorkspace();
-                        }
-                      },
-                    ),
-                  ),
-                ],
-              ),
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -38684,6 +40356,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 style: const TextStyle(color: Colors.white70, fontSize: 12),
                 decoration: const InputDecoration(
                   labelText: 'Task description template',
+                  helperText: 'Not applied yet',
+                  helperStyle: TextStyle(color: Color(0xFFB8860B), fontSize: 10),
+                  
                   labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
                   hintText: 'e.g. ## Notes\n\n## Steps',
                   hintStyle: TextStyle(color: Colors.white24, fontSize: 11),
@@ -38702,6 +40377,62 @@ class _ResizableScreenState extends State<ResizableScreen> {
               ),
             ),
             const Divider(color: Colors.white10),
+          ],
+        ),
+        // ── Planner ───────────────────────────────────────────────────────
+        _settingsCard(
+          label: 'Planner',
+          expanded: _settingsPlannerExpanded,
+          onTap: () => setState(
+            () => _settingsPlannerExpanded = !_settingsPlannerExpanded,
+          ),
+          children: [
+            _settingsDropdown<int>(
+              label: 'Visible days',
+              helper: 'Day columns shown at the default zoom.',
+              value: _plannerDefaultDays,
+              items: [
+                for (final d in _plannerDayOptions)
+                  (d, d == 1 ? '1 day' : '$d days'),
+              ],
+              onChanged: (v) {
+                setState(() => _plannerDefaultDays = v);
+                _saveWorkspace();
+              },
+            ),
+            _settingsDropdown<int>(
+              label: 'Day starts at',
+              helper: 'Earlier hours are hidden in the Schedule and timeline.',
+              value: _plannerStartHour,
+              items: [
+                for (var h = 0; h <= 22; h++)
+                  (h, '${h.toString().padLeft(2, '0')}:00'),
+              ],
+              onChanged: (v) {
+                setState(() {
+                  _plannerStartHour = v;
+                  if (_plannerEndHour - v < 2) _plannerEndHour = v + 2;
+                });
+                _saveWorkspace();
+              },
+            ),
+            _settingsDropdown<int>(
+              label: 'Day ends at',
+              helper: 'Later hours are hidden in the Schedule and timeline.',
+              value: _plannerEndHour,
+              items: [
+                for (var h = 2; h <= 24; h++)
+                  (h, '${h.toString().padLeft(2, '0')}:00'),
+              ],
+              onChanged: (v) {
+                setState(() {
+                  _plannerEndHour = v;
+                  if (v - _plannerStartHour < 2) _plannerStartHour = v - 2;
+                });
+                _saveWorkspace();
+              },
+            ),
+            const SizedBox(height: 8),
           ],
         ),
         // ── Pomodoro ──────────────────────────────────────────────────────
@@ -38782,7 +40513,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 children: [
                   const Expanded(
                     child: Text(
-                      'Default time estimate for new sub-tasks',
+                      'Default time estimate for new sub-tasks  (not applied yet)',
                       style: TextStyle(color: Colors.white70, fontSize: 13),
                     ),
                   ),
@@ -38831,6 +40562,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 'Start tracking next task when marking current as done',
                 style: TextStyle(color: Colors.white70, fontSize: 13),
               ),
+              subtitle: const Text(
+                'Not applied yet',
+                style: const TextStyle(color: Color(0xFFB8860B), fontSize: 11),
+              ),
               value: _trackNextOnDone,
               activeColor: Colors.blueAccent,
               onChanged: (v) {
@@ -38859,7 +40594,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   ),
                   const SizedBox(width: 12),
                   const Text(
-                    'Volume',
+                    'Volume  (not applied yet)',
                     style: TextStyle(color: Colors.white70, fontSize: 13),
                   ),
                   const SizedBox(width: 8),
@@ -38893,6 +40628,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
                 decoration: const InputDecoration(
                   labelText: 'Task marked done sound',
+                  helperText: 'Not applied yet',
+                  helperStyle: TextStyle(color: Color(0xFFB8860B), fontSize: 10),
+                  
                   labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
                   enabledBorder: OutlineInputBorder(
                     borderSide: BorderSide(color: Color(0xFF2C2F32)),
@@ -38934,6 +40672,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 'Increase pitch for every task done',
                 style: TextStyle(color: Colors.white70, fontSize: 13),
               ),
+              subtitle: const Text(
+                'Not applied yet',
+                style: const TextStyle(color: Color(0xFFB8860B), fontSize: 11),
+              ),
               value: _increasePitch,
               activeColor: Colors.blueAccent,
               onChanged: (v) {
@@ -38949,6 +40691,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
                 decoration: const InputDecoration(
                   labelText: 'Task work stage begin sound',
+                  helperText: 'Not applied yet',
+                  helperStyle: TextStyle(color: Color(0xFFB8860B), fontSize: 10),
+                  
                   labelStyle: TextStyle(color: Colors.white38, fontSize: 12),
                   enabledBorder: OutlineInputBorder(
                     borderSide: BorderSide(color: Color(0xFF2C2F32)),
@@ -38983,72 +40728,6 @@ class _ResizableScreenState extends State<ResizableScreen> {
             const Divider(color: Colors.white10),
           ],
         ),
-        // ── Keyboard Shortcuts ────────────────────────────────────────────
-        _settingsCard(
-          label: 'Keyboard Shortcuts',
-          expanded: _settingsTasksExpanded,
-          onTap: () =>
-              setState(() => _settingsTasksExpanded = !_settingsTasksExpanded),
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-              child: Text(
-                'Global',
-                style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white38,
-                  letterSpacing: 1.1,
-                ),
-              ),
-            ),
-            kbRow('Add New Task', 'Shift + A'),
-            kbRow('Add New Note', 'N'),
-            kbRow('Focus Sidenav', 'Shift + D'),
-            kbRow('Show/Hide Notes', 'Shift + N'),
-            kbRow('Toggle Filter/Group/Sort Panel', 'C'),
-            kbRow('Show Search Bar', 'Shift + F'),
-            kbRow('Show/Hide Task Backlog (Inbox)', 'B'),
-            kbRow('Go To Work View & Focus First Task', 'W'),
-            kbRow('Enter Focus Mode', 'F'),
-            kbRow('Go To Schedule', 'Shift + S'),
-            kbRow('Go To Settings', 'Shift + G'),
-            kbRow('Zoom In', 'Ctrl + +'),
-            kbRow('Zoom Out', 'Ctrl + -'),
-            kbRow('Zoom Default', 'Ctrl + 0'),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-              child: Text(
-                'Tasks',
-                style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white38,
-                  letterSpacing: 1.1,
-                ),
-              ),
-            ),
-            kbRow('Edit Title', 'T'),
-            kbRow('Show/Hide Task Details', 'I'),
-            kbRow('Toggle Done', 'D'),
-            kbRow('Add Sub Task', 'A'),
-            kbRow('Attach file or link', 'L'),
-            kbRow('Delete Task', 'Backspace'),
-            kbRow('Open "Move Task To Project" menu', 'E'),
-            kbRow('Select Previous Task', 'K'),
-            kbRow('Select Next Task', 'J'),
-            kbRow('Move Task Up in List', 'Ctrl + Shift + ↑'),
-            kbRow('Move Task Down in List', 'Ctrl + Shift + ↓'),
-            kbRow('Move Task to Top of List', 'Ctrl + Alt + ↑'),
-            kbRow('Move Task to Bottom of List', 'Ctrl + Alt + ↓'),
-            kbRow('Move Task to Task Backlog', 'Shift + B'),
-            kbRow('Move Task to Today\'s Task List', 'Shift + T'),
-            kbRow('Start/Stop Task', 'Y'),
-            kbRow('Edit Tags', 'G'),
-            const SizedBox(height: 12),
-            const Divider(color: Colors.white10),
-          ],
-        ),
       ],
     );
   }
@@ -39057,7 +40736,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     return _settingsPage(
       cards: [
         _settingsCard(
-          label: 'Notes',
+          label: 'Storage',
           expanded: _settingsNotesExpanded,
           onTap: () =>
               setState(() => _settingsNotesExpanded = !_settingsNotesExpanded),
@@ -39082,71 +40761,166 @@ class _ResizableScreenState extends State<ResizableScreen> {
   Widget _buildSettingsSectionCanvas() {
     return _settingsPage(
       cards: [
-        // ── Persons canvas layout ─────────────────────────────────────────
+        // ── Canvas cards ──────────────────────────────────────────────────
         _settingsCard(
-          label: 'Persons Canvas Layout',
-          expanded: true,
-          onTap: () {},
+          label: 'Canvas Cards',
+          expanded: _settingsCanvasExpanded,
+          onTap: () => setState(
+            () => _settingsCanvasExpanded = !_settingsCanvasExpanded,
+          ),
+          children: [
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.folder_outlined,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show project name',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              subtitle: const Text(
+                'Display the project below the task title',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              value: _showProjectName,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showProjectName = v);
+                _saveWorkspace();
+              },
+            ),
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.calendar_today_outlined,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show due date on cards',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              value: _showDueDateOnCards,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showDueDateOnCards = v);
+                _saveWorkspace();
+              },
+            ),
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.hourglass_bottom_rounded,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show countdown on cards',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              subtitle: const Text(
+                'Days/hours remaining until the due date (also used on Tasks list rows)',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              value: _showCountdownOnCards,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showCountdownOnCards = v);
+                _saveWorkspace();
+              },
+            ),
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.timer_outlined,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show time estimate on cards',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              subtitle: const Text(
+                'Display the estimated duration below the title',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              value: _showTimeOnCards,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showTimeOnCards = v);
+                _saveWorkspace();
+              },
+            ),
+            SwitchListTile(
+              secondary: const Icon(
+                Icons.tag,
+                color: Colors.blueAccent,
+                size: 20,
+              ),
+              title: const Text(
+                'Show task ID on cards',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              value: _showIdOnCards,
+              activeColor: Colors.blueAccent,
+              onChanged: (v) {
+                setState(() => _showIdOnCards = v);
+                _saveWorkspace();
+              },
+            ),
+            const Divider(color: Colors.white10),
+          ],
+        ),
+        // ── New card size ─────────────────────────────────────────────────
+        _settingsCard(
+          label: 'New Card Size',
+          expanded: _settingsNewCardExpanded,
+          onTap: () => setState(
+            () => _settingsNewCardExpanded = !_settingsNewCardExpanded,
+          ),
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                const Text(
-                  'Controls the default spacing on the Visualizer › Persons canvas.',
-                  style: TextStyle(color: Colors.white38, fontSize: 11),
-                ),
-                const SizedBox(height: 16),
-
-                // ── Block-to-wall padding ─────────────────────────────────
-                Row(children: [
-                  const Icon(Icons.border_outer_rounded, size: 15, color: Colors.white38),
-                  const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text('Wall padding',
-                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: _cardSizeField(
+                      label: 'Width',
+                      value: _newCardWidth,
+                      min: 160,
+                      max: 1200,
+                      onValid: (v) {
+                        setState(() => _newCardWidth = v);
+                        AppPrefs.newCardWidth = v;
+                        _saveWorkspace();
+                      },
+                    ),
                   ),
-                  Text('${_personCanvasPadding.round()} px',
-                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
-                ]),
-                Slider(
-                  value: _personCanvasPadding,
-                  min: 0,
-                  max: 48,
-                  divisions: 48,
-                  activeColor: Colors.blueAccent,
-                  inactiveColor: Colors.white12,
-                  onChanged: (v) => setState(() => _personCanvasPadding = v),
-                  onChangeEnd: (_) => _saveWorkspace(),
-                ),
-
-                const SizedBox(height: 8),
-
-                // ── Block-to-block gap ────────────────────────────────────
-                Row(children: [
-                  const Icon(Icons.space_bar_rounded, size: 15, color: Colors.white38),
-                  const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text('Block gap',
-                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _cardSizeField(
+                      label: 'Height',
+                      value: _newCardHeight,
+                      min: 100,
+                      max: 1200,
+                      onValid: (v) {
+                        setState(() => _newCardHeight = v);
+                        AppPrefs.newCardHeight = v;
+                        _saveWorkspace();
+                      },
+                    ),
                   ),
-                  Text('${_personCanvasGap.round()} px',
-                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
-                ]),
-                Slider(
-                  value: _personCanvasGap,
-                  min: 0,
-                  max: 32,
-                  divisions: 32,
-                  activeColor: Colors.blueAccent,
-                  inactiveColor: Colors.white12,
-                  onChanged: (v) => setState(() => _personCanvasGap = v),
-                  onChangeEnd: (_) => _saveWorkspace(),
-                ),
-              ]),
+                ],
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 14),
+              child: Text(
+                'Applies only to newly created task cards; existing cards keep their size.',
+                style: TextStyle(fontSize: 11, color: Colors.white38),
+              ),
             ),
           ],
         ),
-
         // ── Canvas Time Gradation (Gantt) master toggle ──────────────────
         _settingsCard(
           label: 'Time Gradation (Gantt-Like Diagram)',
@@ -39336,6 +41110,168 @@ class _ResizableScreenState extends State<ResizableScreen> {
     );
   }
 
+  Widget _buildSettingsSectionVisualizers() {
+    return _settingsPage(
+      cards: [
+        // ── Persons canvas layout ─────────────────────────────────────────
+        _settingsCard(
+          label: 'Persons Canvas Layout',
+          expanded: true,
+          onTap: () {},
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const Text(
+                  'Controls the default spacing on the Visualizer › Persons canvas.',
+                  style: TextStyle(color: Colors.white38, fontSize: 11),
+                ),
+                const SizedBox(height: 16),
+
+                // ── Block-to-wall padding ─────────────────────────────────
+                Row(children: [
+                  const Icon(Icons.border_outer_rounded, size: 15, color: Colors.white38),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text('Wall padding',
+                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                  ),
+                  Text('${_personCanvasPadding.round()} px',
+                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
+                ]),
+                Slider(
+                  value: _personCanvasPadding,
+                  min: 0,
+                  max: 48,
+                  divisions: 48,
+                  activeColor: Colors.blueAccent,
+                  inactiveColor: Colors.white12,
+                  onChanged: (v) => setState(() => _personCanvasPadding = v),
+                  onChangeEnd: (_) => _saveWorkspace(),
+                ),
+
+                const SizedBox(height: 8),
+
+                // ── Block-to-block gap ────────────────────────────────────
+                Row(children: [
+                  const Icon(Icons.space_bar_rounded, size: 15, color: Colors.white38),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text('Block gap',
+                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                  ),
+                  Text('${_personCanvasGap.round()} px',
+                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
+                ]),
+                Slider(
+                  value: _personCanvasGap,
+                  min: 0,
+                  max: 32,
+                  divisions: 32,
+                  activeColor: Colors.blueAccent,
+                  inactiveColor: Colors.white12,
+                  onChanged: (v) => setState(() => _personCanvasGap = v),
+                  onChangeEnd: (_) => _saveWorkspace(),
+                ),
+              ]),
+            ),
+          ],
+        ),
+
+      ],
+    );
+  }
+
+  List<Widget> _shortcutCards() {
+    return [
+        _settingsCard(
+          label: 'Global',
+          expanded: true,
+          onTap: () {},
+          children: [
+            _kbRow('Add New Task', 'Shift + A'),
+            _kbRow('Focus Sidenav', 'Shift + D'),
+            _kbRow('Toggle Filter/Group/Sort Panel', 'C'),
+            _kbRow('Show Search Bar', 'Shift + F'),
+            _kbRow('Show/Hide Task Backlog (Inbox)', 'B'),
+            _kbRow('Go To Work View & Focus First Task', 'W'),
+            _kbRow('Enter Focus Mode', 'F'),
+            _kbRow('Go To Schedule', 'Shift + S'),
+            _kbRow('Go To Settings', 'Shift + G'),
+            _kbRow('Zoom In', 'Ctrl + +'),
+            _kbRow('Zoom Out', 'Ctrl + -'),
+            _kbRow('Zoom Default', 'Ctrl + 0'),
+            const SizedBox(height: 12),
+          ],
+        ),
+        _settingsCard(
+          label: 'Tasks',
+          expanded: true,
+          onTap: () {},
+          children: [
+            _kbRow('Edit Title', 'T'),
+            _kbRow('Show/Hide Task Details', 'I'),
+            _kbRow('Toggle Done', 'D'),
+            _kbRow('Add Sub Task', 'A'),
+            _kbRow('Attach file or link', 'L'),
+            _kbRow('Delete Task', 'Backspace'),
+            _kbRow('Open "Move Task To Project" menu', 'E'),
+            _kbRow('Select Previous Task', 'K'),
+            _kbRow('Select Next Task', 'J'),
+            _kbRow('Move Task Up in List', 'Ctrl + Shift + ↑'),
+            _kbRow('Move Task Down in List', 'Ctrl + Shift + ↓'),
+            _kbRow('Move Task to Top of List', 'Ctrl + Alt + ↑'),
+            _kbRow('Move Task to Bottom of List', 'Ctrl + Alt + ↓'),
+            _kbRow('Move Task to Task Backlog', 'Shift + B'),
+            _kbRow('Move Task to Today\'s Task List', 'Shift + T'),
+            _kbRow('Start/Stop Task', 'Y'),
+            _kbRow('Edit Tags', 'G'),
+            const SizedBox(height: 12),
+          ],
+        ),
+        _settingsCard(
+          label: 'Notes',
+          expanded: true,
+          onTap: () {},
+          children: [
+            _kbRow('Add New Note', 'N'),
+            _kbRow('Show/Hide Notes', 'Shift + N'),
+            const SizedBox(height: 12),
+          ],
+        ),
+    ];
+  }
+
+  Widget _kbRow(String action, String shortcut) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+    child: Row(
+      children: [
+        Expanded(
+          child: Text(
+            action,
+            style: const TextStyle(color: Colors.white60, fontSize: 12),
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A1C1E),
+            borderRadius: BorderRadius.circular(5),
+            border: Border.all(color: const Color(0xFF3A3D42)),
+          ),
+          child: Text(
+            shortcut,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+              fontFamily: 'monospace',
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
   Widget _buildSettingsSectionProjects() {
     return _settingsPage(
       cards: [
@@ -39448,7 +41384,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         (_showProjectName ? 14.0 : 0) +
         (_showDueDateOnCards ? 14.0 : 0) +
         ((_showDueDateOnCards && hasTimeStr) ? 14.0 : 0) +
-        (_showCountdownOnCards && task.dueDay != null ? 14.0 : 0);
+        (_showCountdownOnCards && task.dueDay != null ? 14.0 : 0) +
+        (_showTimeOnCards && task.durationMinutes > 0 ? 14.0 : 0);
 
     return Material(
       type: MaterialType.transparency,
@@ -39599,11 +41536,11 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                   _currentCursorLocalPos = null;
                                 });
                                 ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
+                                  SnackBar(
                                     content: Text(
                                       'Connection blocked: Path already exists.',
                                     ),
-                                    duration: Duration(seconds: 2),
+                                    duration: snackDur(Duration(seconds: 2)),
                                   ),
                                 );
                               }
@@ -39847,6 +41784,37 @@ class _ResizableScreenState extends State<ResizableScreen> {
                                                   fontSize: 9,
                                                   fontFamily: 'monospace',
                                                 ),
+                                              ),
+                                            ),
+                                          if (_showTimeOnCards &&
+                                              task.durationMinutes > 0)
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 2,
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(
+                                                    Icons.timer_outlined,
+                                                    size: 9,
+                                                    color: Colors.white
+                                                        .withOpacity(0.4),
+                                                  ),
+                                                  const SizedBox(width: 3),
+                                                  Text(
+                                                    task.durationMinutes >= 60
+                                                        ? '${task.durationMinutes ~/ 60}h'
+                                                            '${task.durationMinutes % 60 == 0 ? '' : ' ${task.durationMinutes % 60}m'}'
+                                                        : '${task.durationMinutes}m',
+                                                    style: TextStyle(
+                                                      color: Colors.white
+                                                          .withOpacity(0.4),
+                                                      fontSize: 9,
+                                                      fontFamily: 'monospace',
+                                                    ),
+                                                  ),
+                                                ],
                                               ),
                                             ),
                                           if (_showDueDateOnCards)
@@ -40331,6 +42299,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
         (_showDueDateOnCards ? 14.0 : 0) +
         ((_showDueDateOnCards && hasTimeStr) ? 14.0 : 0) +
         (_showCountdownOnCards && task.dueDay != null ? 14.0 : 0) +
+        (_showTimeOnCards && task.durationMinutes > 0 ? 14.0 : 0) +
         (borderWidth * 2);
   }
 
@@ -40832,6 +42801,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         _isNotesView = true;
         _isTasksView = false;
         _isSettingsView = false;
+        _isVisualizerView = false;
+        _isFilesView = false;
         _notesNavSection = 'editor';
         _activeNoteId = noteId;
         if (!_openNoteTabs.contains(noteId)) _openNoteTabs.add(noteId);
@@ -45841,6 +47812,10 @@ class _ScheduleCanvas extends StatefulWidget {
   final Map<String, Color> projectColors;
   // Feature 8: right-click opens the standard task context menu
   final void Function(Task task, Offset globalPos)? onContextMenu;
+  // User settings (Settings → Tasks → Planner)
+  final int defaultVisibleDays; // columns shown at default zoom
+  final int startHour; // first visible hour (0–22)
+  final int endHour; // end of visible range (2–24)
 
   const _ScheduleCanvas({
     Key? key,
@@ -45855,6 +47830,9 @@ class _ScheduleCanvas extends StatefulWidget {
     required this.onCreateRequest,
     this.onVisibleRangeChanged,
     this.onContextMenu,
+    this.defaultVisibleDays = 7,
+    this.startHour = 0,
+    this.endHour = 24,
   }) : super(key: key);
 
   @override
@@ -45871,7 +47849,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
 
   // ── State ──────────────────────────────────────────────────────────────────
   // _scale: VERTICAL zoom (hour height = _bHH * _scale).
-  // _hScale: HORIZONTAL zoom (visibleDays = ceil(7 / _hScale)).
+  // _hScale: HORIZONTAL zoom (visibleDays = ceil(baseDays / _hScale)).
   // They start equal and can diverge via axis-specific zoom.
   double _scale = 1.0;
   double _hScale = 1.0;
@@ -46025,16 +48003,31 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
 
   Timer? _clockTimer;
 
+  // ── User-configurable view defaults ────────────────────────────────────────
+  /// Columns visible at _hScale == 1.0 (Settings → Planner → Visible days).
+  int get _baseDays => widget.defaultVisibleDays.clamp(1, 14);
+
+  /// Fewest columns the horizontal zoom may show: a full week, or less when
+  /// the user chose a smaller default.
+  int get _minVisibleDays => math.min(_baseDays, 7);
+
+  int _visibleDaysFor(double hScale) =>
+      ((_baseDays / hScale) - 1e-9).ceil().clamp(_minVisibleDays, 365);
+
+  /// Hour that is scrolled into view when the canvas opens / resets.
+  int get _initialHour => math.max(7, widget.startHour);
+
   // ── Lifecycle ──────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    // Store the desired 7-AM offset unconditionally. _clampOY cannot do its
+    // Store the desired initial offset (7 AM, or the first visible hour)
+    // unconditionally. _clampOY cannot do its
     // job here because _canvasH/_scrollH are 0 before the first layout pass.
     // A post-frame callback re-clamps _oy once real dimensions are available,
     // which prevents the first build from clamping everything to 0 and hiding
     // all task cards.
-    _oy = -(7 * _bHH + _padT); // scroll to 7 AM on open
+    _oy = -(_initialHour * _bHH + _padT); // scroll to 7 AM on open
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         setState(() {
@@ -46051,6 +48044,11 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
   @override
   void didUpdateWidget(_ScheduleCanvas oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // Visible hour range changed in Settings → keep the scroll inside it.
+    if (oldWidget.startHour != widget.startHour ||
+        oldWidget.endHour != widget.endHour) {
+      _oy = _clampOY(_oy, _scale);
+    }
     // When the parent sets a new weekStart (from Shift-drag feedback), compensate
     // _dayShift so the visual position stays the same.
     // When a deliberate top-bar navigation triggered this update, skip the
@@ -46123,7 +48121,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
       _hScale = 1.0;
       _ox = 0.0;
       _dayShift = 0;
-      _oy = _clampOY(-(7 * _bHH * _scale + _padT), _scale);
+      _oy = _clampOY(-(_initialHour * _bHH * _scale + _padT), _scale);
     });
   }
 
@@ -46147,11 +48145,11 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
       _dayShift = 0;
       _ox = 0.0;
       if (mode == 'month') {
-        _hScale = 7.0 / 30.0; // 30 columns visible
+        _hScale = _baseDays / 30.0; // 30 columns visible
       } else if (mode == '14d') {
-        _hScale = 7.0 / 14.0; // 14 columns visible
+        _hScale = _baseDays / 14.0; // 14 columns visible
       } else {
-        _hScale = 1.0; // 7 columns visible (week)
+        _hScale = _baseDays / 7.0; // 7 columns visible (week)
       }
     });
   }
@@ -46162,7 +48160,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
     setState(() {
       _dayShift = 0;
       _ox = 0.0;
-      _hScale = 7.0 / days.clamp(1, 365);
+      _hScale = _baseDays / days.clamp(1, 365);
     });
   }
 
@@ -46176,7 +48174,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
       _ox = 0.0;
       _oy = _clampOY(midY - origWY * newScale, newScale);
     });
-    final newVD = (7.0 / _hScale).ceil().clamp(7, 365);
+    final newVD = _visibleDaysFor(_hScale);
     _snapToBoundary(visibleDays: newVD);
   }
 
@@ -46190,7 +48188,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
       _ox = 0.0;
       _oy = _clampOY(midY - origWY * newScale, newScale);
     });
-    final newVD = (7.0 / _hScale).ceil().clamp(7, 365);
+    final newVD = _visibleDaysFor(_hScale);
     _snapToBoundary(visibleDays: newVD);
   }
 
@@ -46202,9 +48200,11 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
   // Minimum scale: hard floor so day content never becomes invisible.
   static const double _absMinScale = 0.05;
 
-  // Scale at which 24h + pads exactly fills the scroll area.
-  double get _fitScale =>
-      _scrollH > 0 ? (_scrollH - _padT - _padB) / (24 * _bHH) : _absMinScale;
+  // Scale at which the visible hour range + pads exactly fills the scroll area.
+  double get _fitScale => _scrollH > 0
+      ? (_scrollH - _padT - _padB) /
+            ((widget.endHour - widget.startHour) * _bHH)
+      : _absMinScale;
 
   // Effective VERTICAL scale: never compress below fit (24h always fills view).
   // Horizontal zoom (_visibleDays) keeps using raw _scale so more days appear.
@@ -46212,12 +48212,16 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
 
   // Clamp _oy so content never leaves empty space — but if content is
   // shorter than the canvas (fully zoomed out), pin to top (oy = 0).
+  // Only the user's visible hour range (Settings → Planner) can be scrolled to:
+  // `top` is the offset that puts the first visible hour just under the top pad.
   double _clampOY(double oy, double scale) {
     final vs = scale < _fitScale ? _fitScale : scale;
-    final totalH = 24 * _bHH * vs + _padT + _padB;
+    final top = -widget.startHour * _bHH * vs;
+    final totalH =
+        (widget.endHour - widget.startHour) * _bHH * vs + _padT + _padB;
     final h = _scrollH > 0 ? _scrollH : _canvasH;
-    if (totalH <= h) return 0.0;
-    return oy.clamp(h - totalH, 0.0);
+    if (totalH <= h) return top;
+    return oy.clamp(top - (totalH - h), top);
   }
 
   bool get _busy => _dragId != null || _resizeId != null || _hResizeId != null;
@@ -46329,7 +48333,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
   void _zoomH(double screenX, double factor, double cw) {
     final newHScale = (_hScale * factor).clamp(_absMinScale, 6.0);
     final worldCol = (screenX - _ox - _tCW) / cw;
-    final newVD = (7.0 / newHScale).ceil().clamp(7, 365);
+    final newVD = _visibleDaysFor(newHScale);
     final newCw = _canvasW > 0 ? (_canvasW - _tCW) / newVD : cw;
     _hScale = newHScale;
     _ox = screenX - _tCW - worldCol * newCw;
@@ -46409,7 +48413,7 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
 
         // visibleDays: zoom out (_scale < 1) -> more days; zoom in -> fewer.
         // Minimum 7 so a full week is always shown at default zoom.
-        final int visibleDays = (7.0 / _hScale).ceil().clamp(7, 365);
+        final int visibleDays = _visibleDaysFor(_hScale);
         _visibleDays = visibleDays;
         final cw = _colW(visibleDays);
         final days = List.generate(
@@ -46584,6 +48588,8 @@ class _ScheduleCanvasState extends State<_ScheduleCanvas> {
                                     padB: _padB,
                                     todayCol: todayCol,
                                     visibleDays: visibleDays,
+                                    startHour: widget.startHour,
+                                    endHour: widget.endHour,
                                   ),
                                 ),
                               ),
@@ -48758,8 +50764,11 @@ class _ScheduleGridPainter extends CustomPainter {
   final double scale, ox, oy, colW, bHH, tCW, padT, padB;
   final int todayCol;
   final int visibleDays;
+  final int startHour, endHour; // visible hour range (default 0–24)
 
   const _ScheduleGridPainter({
+    this.startHour = 0,
+    this.endHour = 24,
     required this.scale,
     required this.ox,
     required this.oy,
@@ -48775,10 +50784,12 @@ class _ScheduleGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final hourH = bHH * scale; // scaled pixel height of one hour
-    final dayH = 24 * hourH; // total height of the 24-hour block
 
     // Origin of hour-0 in screen coords
     final originY = oy + padT;
+    // Screen Y where the visible hour range begins / ends
+    final rangeTopY = originY + startHour * hourH;
+    final rangeBottomY = originY + endHour * hourH;
 
     // ── Paints ────────────────────────────────────────────────────────────────
     final hourPaint = Paint()
@@ -48799,7 +50810,7 @@ class _ScheduleGridPainter extends CustomPainter {
     final padPaint = Paint()..color = const Color(0xFF0E0F10);
 
     // ── Top pad zone (above 12 AM) ────────────────────────────────────────────
-    final topPadBottom = originY.clamp(0.0, size.height);
+    final topPadBottom = rangeTopY.clamp(0.0, size.height);
     if (topPadBottom > 0) {
       canvas.drawRect(
         Rect.fromLTWH(tCW, 0, size.width - tCW, topPadBottom),
@@ -48808,7 +50819,7 @@ class _ScheduleGridPainter extends CustomPainter {
     }
 
     // ── Bottom pad zone (below 11:55 PM) ──────────────────────────────────────
-    final bottomPadTop = (originY + dayH).clamp(0.0, size.height);
+    final bottomPadTop = rangeBottomY.clamp(0.0, size.height);
     if (bottomPadTop < size.height) {
       canvas.drawRect(
         Rect.fromLTWH(
@@ -48847,7 +50858,7 @@ class _ScheduleGridPainter extends CustomPainter {
 
     if (show5 || show15) {
       final int steps = show5 ? 12 : 4;
-      for (int h = 0; h < 24; h++) {
+      for (int h = startHour; h < endHour; h++) {
         for (int s = 1; s < steps; s++) {
           final y = (h + s / steps) * hourH + originY;
           if (y < 0 || y > size.height) continue;
@@ -48858,7 +50869,7 @@ class _ScheduleGridPainter extends CustomPainter {
         }
       }
     } else {
-      for (int h = 0; h < 24; h++) {
+      for (int h = startHour; h < endHour; h++) {
         final y2 = (h + 0.5) * hourH + originY;
         if (y2 >= 0 && y2 <= size.height) {
           canvas.drawLine(
@@ -48877,7 +50888,7 @@ class _ScheduleGridPainter extends CustomPainter {
       fontWeight: FontWeight.w500,
     );
 
-    for (int h = 0; h <= 24; h++) {
+    for (int h = startHour; h <= endHour; h++) {
       final y = h * hourH + originY;
       if (y < -20 || y > size.height + 1) continue;
 
@@ -48885,7 +50896,7 @@ class _ScheduleGridPainter extends CustomPainter {
         canvas.drawLine(Offset(tCW, y), Offset(size.width, y), hourPaint);
       }
 
-      if (h < 24) {
+      if (h < endHour) {
         final label = h == 0 ? '12 AM' : _labelFor(h);
         final tp = TextPainter(
           text: TextSpan(text: label, style: labelStyle),
@@ -48933,6 +50944,8 @@ class _ScheduleGridPainter extends CustomPainter {
       o.padB != padB ||
       o.todayCol != todayCol ||
       o.visibleDays != visibleDays ||
+      o.startHour != startHour ||
+      o.endHour != endHour ||
       o.tCW != tCW;
 }
 
@@ -52445,7 +54458,16 @@ class _DueDatePickerPanelState extends State<_DueDatePickerPanel> {
   final TextEditingController _timeCtrl = TextEditingController();
   final FocusNode _timeFocusNode = FocusNode();
 
-  static const _weekDays = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+  static const _weekDaysMonFirst = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+  /// Weekday header letters rotated to start on the user's first day.
+  List<String> get _weekDays {
+    final i = AppPrefs.firstDayOfWeek - 1;
+    return [
+      ..._weekDaysMonFirst.sublist(i),
+      ..._weekDaysMonFirst.sublist(0, i),
+    ];
+  }
   static const _monthNames = [
     'JAN',
     'FEB',
@@ -52571,8 +54593,8 @@ class _DueDatePickerPanelState extends State<_DueDatePickerPanel> {
   /// Build the 6×7 calendar grid for the current _viewMonth.
   List<DateTime?> _calendarDays() {
     final first = _viewMonth;
-    // weekday: 1=Mon … 7=Sun → offset so Mon is col 0
-    final startOffset = (first.weekday - 1) % 7;
+    // weekday: 1=Mon … 7=Sun → offset so the user's first weekday is col 0
+    final startOffset = (first.weekday - AppPrefs.firstDayOfWeek + 7) % 7;
     final daysInMonth = DateTime(_viewMonth.year, _viewMonth.month + 1, 0).day;
     final cells = <DateTime?>[];
     for (int i = 0; i < startOffset; i++) cells.add(null);
@@ -57682,6 +59704,10 @@ class _SpLiveMarkdownController extends TextEditingController {
   // ── Public accessors ───────────────────────────────────────────────────────
 
   String get backingText => _backingText;
+
+  /// Índice usado para colorir [[links]] (resolvido / ambíguo / sem destino).
+  /// O editor atribui isto a cada build; não notifica (evita loop de save).
+  RefIndex refIndex = RefIndex.empty;
   List<_Fold> get folds => List.unmodifiable(_folds);
 
   bool isFoldedAt(int headingLineStart) {
@@ -58019,6 +60045,7 @@ class _SpLiveMarkdownController extends TextEditingController {
     required bool withComposing,
   }) {
     final cur = _sel.isValid ? _sel.baseOffset : -1;
+    kRefStyleIndex = refIndex; // lido por _buildLineInlineSpan (refs_ui.dart)
     return _buildDocumentSpan(_displayText, cur, style ?? _kDocBase);
   }
 }
@@ -58259,6 +60286,17 @@ TextSpan _buildDocumentSpan(String text, int cursorPos, TextStyle base) {
 
 TextSpan _buildLineInlineSpan(String text, TextStyle base, int cursorPos) {
   if (text.isEmpty) return TextSpan(text: '', style: base);
+
+  // [[links]] são tratados ANTES de **negrito**/*itálico*: um `_` ou `*` no
+  // título não pode virar formatação. Os trechos entre links voltam aqui.
+  final refSpan = buildEditorLinkSpans(
+    text,
+    base,
+    cursorPos,
+    kRefStyleIndex,
+    (seg, st, cur) => _buildLineInlineSpan(seg, st, cur),
+  );
+  if (refSpan != null) return refSpan;
 
   final dimMarker = base.copyWith(
     color: (base.color ?? _nordFrost).withOpacity(0.30),
@@ -61932,6 +63970,13 @@ class _NotesEditor extends StatefulWidget {
   /// [currentId] is the note being renamed and must be excluded from the check.
   final bool Function(String newTitle, String currentId)? isTitleTaken;
 
+  /// Referências [[id|Título]]: índice, autocomplete, backlinks. Null = desligado.
+  final RefsController? refs;
+
+  /// Id deste documento no espaço de ids das referências. Null = usa `note.id`
+  /// (notas); para arquivos de entidade é o `id` do frontmatter (ou null).
+  final String? selfRefId;
+
   const _NotesEditor({
     Key? key,
     required this.note,
@@ -61942,6 +63987,8 @@ class _NotesEditor extends StatefulWidget {
     this.onDeleteNote,
     this.isTitleTaken,
     this.onFoldsChanged,
+    this.refs,
+    this.selfRefId,
   }) : super(key: key);
 
   @override
@@ -61983,6 +64030,15 @@ class _NotesEditorState extends State<_NotesEditor> {
   // ── Reading mode hover — lineOffset of the hovered heading, null when none ──
   int? _readingHoveredLineOffset;
 
+  // ── Referências [[id|Título]] ─────────────────────────────────────────────
+  WikiTrigger? _refTrigger; // `[[` aberto antes do cursor (menu visível)
+  List<RefTarget> _refItems = const [];
+  int _refSel = 0;
+
+  String? get _selfRefId =>
+      widget.selfRefId ??
+      ((widget.note?.id ?? '').startsWith('person_file:') ? null : widget.note?.id);
+
   // ── Save debounce ─────────────────────────────────────────────────────────
   Timer? _saveDebounce;
 
@@ -62003,6 +64059,8 @@ class _NotesEditorState extends State<_NotesEditor> {
       _ctrl.restoreFolds(note.collapsedHeadings);
     }
     _ctrl.addListener(_onDocChanged);
+    widget.refs?.addListener(_onRefsChanged);
+    widget.refs?.onRefreshEntities?.call(); // entidades entram no índice (limitado)
     _titleCtrl.addListener(_onTitleTextChanged);
     _titleFocusNode.addListener(() {
       if (!_titleFocusNode.hasFocus) _save();
@@ -62041,6 +64099,7 @@ class _NotesEditorState extends State<_NotesEditor> {
 
   @override
   void dispose() {
+    widget.refs?.removeListener(_onRefsChanged);
     _saveDebounce?.cancel();
     _titleCtrl.removeListener(_onTitleTextChanged);
     _titleCtrl.dispose();
@@ -62054,6 +64113,7 @@ class _NotesEditorState extends State<_NotesEditor> {
   // ── Save ──────────────────────────────────────────────────────────────────
 
   void _onDocChanged() {
+    _updateRefMenu();
     // setState rebuilds the gutter widget, which reads the backing text.
     if (mounted) setState(() {});
     _saveDebounce?.cancel();
@@ -62089,6 +64149,115 @@ class _NotesEditorState extends State<_NotesEditor> {
     note.content = (raw == '\n') ? '' : raw;
     note.updatedAt = DateTime.now();
     widget.onNoteChanged(note, oldTitle: oldTitle);
+  }
+
+  // ── Referências [[id|Título]] ─────────────────────────────────────────────
+  //
+  // Digite `[[` → menu de sugestões; Enter grava `[[id|Título]]`. O id é o que
+  // resolve; o título é só rótulo. Ctrl+clique (ou Ctrl+Enter) abre o destino.
+
+  void _onRefsChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _closeRefMenu() {
+    _refTrigger = null;
+    _refItems = const [];
+    _refSel = 0;
+  }
+
+  /// Abre, atualiza ou fecha o menu a cada mudança de texto/cursor.
+  /// Só mexe nos campos; quem chama já reconstrói o widget.
+  void _updateRefMenu() {
+    final refs = widget.refs;
+    final sel = _ctrl.selection;
+    if (refs == null || _readingMode || !sel.isValid || !sel.isCollapsed) {
+      _closeRefMenu();
+      return;
+    }
+    final trig = findWikiTrigger(_ctrl.text, sel.baseOffset);
+    if (trig == null) {
+      _closeRefMenu();
+      return;
+    }
+    final items = refs.index.suggest(trig.query, excludeId: _selfRefId);
+    final prev = _refTrigger;
+    if (prev == null || prev.query != trig.query || prev.start != trig.start) {
+      _refSel = 0;
+    }
+    _refTrigger = trig;
+    _refItems = items;
+    if (_refSel >= items.length) _refSel = 0;
+  }
+
+  void _acceptRef(RefTarget t) {
+    final trig = _refTrigger;
+    final sel = _ctrl.selection;
+    if (trig == null || !sel.isValid) return;
+    final res = applyWikiCompletion(_ctrl.text, sel.baseOffset, trig, t);
+    setState(_closeRefMenu);
+    _ctrl.value = TextEditingValue(
+      text: res.text,
+      selection: TextSelection.collapsed(offset: res.cursor),
+    );
+    _save();
+    _focus.requestFocus();
+  }
+
+  /// Ctrl/Cmd+clique num [[link]] abre o destino (clique simples só edita).
+  void _onEditorTap() {
+    final kb = HardwareKeyboard.instance;
+    if (!(kb.isControlPressed || kb.isMetaPressed)) return;
+    _openLinkAtCursor();
+  }
+
+  bool _openLinkAtCursor() {
+    final refs = widget.refs;
+    final sel = _ctrl.selection;
+    if (refs == null || !sel.isValid || !sel.isCollapsed) return false;
+    final l = wikiLinkAt(_ctrl.text, sel.baseOffset);
+    if (l == null) return false;
+    _openRes(refs.index.resolve(l));
+    return true;
+  }
+
+  void _openRes(RefResolution r) {
+    final refs = widget.refs;
+    if (refs == null) return;
+    final t = r.target;
+    if (t != null) {
+      _save(); // não perder o que foi digitado antes de trocar de nota
+      refs.open(t);
+    } else if (r.ambiguous) {
+      showRefPicker(context, r.candidates, (picked) {
+        _save();
+        refs.open(picked);
+      });
+    } else {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text('This link has no target.')),
+      );
+    }
+  }
+
+  /// `[[Título]]` → `[[id|Título]]` para os links que hoje resolvem só pelo título.
+  void _fixateLinks() {
+    final refs = widget.refs;
+    if (refs == null) return;
+    final before = _ctrl.backingText;
+    final after = refs.index.fixateLinks(before);
+    if (after == before) return;
+    final folds = _ctrl.getFoldedHeadings();
+    _ctrl.resetContent(after);
+    if (folds.isNotEmpty) _ctrl.restoreFolds(folds);
+    _save();
+  }
+
+  /// Markdown inline do modo leitura, com [[links]] clicáveis.
+  TextSpan _readInline(String text, TextStyle base) {
+    final refs = widget.refs;
+    if (refs == null || !text.contains('[[')) return _buildInlineSpan(text, base);
+    return buildReadingLinkSpans(text, base, refs.index, _openRes, _buildInlineSpan);
   }
 
   // ── Text mutation helpers ─────────────────────────────────────────────────
@@ -62173,8 +64342,37 @@ class _NotesEditorState extends State<_NotesEditor> {
     final ctrlHeld = HardwareKeyboard.instance.isControlPressed;
     final shiftHeld = HardwareKeyboard.instance.isShiftPressed;
 
+    // ── Menu de [[links]]: ↑ ↓ · Enter/Tab aceita · Esc fecha ────────────
+    if (_refTrigger != null && !ctrlHeld) {
+      if (key == LogicalKeyboardKey.escape) {
+        setState(_closeRefMenu);
+        return KeyEventResult.handled;
+      }
+      if (_refItems.isNotEmpty) {
+        if (key == LogicalKeyboardKey.arrowDown) {
+          setState(() => _refSel = (_refSel + 1) % _refItems.length);
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowUp) {
+          setState(() => _refSel = (_refSel - 1 + _refItems.length) % _refItems.length);
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.enter ||
+            key == LogicalKeyboardKey.numpadEnter ||
+            key == LogicalKeyboardKey.tab) {
+          _acceptRef(_refItems[_refSel]);
+          return KeyEventResult.handled;
+        }
+      }
+    }
+
     // ── Ctrl shortcuts ───────────────────────────────────────────────────
     if (ctrlHeld) {
+      // Ctrl+Enter: abre o [[link]] sob o cursor.
+      if ((key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.numpadEnter) &&
+          _openLinkAtCursor()) {
+        return KeyEventResult.handled;
+      }
       if (key == LogicalKeyboardKey.keyB) {
         _wrapSelection('**');
         return KeyEventResult.handled;
@@ -62618,6 +64816,27 @@ class _NotesEditorState extends State<_NotesEditor> {
   // ── Editing view ──────────────────────────────────────────────────────────
 
   Widget _buildEditingView() {
+    _ctrl.refIndex = widget.refs?.index ?? RefIndex.empty;
+    final menuOpen = _refTrigger != null && !_readingMode;
+    return Stack(
+      children: [
+        Positioned.fill(child: _buildEditingViewCore()),
+        if (menuOpen)
+          Positioned(
+            left: 44,
+            bottom: 16,
+            child: RefSuggestionList(
+              query: _refTrigger!.query,
+              items: _refItems,
+              selected: _refSel,
+              onPick: _acceptRef,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildEditingViewCore() {
     return Focus(
       // This Focus intercepts key events before the TextField processes them.
       // canRequestFocus: false keeps it invisible to Tab-order traversal.
@@ -62723,6 +64942,7 @@ class _NotesEditorState extends State<_NotesEditor> {
                       child: TextField(
                         controller: _ctrl,
                         focusNode: _focus,
+                        onTap: _onEditorTap,
                         maxLines: null,
                         cursorColor: _nordCyan,
                         cursorWidth: 1.5,
@@ -62750,6 +64970,18 @@ class _NotesEditorState extends State<_NotesEditor> {
                 ),
               ),
             ),
+
+            // ── Backlinks (derivados do índice) ─────────────────────────
+            if (widget.refs != null && _selfRefId != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 36, top: 28),
+                child: RefBacklinksPanel(
+                  refs: widget.refs!,
+                  selfId: _selfRefId!,
+                  fixableCount: widget.refs!.index.countFixable(_ctrl.backingText),
+                  onFixate: _fixateLinks,
+                ),
+              ),
 
             // Tap-below area: click anywhere below the text to focus ──
             // Also move cursor to the end so the next keystroke appends
@@ -63014,6 +65246,11 @@ class _NotesEditorState extends State<_NotesEditor> {
           const SizedBox(height: 32),
           for (int i = 0; i < visible.length; i++)
             _buildReadingBlock(visible, i),
+          if (widget.refs != null && _selfRefId != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 36, top: 28),
+              child: RefBacklinksPanel(refs: widget.refs!, selfId: _selfRefId!),
+            ),
         ],
       ),
     );
@@ -63123,7 +65360,7 @@ class _NotesEditorState extends State<_NotesEditor> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: RichText(
-                    text: _buildInlineSpan(
+                    text: _readInline(
                       displayText,
                       TextStyle(
                         fontFamily: 'Inter',
@@ -63160,7 +65397,7 @@ class _NotesEditorState extends State<_NotesEditor> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: RichText(
-                    text: _buildInlineSpan(
+                    text: _readInline(
                       b.content,
                       TextStyle(
                         fontFamily: 'Inter',
@@ -63199,7 +65436,7 @@ class _NotesEditorState extends State<_NotesEditor> {
               ),
               Expanded(
                 child: RichText(
-                  text: _buildInlineSpan(
+                  text: _readInline(
                     b.content,
                     const TextStyle(
                       fontFamily: 'Inter',
@@ -63242,7 +65479,7 @@ class _NotesEditorState extends State<_NotesEditor> {
               ),
               Expanded(
                 child: RichText(
-                  text: _buildInlineSpan(
+                  text: _readInline(
                     b.content,
                     const TextStyle(
                       fontFamily: 'Inter',
@@ -63278,7 +65515,7 @@ class _NotesEditorState extends State<_NotesEditor> {
               ),
               Expanded(
                 child: RichText(
-                  text: _buildInlineSpan(
+                  text: _readInline(
                     b.content,
                     TextStyle(
                       fontFamily: 'Inter',
@@ -63306,7 +65543,7 @@ class _NotesEditorState extends State<_NotesEditor> {
       Padding(
         padding: const EdgeInsets.only(bottom: 4),
         child: RichText(
-          text: _buildInlineSpan(
+          text: _readInline(
             b.content,
             const TextStyle(
               fontFamily: 'Inter',
@@ -63567,7 +65804,7 @@ class _OrgSettingsViewState extends State<_OrgSettingsView> {
         SnackBar(
           content: Text('A project named "$n" already exists.'),
           backgroundColor: const Color(0xFFB71C1C),
-          duration: const Duration(seconds: 3),
+          duration: snackDur(const Duration(seconds: 3)),
         ),
       );
       return;
@@ -65537,9 +67774,13 @@ class _TimeTrackingPanel extends StatefulWidget {
   final Map<String, Project> projects;
   final _ExecutionViewMode execViewMode;
   final Map<String, List<_ExecutionSession>> taskSessions;
+  final int startHour; // visible range (Settings → Planner)
+  final int endHour;
 
   const _TimeTrackingPanel({
     Key? key,
+    this.startHour = 0,
+    this.endHour = 24,
     required this.allTasks,
     required this.activeTimerTaskId,
     required this.timerStartedAt,
@@ -65556,10 +67797,10 @@ class _TimeTrackingPanelState extends State<_TimeTrackingPanel>
     with SingleTickerProviderStateMixin {
   late final AnimationController _pulse;
 
-  // Timeline spans 6 AM – midnight (18 hours)
-  static const int _startHour = 0;
-  static const int _endHour = 24;
-  static const int _spanHours = _endHour - _startHour;
+  // Timeline spans the user's visible hour range (default 00:00 – 24:00)
+  int get _startHour => widget.startHour;
+  int get _endHour => widget.endHour;
+  int get _spanHours => _endHour - _startHour;
 
   @override
   void initState() {
@@ -65793,7 +68034,8 @@ class _TimeTrackingPanelState extends State<_TimeTrackingPanel>
                           clipBehavior: Clip.none,
                           children: [
                             // Tick marks
-                            ...List.generate(25, (i) {
+                            ...List.generate(_spanHours + 1, (k) {
+                              final i = _startHour + k;
                               final frac = _hourToFraction(i.toDouble());
                               final x = frac * w;
                               return Positioned(
@@ -65830,11 +68072,21 @@ class _TimeTrackingPanelState extends State<_TimeTrackingPanel>
                             ),
                             // Blocks
                             ...laneBlocks.map((b) {
-                              final x = _hourToFraction(b.startHour) * w;
-                              final bw = (b.durationH / _spanHours * w).clamp(
-                                4.0,
-                                w - x,
+                              // Clip the block to the visible hour range.
+                              final visStart = math.max(
+                                b.startHour,
+                                _startHour.toDouble(),
                               );
+                              final visEnd = math.min(
+                                b.startHour + b.durationH,
+                                _endHour.toDouble(),
+                              );
+                              if (visEnd <= visStart) {
+                                return const SizedBox.shrink();
+                              }
+                              final x = _hourToFraction(visStart) * w;
+                              final bw = ((visEnd - visStart) / _spanHours * w)
+                                  .clamp(4.0, w - x);
                               if (b.isActive) {
                                 return AnimatedBuilder(
                                   animation: _pulse,
@@ -77889,7 +80141,8 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+          SnackBar(
+          duration: snackDur(const Duration(seconds: 4)), content: Text('Error: $e'), backgroundColor: Colors.red),
         );
       }
     } finally {
@@ -77911,6 +80164,7 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
+          duration: snackDur(const Duration(seconds: 4)),
             content: Text('Error saving: $e'),
             backgroundColor: Colors.red,
           ),
@@ -78619,33 +80873,33 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
         break;
       case 'Labels':
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
+          SnackBar(
             content: Text('Labels: manage in Trello'),
-            duration: Duration(seconds: 2),
+            duration: snackDur(Duration(seconds: 2)),
           ),
         );
         break;
       case 'Dates':
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
+          SnackBar(
             content: Text('Dates: manage in Trello'),
-            duration: Duration(seconds: 2),
+            duration: snackDur(Duration(seconds: 2)),
           ),
         );
         break;
       case 'Members':
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
+          SnackBar(
             content: Text('Members: manage in Trello'),
-            duration: Duration(seconds: 2),
+            duration: snackDur(Duration(seconds: 2)),
           ),
         );
         break;
       case 'Attachment':
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
+          SnackBar(
             content: Text('Attachments: manage in Trello'),
-            duration: Duration(seconds: 2),
+            duration: snackDur(Duration(seconds: 2)),
           ),
         );
         break;
@@ -78796,6 +81050,7 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
+          duration: snackDur(const Duration(seconds: 4)),
             content: Text('Error creating checklist: $e'),
             backgroundColor: Colors.red,
           ),
@@ -79351,7 +81606,8 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
     } catch (e) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+          SnackBar(
+          duration: snackDur(const Duration(seconds: 4)), content: Text('Error: $e'), backgroundColor: Colors.red),
         );
     }
   }
@@ -79367,7 +81623,8 @@ class _TrelloCardPageState extends State<_TrelloCardPage> {
     } catch (e) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+          SnackBar(
+          duration: snackDur(const Duration(seconds: 4)), content: Text('Error: $e'), backgroundColor: Colors.red),
         );
     }
   }
@@ -81221,6 +83478,51 @@ class _CategoryRow extends StatelessWidget {
 // ── _MetagroupCriteriaPanel ────────────────────────────────────────────────
 /// Shows individual criteria chips from each Metagroup that can be dragged
 /// one-by-one into a container, or tapped to add to a selected target.
+/// Filter / Group / Sort settings for a sidebar LIST (Projects or Tags header).
+/// Unlike the task-level F/G/S, these act on the items listed below the header.
+class _SidebarListFgs {
+  String nameQuery = '';
+  bool onlyWithOpen = false; // only items that have open tasks
+  bool onlyOverdue = false; // only items that have overdue open tasks
+  bool groupByFolder = true; // false = flat list, folders ignored
+  String sortField = 'manual'; // manual | name | open | overdue
+  bool sortAsc = true;
+
+  bool get filterActive =>
+      nameQuery.trim().isNotEmpty || onlyWithOpen || onlyOverdue;
+  bool get isActive => filterActive || !groupByFolder || sortField != 'manual';
+
+  /// Persisted state. [nameQuery] is a transient search string and is
+  /// deliberately not saved.
+  Map<String, dynamic> toJson() => {
+    'onlyWithOpen': onlyWithOpen,
+    'onlyOverdue': onlyOverdue,
+    'groupByFolder': groupByFolder,
+    'sortField': sortField,
+    'sortAsc': sortAsc,
+  };
+
+  void applyJson(Map<String, dynamic> j) {
+    onlyWithOpen = j['onlyWithOpen'] == true;
+    onlyOverdue = j['onlyOverdue'] == true;
+    groupByFolder = j['groupByFolder'] != false;
+    final sf = j['sortField'];
+    sortField = (sf is String && const ['manual', 'name', 'open', 'overdue'].contains(sf))
+        ? sf
+        : 'manual';
+    sortAsc = j['sortAsc'] != false;
+  }
+
+  void reset() {
+    nameQuery = '';
+    onlyWithOpen = false;
+    onlyOverdue = false;
+    groupByFolder = true;
+    sortField = 'manual';
+    sortAsc = true;
+  }
+}
+
 class _MetagroupCriteriaPanel extends StatefulWidget {
   final List<Task> allTasks;
   final Map<String, Project> projects;
@@ -82906,14 +85208,29 @@ class EntityLocator {
         if (slot.isOne) return 1;
         return (await listNames('${loc.dir}/${slot.folder}')).length;
       case 'connections':
-        final idx = await EntityIndex.build(this);
-        return idx.connectionsOf(loc.rel).length;
+        final idx = await RelationIndex.shared(
+          entities: this,
+          fileRoots: <String>[worksRoot],
+        );
+        final me = idx.byRel(loc.rel);
+        if (me == null) return 0;
+        return idx
+            .relationsOf(
+              me.key,
+              otherKinds: const <RelNodeKind>{RelNodeKind.entity},
+              includeForeign: true,
+            )
+            .length;
       case 'works':
         final a = loc.anchorPath;
         if (a == null || !File(a).existsSync()) return null;
         final id = _str(readFrontmatter(await File(a).readAsString())['id']);
         if (id == null || id.isEmpty) return null;
-        return (await WorksLinks.linkedTo(worksRoot, id)).length;
+        final idx = await RelationIndex.shared(
+          entities: this,
+          fileRoots: <String>[worksRoot],
+        );
+        return WorksLinks.fromIndex(idx, id).length;
       default:
         return null;
     }
@@ -83015,6 +85332,17 @@ class EntityScaffolder {
 class EntityIndexEntry {
   final String id, name, rel, typeId, anchorPath;
   final List<ConnectionRef> connections;
+
+  /// Todas as relações de saída do sidecar `.cc/<id>.yaml` (qualquer status e
+  /// workspace). O [RelationIndex] (4.6) decide o que mostrar.
+  final List<CcRelation> relations;
+
+  /// `connections` do frontmatter da âncora (formato antigo).
+  final List<ConnectionRef> legacy;
+
+  /// Quantas `connections` ainda estão no frontmatter da âncora (formato
+  /// antigo, a migrar para as relações do `.cc/`).
+  final int legacyCount;
   const EntityIndexEntry({
     required this.id,
     required this.name,
@@ -83022,13 +85350,17 @@ class EntityIndexEntry {
     required this.typeId,
     required this.anchorPath,
     required this.connections,
+    this.relations = const <CcRelation>[],
+    this.legacy = const <ConnectionRef>[],
+    this.legacyCount = 0,
   });
 }
 
 class ConnectionRef {
   final String ref; // id da entidade alvo
   final String label;
-  const ConnectionRef(this.ref, this.label);
+  final String pred; // predicado da relação ('' = `connections` antigo)
+  const ConnectionRef(this.ref, this.label, {this.pred = ''});
 }
 
 class ResolvedConnection {
@@ -83057,22 +85389,39 @@ class EntityIndex {
     if (l == null) return;
     final a = l.anchorPath;
     if (a != null && File(a).existsSync()) {
-      final fm = readFrontmatter(await File(a).readAsString());
-      final id = _str(fm['id']);
+      final info = await _anchorInfo(a);
+      final id = info.id;
       if (id != null && id.isNotEmpty) {
+        // Formato antigo (frontmatter) + relações do `.cc/<id>.yaml`. A relação
+        // nova substitui a antiga que aponta para o mesmo alvo.
+        final legacy = info.legacy;
+        final allRels = await _relationsOf(a, id);
+        final rels = <CcRelation>[
+          for (final r in allRels)
+            if (r.status == 'confirmada' && !RelationIndex._foreign(r)) r,
+        ];
+        final relTargets = <String>{for (final r in rels) r.ref.id};
+        final conns = <ConnectionRef>[
+          for (final c in legacy)
+            if (!relTargets.contains(c.ref)) c,
+          for (final r in rels)
+            ConnectionRef(
+              r.ref.id,
+              r.nota ??
+                  PredicateRegistry.instance.label(r.pred, fallback: r.predName),
+              pred: r.pred,
+            ),
+        ];
         out.add(EntityIndexEntry(
           id: id,
           name: l.name,
           rel: rel,
           typeId: l.def.id,
           anchorPath: a,
-          connections: [
-            for (final c in _asList(fm['connections']))
-              if (c is Map && c['ref'] != null)
-                ConnectionRef(c['ref'].toString(), _str(c['label']) ?? '')
-              else if (c is String)
-                ConnectionRef(c, ''),
-          ],
+          connections: conns,
+          relations: allRels,
+          legacy: legacy,
+          legacyCount: legacy.length,
         ));
       }
     }
@@ -83085,6 +85434,61 @@ class EntityIndex {
         }
       }
     }
+  }
+
+  /// `connections` do frontmatter da âncora (formato antigo).
+  static List<ConnectionRef> legacyConnectionsOf(Map<String, dynamic> fm) => [
+        for (final c in _asList(fm['connections']))
+          if (c is Map && c['ref'] != null)
+            ConnectionRef(c['ref'].toString(), _str(c['label']) ?? '')
+          else if (c is String)
+            ConnectionRef(c, ''),
+      ];
+
+  // Âncora (id + `connections` antigas) em cache por mtime/tamanho: o índice é
+  // reconstruído a cada aba/badge e as âncoras quase nunca mudam.
+  static final Map<String, ({int mtime, int size, String? id, List<ConnectionRef> legacy})>
+      _anchorCache = {};
+
+  static Future<({String? id, List<ConnectionRef> legacy})> _anchorInfo(
+    String anchorPath,
+  ) async {
+    final f = File(anchorPath);
+    final st = await f.stat();
+    final m = st.modified.microsecondsSinceEpoch;
+    final hit = _anchorCache[anchorPath];
+    if (hit != null && hit.mtime == m && hit.size == st.size) {
+      return (id: hit.id, legacy: hit.legacy);
+    }
+    final fm = readFrontmatter(await f.readAsString());
+    final id = _str(fm['id']);
+    final legacy = legacyConnectionsOf(fm);
+    _anchorCache[anchorPath] = (mtime: m, size: st.size, id: id, legacy: legacy);
+    return (id: id, legacy: legacy);
+  }
+
+  /// Relações de saída da entidade (`.cc/<id>.yaml`, ao lado da âncora), de
+  /// qualquer status e workspace, lidas pelo cache por pasta do
+  /// [RelationIndex]. Quem usa filtra (`confirmada`, workspace local).
+  static Future<List<CcRelation>> _relationsOf(String anchorPath, String id) async {
+    try {
+      final fo = await RelationIndex._folderOf(File(anchorPath).parent.path);
+      if (fo == null) return const <CcRelation>[];
+      final want = '${CcData.safeId(id)}.yaml';
+      for (final sc in fo.sidecars) {
+        if (sc.fileName == want) return sc.relations;
+      }
+    } catch (_) {}
+    return const <CcRelation>[];
+  }
+
+  /// Total de `connections` ainda no formato antigo.
+  int get legacyTotal {
+    var n = 0;
+    for (final e in entries) {
+      n += e.legacyCount;
+    }
+    return n;
   }
 
   EntityIndexEntry? byId(String id) {
@@ -83124,28 +85528,1111 @@ class EntityIndex {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Works: vínculos arquivo ↔ entidade (companheiros .cc/<arquivo>.md)
+// Migração das `connections` do frontmatter para relações do `.cc/`
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// Cada `connections: [{ref, label}]` vira uma relação `relacionado_a` no sidecar
+// da entidade (`<pasta>/.cc/<id>.yaml`), com o rótulo livre preservado em
+// `nota`. Por entidade: backup da âncora, gravação das relações, verificação
+// (releitura) e só então a chave `connections` sai do frontmatter. Se qualquer
+// passo falha, a âncora fica como estava. Nada é apagado antes de conferir.
 
-class WorksLinks {
-  /// Arquivos de [worksRoot] cujo companheiro lista [entityId] em `refs`.
-  static Future<List<String>> linkedTo(String worksRoot, String entityId) async {
-    final root = Directory(worksRoot);
-    if (!await root.exists()) return [];
-    final out = <String>[];
-    await for (final e in root.list(recursive: true, followLinks: false)) {
-      if (e is! File || !e.path.endsWith('.md')) continue;
-      final parent = e.parent;
-      if (parent.uri.pathSegments.where((s) => s.isNotEmpty).last != '.cc') continue;
-      final fm = readFrontmatter(await e.readAsString());
-      final refs = _asList(fm['refs']).map((x) => x.toString()).toList();
-      if (!refs.contains(entityId)) continue;
-      final target = File('${parent.parent.path}/${_str(fm['file']) ?? ''}');
-      if (await target.exists()) out.add(target.path);
+class ConnMigrationItem {
+  final String ownerRel, ownerName, ownerId, ref, label;
+  final bool targetMissing; // o alvo não existe (mais) no índice
+  const ConnMigrationItem({
+    required this.ownerRel,
+    required this.ownerName,
+    required this.ownerId,
+    required this.ref,
+    required this.label,
+    required this.targetMissing,
+  });
+}
+
+class ConnMigrationReport {
+  final List<ConnMigrationItem> items;
+  const ConnMigrationReport(this.items);
+  int get entities => items.map((i) => i.ownerId).toSet().length;
+  List<ConnMigrationItem> get missing =>
+      items.where((i) => i.targetMissing).toList();
+}
+
+class ConnMigrationResult {
+  int entities = 0;
+  int relations = 0;
+  String backupDir = '';
+  final List<String> warnings = [];
+  final List<String> errors = [];
+}
+
+class ConnectionsMigration {
+  static const String predId = 'relacionado_a';
+  static const String predName = 'relacionado a';
+
+  /// O que seria convertido, sem alterar nada.
+  static Future<ConnMigrationReport> preview(EntityLocator loc) async {
+    final idx = await EntityIndex.build(loc);
+    final ids = <String>{for (final e in idx.entries) e.id};
+    final items = <ConnMigrationItem>[];
+    for (final e in idx.entries) {
+      if (e.legacyCount == 0) continue;
+      final fm = readFrontmatter(await File(e.anchorPath).readAsString());
+      for (final c in EntityIndex.legacyConnectionsOf(fm)) {
+        items.add(ConnMigrationItem(
+          ownerRel: e.rel,
+          ownerName: e.name,
+          ownerId: e.id,
+          ref: c.ref,
+          label: c.label,
+          targetMissing: !ids.contains(c.ref),
+        ));
+      }
     }
-    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return ConnMigrationReport(items);
+  }
+
+  /// Converte tudo. [backupRoot]: onde ficam as cópias das âncoras.
+  static Future<ConnMigrationResult> apply(
+    EntityLocator loc, {
+    required String backupRoot,
+  }) async {
+    final res = ConnMigrationResult();
+    final idx = await EntityIndex.build(loc);
+    final stamp = DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+    final backup = '$backupRoot/connections-$stamp';
+    res.backupDir = backup;
+    for (final e in idx.entries) {
+      if (e.legacyCount == 0) continue;
+      try {
+        final text = await File(e.anchorPath).readAsString();
+        final legacy = EntityIndex.legacyConnectionsOf(readFrontmatter(text));
+        if (legacy.isEmpty) continue;
+
+        // 1) backup da âncora, como estava
+        final safe = e.rel.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        final bf = File('$backup/$safe.md');
+        await bf.parent.create(recursive: true);
+        await bf.writeAsString(text);
+
+        // 2) relações no sidecar (aresta já existente não é duplicada)
+        final target = await CcData.forMd(e.anchorPath, create: true);
+        await CcData.mutate(target, (doc) {
+          final list = doc['relations'] is List
+              ? List<dynamic>.from(doc['relations'] as List)
+              : <dynamic>[];
+          for (final c in legacy) {
+            final rel = CcRelation(
+              pred: predId,
+              predName: predName,
+              ref: CcRef(c.ref, CcData.workspaceId),
+              nota: c.label.isEmpty ? null : c.label,
+            );
+            final dup = list.any((x) {
+              final p = CcRelation.parse(x);
+              return p != null && p.pred == predId && p.ref == rel.ref;
+            });
+            if (dup) {
+              res.warnings.add(
+                '${e.rel}: relação com ${c.ref} já existia; rótulo '
+                '"${c.label}" não foi acrescentado',
+              );
+            } else {
+              list.add(rel.toJson());
+            }
+          }
+          doc['relations'] = list;
+        });
+
+        // 3) verificação: toda conexão antiga está nas relações gravadas
+        final back = await CcData.read(target);
+        final have = <String>{
+          for (final r in back.relations) '${r.pred}|${r.ref.id}',
+        };
+        final ok = legacy.every((c) => have.contains('$predId|${c.ref}'));
+        if (!ok) {
+          res.errors.add(
+            '${e.rel}: a verificação falhou; `connections` mantido na âncora',
+          );
+          continue;
+        }
+
+        // 4) só agora a chave antiga sai do frontmatter
+        await updateFrontmatterKey(e.anchorPath, 'connections', null);
+        res.entities++;
+        res.relations += legacy.length;
+      } on CcInvalidYamlException catch (err) {
+        res.errors.add('${e.rel}: $err (âncora não alterada)');
+      } catch (err) {
+        res.errors.add('${e.rel}: $err');
+      }
+    }
+    RelationIndex.invalidate();
+    return res;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4.6 Índice de relações
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Visão única, em memória, das relações tipadas de TODOS os itens que as
+// guardam: entidades (`<pasta da âncora>/.cc/<id>.yaml`) e arquivos/pastas de
+// Works (`.cc/<arquivo>.yaml`, `.cc/<id>.yaml` com `bind: id`,
+// `.cc/__folder__.yaml`). Antes eram dois caminhos de leitura separados
+// (EntityIndex e WorksLinks); agora os dois leem daqui.
+//
+// • Só relações de SAÍDA são lidas do disco (é o que os sidecars guardam). A
+//   entrada é derivada: A --autor_de--> B aparece em B como
+//   `escrito_por` A (predicado inverso do registro; o mesmo predicado se for
+//   simétrico; o original, marcado como sem inverso, se o registro não tem).
+// • Cache por pasta: o parse dos sidecars de uma pasta só é refeito quando a
+//   assinatura (nome + mtime + tamanho de cada arquivo de `.cc/`) muda, ou
+//   quando [CcData.mutate] grava ali ([invalidate]).
+// • Os `refs` da fase 1 (links `[[id|Título]]` no texto) entram como OUTRA
+//   fonte ([RelationIndex.refs]): `mentionedIn`/`mentionsOf`. Nunca se
+//   misturam às relações tipadas — a aba Connections mostra "Relacionados"
+//   (tipadas) e "Mentioned in" (texto) em seções separadas.
+// • Formatos antigos ainda lidos até a migração: `connections` no frontmatter
+//   da âncora e companheiros `.cc/<arquivo>.md` com `refs` ([RelSource]).
+//
+// Consultas:
+//   outgoing(key)        saída por id (filtros: predicado, tipo/espécie do alvo)
+//   incoming(key)        entrada derivada
+//   relationsOf(key)     saída + entrada, sem duplicar o que está dos dois lados
+//   byPredicate(pred)    busca por predicado (inclui o derivado pelo inverso)
+//   byTargetType(type)   busca por tipo de alvo (id do tipo da entidade,
+//                        'file' ou 'folder')
+//   mentionedIn / mentionsOf   links no texto (fase 1)
+
+/// Espécie de um nó do índice.
+enum RelNodeKind { entity, file, folder }
+
+/// Um item que participa de relações.
+class RelNode {
+  /// Entidade e nota `.md` com id: o id. Arquivo sem id: `file:<caminho>`.
+  /// Pasta: `folder:<caminho>`.
+  final String key;
+  final RelNodeKind kind;
+  final String name;
+
+  /// Entidade: id do tipo (`person`…). Arquivo: `file`. Pasta: `folder`.
+  final String typeId;
+
+  /// Entidade: caminho relativo (para navegar).
+  final String? rel;
+
+  /// Entidade: âncora. Arquivo/pasta: caminho absoluto.
+  final String? path;
+
+  /// Fase 6: nó vindo do cache local de OUTRO workspace (`''` = este). A
+  /// chave é `ws:<workspace_id>:<id>`; não tem [rel] nem [path].
+  final String ws;
+
+  /// Rótulo do tipo, quando o nó vem do cache (o registro local pode não
+  /// conhecer o tipo do outro workspace).
+  final String typeLabel;
+
+  const RelNode({
+    required this.key,
+    required this.kind,
+    required this.name,
+    required this.typeId,
+    this.rel,
+    this.path,
+    this.ws = '',
+    this.typeLabel = '',
+  });
+
+  /// Nó de outro workspace cujo disco não está montado agora (calculado na
+  /// hora: a montagem muda sem o índice ser reconstruído).
+  bool get offline =>
+      ws.isNotEmpty && !AttachedWorkspaces.instance.isOnline(ws);
+}
+
+/// De onde veio uma aresta.
+enum RelSource {
+  /// Relação tipada num sidecar `.cc/`.
+  sidecar,
+
+  /// `connections` no frontmatter da âncora (formato antigo).
+  legacyConnections,
+
+  /// Companheiro `.cc/<arquivo>.md` com `refs` (formato antigo de Works).
+  legacyCompanion,
+
+  /// Relação de saída lida do cache local de outro workspace (fase 6).
+  cache,
+}
+
+/// Uma aresta como foi gravada: de [fromKey] para [rel].ref.
+class IndexedRelation {
+  final String fromKey;
+  final CcRelation rel;
+  final RelSource source;
+  const IndexedRelation(this.fromKey, this.rel, this.source);
+
+  /// O alvo está em outro workspace.
+  bool get toForeign =>
+      CcData.workspaceId.isNotEmpty &&
+      rel.ref.ws.isNotEmpty &&
+      rel.ref.ws != CcData.workspaceId;
+
+  /// Chave do alvo no índice: o id, ou `ws:<workspace>:<id>` quando o alvo é
+  /// de outro workspace (referência `{id, ws}`).
+  String get toKey => toForeign ? 'ws:${rel.ref.ws}:${rel.ref.id}' : rel.ref.id;
+  bool get confirmed => rel.status == 'confirmada';
+
+  /// Toca outro workspace (alvo de lá, ou escrita lá e vinda do cache local);
+  /// fora das consultas por padrão.
+  bool get foreign => toForeign || fromKey.startsWith('ws:');
+}
+
+/// Situação do outro lado de uma relação.
+enum RelTargetStatus {
+  /// Achado (neste workspace, ou no cache de outro).
+  ok,
+
+  /// Não existe (mais): "sem destino" (vermelho).
+  missing,
+
+  /// Está num workspace anexado cujo disco não está montado: não dá para
+  /// saber (cinza, "workspace offline").
+  workspaceOffline,
+
+  /// Aponta para um workspace que não está anexado a este.
+  workspaceUnknown,
+}
+
+/// Uma aresta vista de um dos lados.
+class RelationView {
+  final IndexedRelation edge;
+
+  /// O nó de cujo ponto de vista a relação é lida.
+  final String selfKey;
+
+  /// true = derivada (a aresta foi gravada pelo outro nó).
+  final bool incoming;
+
+  /// O outro lado; null se não existe (mais) no índice.
+  final RelNode? other;
+
+  const RelationView(this.edge, this.selfKey, this.incoming, this.other);
+
+  String get otherKey => incoming ? edge.fromKey : edge.toKey;
+
+  /// Workspace do outro lado (`''` = este).
+  String get otherWs =>
+      other?.ws ?? ((!incoming && edge.toForeign) ? edge.rel.ref.ws : '');
+
+  /// Achado, sem destino, ou em workspace offline (fase 6).
+  RelTargetStatus get otherStatus {
+    final o = other;
+    if (o != null) {
+      return o.offline ? RelTargetStatus.workspaceOffline : RelTargetStatus.ok;
+    }
+    if (incoming || !edge.toForeign) return RelTargetStatus.missing;
+    final att = AttachedWorkspaces.instance;
+    final ws = edge.rel.ref.ws;
+    if (att.byId(ws) == null) return RelTargetStatus.workspaceUnknown;
+    return att.isOnline(ws)
+        ? RelTargetStatus.missing
+        : RelTargetStatus.workspaceOffline;
+  }
+
+  /// Predicado como foi gravado (do ponto de vista de quem escreveu).
+  String get storedPred => edge.rel.pred;
+
+  /// Predicado do ponto de vista de [selfKey]: o gravado, ou o inverso quando
+  /// a relação é derivada (e o registro o conhece).
+  String get pred {
+    if (!incoming) return storedPred;
+    return PredicateRegistry.instance.inverseOf(storedPred) ?? storedPred;
+  }
+
+  /// false só numa relação derivada cujo predicado não tem inverso no
+  /// registro: [pred] é então o gravado, lido ao contrário.
+  bool get hasInverse =>
+      !incoming || PredicateRegistry.instance.inverseOf(storedPred) != null;
+
+  /// Rótulo do predicado (sem a nota livre).
+  String get predLabel => PredicateRegistry.instance.label(
+        pred,
+        fallback: pred == storedPred ? edge.rel.predName : '',
+      );
+
+  /// Nota livre da relação, se houver, senão o rótulo do predicado.
+  String get label => edge.rel.nota ?? predLabel;
+
+  RelSource get source => edge.source;
+}
+
+/// Relação de entrada que ficaria sem alvo ao apagar um item.
+class DanglingRelation {
+  final RelationView view; // do ponto de vista do item que seria apagado
+  final String targetName;
+  const DanglingRelation(this.view, this.targetName);
+
+  /// `Fulana · autor de → Meu Livro` (lida do lado de quem escreveu).
+  String get text {
+    final reg = PredicateRegistry.instance;
+    final who = view.other?.name ?? view.otherKey;
+    return '$who · ${reg.label(view.storedPred, fallback: view.edge.rel.predName)}'
+        ' → $targetName';
+  }
+}
+
+/// Texto do aviso de exclusão: [lines] são `DanglingRelation.text`.
+String danglingSummary(List<String> lines, {int max = 6}) {
+  if (lines.isEmpty) return '';
+  final b = StringBuffer(
+    '${lines.length} relação(ões) de entrada ficarão sem alvo:',
+  );
+  for (final l in lines.take(max)) {
+    b.write('\n• $l');
+  }
+  if (lines.length > max) b.write('\n… e mais ${lines.length - max}');
+  return b.toString();
+}
+
+/// Parse em cache de um sidecar `.yaml` de `.cc/`.
+class _RelSidecar {
+  final String fileName; // `<algo>.yaml`
+  final String bind; // 'id' | ''
+  final String id;
+  final List<CcRelation> relations; // todas, de qualquer status/workspace
+  const _RelSidecar(this.fileName, this.bind, this.id, this.relations);
+}
+
+/// Companheiro antigo `.cc/<arquivo>.md`.
+class _RelCompanion {
+  final String file;
+  final List<String> refs;
+  const _RelCompanion(this.file, this.refs);
+}
+
+/// Cache de uma pasta: o que `.cc/` tinha na assinatura [sig].
+class _RelFolder {
+  final String sig;
+  final List<_RelSidecar> sidecars;
+  final List<_RelCompanion> companions;
+
+  // id → .md da pasta (só para sidecars `bind: id`), com a própria assinatura.
+  String mdSig = '';
+  Map<String, String>? mdIds;
+
+  _RelFolder(this.sig, this.sidecars, this.companions);
+}
+
+class RelationIndex {
+  final Map<String, RelNode> nodes;
+  final List<IndexedRelation> edges;
+
+  /// Links no texto (fase 1). Outra fonte: não entra nas relações tipadas.
+  final RefIndex refs;
+
+  final Map<String, List<IndexedRelation>> _out;
+  final Map<String, List<IndexedRelation>> _in;
+  final Map<String, RelNode> _byRel;
+
+  RelationIndex._(
+    this.nodes,
+    this.edges,
+    this.refs,
+    this._out,
+    this._in,
+    this._byRel,
+  );
+
+  factory RelationIndex._assemble(
+    Map<String, RelNode> nodes,
+    List<IndexedRelation> edges,
+    RefIndex refs,
+  ) {
+    final out = <String, List<IndexedRelation>>{};
+    final inn = <String, List<IndexedRelation>>{};
+    for (final e in edges) {
+      (out[e.fromKey] ??= <IndexedRelation>[]).add(e);
+      (inn[e.toKey] ??= <IndexedRelation>[]).add(e);
+    }
+    final byRel = <String, RelNode>{};
+    for (final n in nodes.values) {
+      final r = n.rel;
+      if (r != null) byRel[r] = n;
+    }
+    return RelationIndex._(nodes, edges, refs, out, inn, byRel);
+  }
+
+  /// Mesmo índice, com outro [RefIndex]. Barato: compartilha tudo o mais.
+  /// A interface guarda o índice (pesado) e troca os refs a cada desenho,
+  /// porque o índice de referências é atualizado em separado.
+  RelationIndex withRefs(RefIndex r) =>
+      RelationIndex._(nodes, edges, r, _out, _in, _byRel);
+
+  // ── Cache por pasta ─────────────────────────────────────────────────────────
+  static final Map<String, _RelFolder> _folders = <String, _RelFolder>{};
+  static int _generation = 0;
+
+  static String _norm(String p) {
+    var s = p.replaceAll('\\', '/');
+    while (s.length > 1 && s.endsWith('/')) {
+      s = s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
+  /// Descarta o cache de [dir] (a pasta que CONTÉM o `.cc/`), ou tudo.
+  /// [CcData.mutate] chama isto a cada gravação; a assinatura de cada pasta
+  /// cobre o que for gravado por fora.
+  static void invalidate([String? dir]) {
+    if (dir == null) {
+      _folders.clear();
+    } else {
+      _folders.remove(_norm(dir));
+    }
+    _generation++;
+  }
+
+  static bool _foreign(CcRelation r) =>
+      CcData.workspaceId.isNotEmpty && r.ref.ws != CcData.workspaceId;
+
+  /// `.cc/` de [dirIn] já parseado (ou do cache, se nada mudou). null = a
+  /// pasta não tem `.cc/`.
+  static Future<_RelFolder?> _folderOf(String dirIn) async {
+    final dir = _norm(dirIn);
+    final cc = Directory('$dir/${CcData.dirName}');
+    try {
+      if (!await cc.exists()) {
+        _folders.remove(dir);
+        return null;
+      }
+    } catch (_) {
+      return null;
+    }
+    final stats = <String, FileStat>{};
+    try {
+      await for (final e in cc.list(followLinks: false)) {
+        if (e is! File) continue;
+        final n = CcData._base(e.path);
+        if (n.endsWith('.tmp')) continue;
+        try {
+          stats[n] = await e.stat();
+        } catch (_) {}
+      }
+    } catch (_) {
+      return null;
+    }
+    final parts = <String>[
+      for (final e in stats.entries)
+        '${e.key}|${e.value.modified.microsecondsSinceEpoch}|${e.value.size}',
+    ]..sort();
+    final sig = parts.join('\n');
+    final hit = _folders[dir];
+    if (hit != null && hit.sig == sig) return hit;
+
+    final sidecars = <_RelSidecar>[];
+    final companions = <_RelCompanion>[];
+    final names = stats.keys.toList()..sort();
+    for (final n in names) {
+      final f = File('$dir/${CcData.dirName}/$n');
+      try {
+        if (n.endsWith('.yaml')) {
+          final j = await CcData.readYamlOrNull(f);
+          if (j == null) {
+            CcData.invalidFiles.add(f.path);
+            continue;
+          }
+          CcData.invalidFiles.remove(f.path);
+          sidecars.add(_RelSidecar(
+            n,
+            (j['bind'] ?? '').toString(),
+            (j['id'] ?? '').toString(),
+            CcDoc(j).relations,
+          ));
+        } else if (n.endsWith('.md')) {
+          final fm = readFrontmatter(await f.readAsString());
+          final file = _str(fm['file']) ?? '';
+          final refs = <String>[
+            for (final x in _asList(fm['refs']))
+              if (x.toString().isNotEmpty) x.toString(),
+          ];
+          if (file.isNotEmpty && refs.isNotEmpty) {
+            companions.add(_RelCompanion(file, refs));
+          }
+        }
+      } catch (_) {}
+    }
+    final fo = _RelFolder(sig, sidecars, companions);
+    _folders[dir] = fo;
+    return fo;
+  }
+
+  /// id → caminho dos `.md` de [dir] (para sidecars `bind: id`), em cache
+  /// enquanto nome/mtime/tamanho dos `.md` não mudam.
+  static Future<Map<String, String>> _mdIdsOf(
+    String dir,
+    _RelFolder fo,
+    Set<String> names,
+  ) async {
+    final mds = <String>[
+      for (final n in names)
+        if (CcData.isMd(n)) n,
+    ]..sort();
+    final parts = <String>[];
+    for (final n in mds) {
+      try {
+        final st = await File('$dir/$n').stat();
+        parts.add('$n|${st.modified.microsecondsSinceEpoch}|${st.size}');
+      } catch (_) {}
+    }
+    final sig = parts.join('\n');
+    final cached = fo.mdIds;
+    if (cached != null && fo.mdSig == sig) return cached;
+    final ids = <String, String>{};
+    for (final n in mds) {
+      final id = await CcData.mdId('$dir/$n');
+      if (id != null) ids.putIfAbsent(id, () => '$dir/$n');
+    }
+    fo.mdSig = sig;
+    fo.mdIds = ids;
+    return ids;
+  }
+
+  // ── Construção ──────────────────────────────────────────────────────────────
+
+  /// Constrói o índice.
+  ///  • [entities]: inclui as entidades (e suas relações/`connections` antigas).
+  ///  • [fileRoots]: pastas de arquivos (ex.: Vault > Works) varridas
+  ///    recursivamente atrás de sidecars.
+  ///  • [refs]: links no texto (fase 1), guardados à parte.
+  static Future<RelationIndex> build({
+    EntityLocator? entities,
+    List<String> fileRoots = const <String>[],
+    RefIndex? refs,
+  }) async {
+    final nodes = <String, RelNode>{};
+    final edges = <IndexedRelation>[];
+    final seen = <String>{};
+    void addEdge(String from, CcRelation r, RelSource s) {
+      if (!seen.add('$from|${r.pred}|${r.ref.id}|${r.ref.ws}')) return;
+      edges.add(IndexedRelation(from, r, s));
+    }
+
+    if (entities != null) {
+      final ent = await EntityIndex.build(entities);
+      for (final e in ent.entries) {
+        nodes[e.id] = RelNode(
+          key: e.id,
+          kind: RelNodeKind.entity,
+          name: e.name,
+          typeId: e.typeId,
+          rel: e.rel,
+          path: e.anchorPath,
+        );
+        final typed = <String>{};
+        for (final r in e.relations) {
+          addEdge(e.id, r, RelSource.sidecar);
+          if (r.status == 'confirmada' && !_foreign(r)) typed.add(r.ref.id);
+        }
+        // `connections` antigas: a relação nova para o mesmo alvo vence.
+        for (final c in e.legacy) {
+          if (typed.contains(c.ref)) continue;
+          addEdge(
+            e.id,
+            CcRelation(
+              pred: ConnectionsMigration.predId,
+              predName: ConnectionsMigration.predName,
+              ref: CcRef.local(c.ref),
+              nota: c.label.isEmpty ? null : c.label,
+            ),
+            RelSource.legacyConnections,
+          );
+        }
+      }
+    }
+
+    if (fileRoots.isNotEmpty) {
+      final roots = <String>[for (final r in fileRoots) _norm(r)];
+      final visited = <String>{};
+      for (final root in roots) {
+        await _scanDir(root, nodes, addEdge, visited);
+      }
+      // pastas que sumiram saem do cache
+      _folders.removeWhere(
+        (k, _) =>
+            !visited.contains(k) &&
+            roots.any((r) => k == r || k.startsWith('$r/')),
+      );
+    }
+
+    await _addCachedForeign(nodes, addEdge);
+
+    return RelationIndex._assemble(nodes, edges, refs ?? RefIndex.empty);
+  }
+
+  /// Fase 6: entidades e relações de saída dos workspaces anexados, lidas do
+  /// cache local (funciona com o disco deles desconectado). Os nós levam o
+  /// workspace na chave (`ws:<workspace>:<id>`).
+  static Future<void> _addCachedForeign(
+    Map<String, RelNode> nodes,
+    void Function(String, CcRelation, RelSource) addEdge,
+  ) async {
+    if (CcData.workspaceId.isEmpty) return;
+    for (final a in AttachedWorkspaces.instance.all) {
+      final snap = await WorkspaceIndexCache.load(a.workspaceId);
+      if (snap == null) continue;
+      for (final e in snap.entries) {
+        final key = 'ws:${a.workspaceId}:${e.id}';
+        nodes.putIfAbsent(
+          key,
+          () => RelNode(
+            key: key,
+            kind: RelNodeKind.entity,
+            name: e.title,
+            typeId: e.type,
+            typeLabel: e.typeLabel,
+            ws: a.workspaceId,
+          ),
+        );
+        for (final r in e.rels) {
+          addEdge(
+            key,
+            CcRelation(
+              pred: r.pred,
+              predName: r.predName,
+              ref: CcRef(r.id, r.ws),
+              status: r.status,
+              nota: r.nota,
+            ),
+            RelSource.cache,
+          );
+        }
+      }
+    }
+  }
+
+  /// Invalida só os `shared()` em memória (não o cache por pasta): o cache
+  /// local de um workspace anexado mudou.
+  static void touch() => _generation++;
+
+  static Future<void> _scanDir(
+    String dir,
+    Map<String, RelNode> nodes,
+    void Function(String, CcRelation, RelSource) addEdge,
+    Set<String> visited,
+  ) async {
+    final names = <String>{};
+    final subdirs = <String>[];
+    try {
+      await for (final e in Directory(dir).list(followLinks: false)) {
+        final n = CcData._base(e.path);
+        if (e is Directory) {
+          if (!n.startsWith('.')) subdirs.add(_norm(e.path));
+        } else if (e is File) {
+          names.add(n);
+        }
+      }
+    } catch (_) {
+      return;
+    }
+    visited.add(dir);
+
+    final fo = await _folderOf(dir);
+    if (fo != null) {
+      Map<String, String>? mdIds;
+      for (final s in fo.sidecars) {
+        if (s.relations.isEmpty) continue;
+        final String key;
+        final RelNode node;
+        if (s.fileName == CcData.folderFileName) {
+          key = 'folder:$dir';
+          node = RelNode(
+            key: key,
+            kind: RelNodeKind.folder,
+            name: CcData._base(dir),
+            typeId: 'folder',
+            path: dir,
+          );
+        } else if (s.bind == 'id' && s.id.isNotEmpty) {
+          mdIds ??= await _mdIdsOf(dir, fo, names);
+          final p = mdIds[s.id];
+          if (p == null) continue; // sidecar órfão
+          key = s.id;
+          node = RelNode(
+            key: key,
+            kind: RelNodeKind.file,
+            name: CcData._base(p),
+            typeId: 'file',
+            path: p,
+          );
+        } else {
+          final target = s.fileName.substring(0, s.fileName.length - 5);
+          if (!names.contains(target)) continue; // arquivo sumiu
+          key = 'file:$dir/$target';
+          node = RelNode(
+            key: key,
+            kind: RelNodeKind.file,
+            name: target,
+            typeId: 'file',
+            path: '$dir/$target',
+          );
+        }
+        nodes.putIfAbsent(key, () => node);
+        for (final r in s.relations) {
+          addEdge(key, r, RelSource.sidecar);
+        }
+      }
+      // Formato antigo: companheiro `.cc/<arquivo>.md` com `refs`.
+      for (final c in fo.companions) {
+        if (!names.contains(c.file)) continue;
+        final key = 'file:$dir/${c.file}';
+        nodes.putIfAbsent(
+          key,
+          () => RelNode(
+            key: key,
+            kind: RelNodeKind.file,
+            name: c.file,
+            typeId: 'file',
+            path: '$dir/${c.file}',
+          ),
+        );
+        for (final id in c.refs) {
+          addEdge(
+            key,
+            CcRelation(
+              pred: 'relacionado_a',
+              predName: 'relacionado a',
+              ref: CcRef.local(id),
+            ),
+            RelSource.legacyCompanion,
+          );
+        }
+      }
+    }
+    for (final s in subdirs) {
+      await _scanDir(s, nodes, addEdge, visited);
+    }
+  }
+
+  // Um build por vez para o mesmo conjunto de raízes: várias abas e badges
+  // pedem o índice juntos ao abrir uma entidade. Reaproveita um build em
+  // andamento (ou terminado há < [maxAge]) enquanto nada foi invalidado.
+  static String? _memoKey;
+  static Future<RelationIndex>? _memo;
+  static int _memoGen = -1;
+  static DateTime? _memoDoneAt;
+
+  static Future<RelationIndex> shared({
+    EntityLocator? entities,
+    List<String> fileRoots = const <String>[],
+    Duration maxAge = const Duration(seconds: 1),
+  }) {
+    final key = '${entities?.genRoot ?? ''}|${fileRoots.map(_norm).join('|')}';
+    final memo = _memo;
+    if (memo != null && _memoKey == key && _memoGen == _generation) {
+      final done = _memoDoneAt;
+      if (done == null || DateTime.now().difference(done) < maxAge) return memo;
+    }
+    final f = build(entities: entities, fileRoots: fileRoots);
+    _memo = f;
+    _memoKey = key;
+    _memoGen = _generation;
+    _memoDoneAt = null;
+    f.then((_) {
+      if (identical(_memo, f)) _memoDoneAt = DateTime.now();
+    }, onError: (Object _) {
+      if (identical(_memo, f)) _memo = null;
+    });
+    return f;
+  }
+
+  // ── Consulta: nós ───────────────────────────────────────────────────────────
+  RelNode? node(String key) => nodes[key];
+
+  /// Entidade pelo caminho relativo (`person/Fulana`).
+  RelNode? byRel(String rel) => _byRel[rel];
+
+  // ── Consulta: relações ──────────────────────────────────────────────────────
+  bool _passes(IndexedRelation e, bool suggested, bool foreign) =>
+      (suggested || e.confirmed) && (foreign || !e.foreign);
+
+  bool _otherOk(
+    RelNode? o,
+    String? otherType,
+    Set<RelNodeKind>? otherKinds,
+    bool includeUnresolved,
+  ) {
+    if (o == null) return includeUnresolved && otherType == null;
+    if (otherType != null && o.typeId != otherType) return false;
+    if (otherKinds != null && !otherKinds.contains(o.kind)) return false;
+    return true;
+  }
+
+  /// Relações que [key] declara (saída), na ordem gravada.
+  ///  • [pred]: só esse predicado.
+  ///  • [otherType]: id do tipo do alvo (`person`, `file`, `folder`…).
+  ///  • [otherKinds]: espécie do alvo.
+  ///  • [includeUnresolved]: mantém alvos que não existem mais (padrão: sim;
+  ///    some quando há [otherType]).
+  ///  • [includeSuggested]/[includeForeign]: `sugerida` e outro workspace.
+  List<RelationView> outgoing(
+    String key, {
+    String? pred,
+    String? otherType,
+    Set<RelNodeKind>? otherKinds,
+    bool includeUnresolved = true,
+    bool includeSuggested = false,
+    bool includeForeign = false,
+  }) {
+    final out = <RelationView>[];
+    for (final e in _out[key] ?? const <IndexedRelation>[]) {
+      if (!_passes(e, includeSuggested, includeForeign)) continue;
+      if (pred != null && e.rel.pred != pred) continue;
+      final v = RelationView(e, key, false, nodes[e.toKey]);
+      if (!_otherOk(v.other, otherType, otherKinds, includeUnresolved)) continue;
+      out.add(v);
+    }
     return out;
   }
+
+  /// Relações que apontam para [key], vistas dele (derivadas). [pred] é o
+  /// predicado visto de [key] (o inverso do gravado); [otherType]/[otherKinds]
+  /// filtram o lado que escreveu a relação.
+  List<RelationView> incoming(
+    String key, {
+    String? pred,
+    String? otherType,
+    Set<RelNodeKind>? otherKinds,
+    bool includeSuggested = false,
+    bool includeForeign = false,
+  }) {
+    final out = <RelationView>[];
+    for (final e in _in[key] ?? const <IndexedRelation>[]) {
+      if (!_passes(e, includeSuggested, includeForeign)) continue;
+      final v = RelationView(e, key, true, nodes[e.fromKey]);
+      if (pred != null && v.pred != pred) continue;
+      if (!_otherOk(v.other, otherType, otherKinds, false)) continue;
+      out.add(v);
+    }
+    return out;
+  }
+
+  /// Saída + entrada de [key]. Uma relação declarada nos dois lados (ou
+  /// simétrica) aparece uma vez, como saída.
+  List<RelationView> relationsOf(
+    String key, {
+    String? pred,
+    String? otherType,
+    Set<RelNodeKind>? otherKinds,
+    bool includeUnresolved = true,
+    bool includeSuggested = false,
+    bool includeForeign = false,
+  }) {
+    final out = outgoing(
+      key,
+      pred: pred,
+      otherType: otherType,
+      otherKinds: otherKinds,
+      includeUnresolved: includeUnresolved,
+      includeSuggested: includeSuggested,
+      includeForeign: includeForeign,
+    );
+    final have = <String>{for (final v in out) '${v.otherKey}|${v.pred}'};
+    for (final v in incoming(
+      key,
+      pred: pred,
+      otherType: otherType,
+      otherKinds: otherKinds,
+      includeSuggested: includeSuggested,
+      includeForeign: includeForeign,
+    )) {
+      if (v.otherKey == key) continue; // laço: já está na saída
+      if (have.add('${v.otherKey}|${v.pred}')) out.add(v);
+    }
+    return out;
+  }
+
+  /// Busca por predicado: todas as relações com [pred], cada uma vista pelo
+  /// sujeito. Com [derived] (padrão), as que só existem pelo inverso entram
+  /// também (`autor_de` acha o que foi gravado como `escrito_por`).
+  /// [subjectType]/[objectType] filtram pelo tipo de cada lado.
+  List<RelationView> byPredicate(
+    String pred, {
+    bool derived = true,
+    String? subjectType,
+    String? objectType,
+    bool includeSuggested = false,
+    bool includeForeign = false,
+  }) {
+    final out = <RelationView>[];
+    final seen = <String>{};
+    bool typed(RelNode? n, String? t) => t == null || (n != null && n.typeId == t);
+
+    for (final e in edges) {
+      if (!_passes(e, includeSuggested, includeForeign)) continue;
+      if (e.rel.pred != pred) continue;
+      final subj = nodes[e.fromKey];
+      final obj = nodes[e.toKey];
+      if (!typed(subj, subjectType) || !typed(obj, objectType)) continue;
+      if (seen.add('${e.fromKey}|${e.toKey}')) {
+        out.add(RelationView(e, e.fromKey, false, obj));
+      }
+    }
+    if (derived) {
+      final reg = PredicateRegistry.instance;
+      for (final e in edges) {
+        if (!_passes(e, includeSuggested, includeForeign)) continue;
+        if (reg.inverseOf(e.rel.pred) != pred) continue;
+        final subj = nodes[e.toKey]; // o alvo da gravada é o sujeito daqui
+        final obj = nodes[e.fromKey];
+        if (subj == null) continue;
+        if (!typed(subj, subjectType) || !typed(obj, objectType)) continue;
+        if (seen.add('${e.toKey}|${e.fromKey}')) {
+          out.add(RelationView(e, e.toKey, true, obj));
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Busca por tipo de alvo: relações (como gravadas) cujo alvo é do tipo
+  /// [typeId] — id do tipo da entidade, `file` ou `folder`. [pred] restringe
+  /// o predicado.
+  List<RelationView> byTargetType(
+    String typeId, {
+    String? pred,
+    bool includeSuggested = false,
+    bool includeForeign = false,
+  }) {
+    final out = <RelationView>[];
+    for (final e in edges) {
+      if (!_passes(e, includeSuggested, includeForeign)) continue;
+      if (pred != null && e.rel.pred != pred) continue;
+      final obj = nodes[e.toKey];
+      if (obj == null || obj.typeId != typeId) continue;
+      out.add(RelationView(e, e.fromKey, false, obj));
+    }
+    return out;
+  }
+
+  // ── Consistência (4.7) ──────────────────────────────────────────────────────
+
+  /// Chaves dos nós cujo caminho é [abs] ou está dentro dele.
+  Set<String> keysUnderPath(String abs) {
+    final p = _norm(abs);
+    final out = <String>{};
+    for (final n in nodes.values) {
+      final np = n.path;
+      if (np == null) continue;
+      final q = _norm(np);
+      if (q == p || q.startsWith('$p/')) out.add(n.key);
+    }
+    return out;
+  }
+
+  /// Relações de ENTRADA que ficariam sem alvo se [absPaths] (arquivos ou
+  /// pastas, entidades inclusive) fossem apagados. Relações cuja origem também
+  /// está sendo apagada não contam (o sidecar delas vai junto).
+  Future<List<DanglingRelation>> danglingFor(Iterable<String> absPaths) async {
+    final gone = <String>{};
+    final names = <String, String>{};
+    for (final a in absPaths) {
+      final ids = await CcData.idsUnder(a);
+      gone.addAll(ids.keys);
+      ids.forEach((k, v) => names[k] = CcData._base(v));
+      gone.addAll(keysUnderPath(a));
+    }
+    final out = <DanglingRelation>[];
+    for (final id in gone) {
+      for (final v in incoming(id, includeForeign: true)) {
+        if (gone.contains(v.otherKey)) continue;
+        out.add(DanglingRelation(v, nodes[id]?.name ?? names[id] ?? id));
+      }
+    }
+    return out;
+  }
+
+  // ── Links no texto (fase 1) — separados das relações tipadas ───────────────
+
+  /// Quem tem `[[…]]` apontando para [id] (agrupado por origem).
+  List<RefBacklink> mentionedIn(String id) => refs.backlinksOf(id);
+
+  /// Alvos que o texto de [id] menciona (sem repetir, na ordem do texto).
+  List<RefTarget> mentionsOf(String id) {
+    final out = <RefTarget>[];
+    final seen = <String>{};
+    for (final l in refs.outgoing[id] ?? const <WikiLink>[]) {
+      final t = refs.resolve(l).target;
+      if (t == null || t.id == id || !seen.add(t.id)) continue;
+      out.add(t);
+    }
+    return out;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Works: vínculos arquivo ↔ entidade
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A relação mora NO ARQUIVO: o sidecar `.cc/<arquivo>.yaml` guarda, em
+// `relations`, quem o escreveu (`escrito_por`), traduziu (`traduzido_por`) ou
+// simplesmente se relaciona com ele (`relacionado_a`). A entidade vê o inverso
+// (autor de, tradutor de…) derivado daqui. O formato antigo (companheiro
+// `.cc/<arquivo>.md` com `refs`) ainda é lido até ser migrado.
+
+/// Arquivo de Works ligado a uma entidade.
+class WorkLink {
+  final String path;
+  final List<String> preds; // predicados do arquivo para a entidade
+  const WorkLink(this.path, this.preds);
+
+  /// Papéis da entidade neste arquivo ("autor de"…), sem o `relacionado_a`.
+  List<String> get roles {
+    final reg = PredicateRegistry.instance;
+    final out = <String>[];
+    for (final p in preds) {
+      if (p == 'relacionado_a') continue;
+      final inv = reg.inverseOf(p);
+      final l = inv != null ? reg.label(inv) : reg.label(p);
+      if (!out.contains(l)) out.add(l);
+    }
+    return out;
+  }
+}
+
+class WorksLinks {
+  /// Arquivos ligados a [entityId] segundo [idx] (relações do arquivo para a
+  /// entidade, no sidecar ou no companheiro antigo), com os predicados.
+  static List<WorkLink> fromIndex(RelationIndex idx, String entityId) {
+    final byPath = <String, Set<String>>{};
+    for (final v in idx.incoming(
+      entityId,
+      otherKinds: const <RelNodeKind>{RelNodeKind.file},
+    )) {
+      final path = v.other?.path;
+      if (path == null) continue;
+      (byPath[path] ??= <String>{}).add(v.storedPred);
+    }
+    return <WorkLink>[
+      for (final en in byPath.entries) WorkLink(en.key, en.value.toList()),
+    ]..sort((x, y) => x.path.toLowerCase().compareTo(y.path.toLowerCase()));
+  }
+
+  /// Arquivos de [worksRoot] ligados a [entityId], com os predicados. Lê o
+  /// mesmo [RelationIndex] da aba Connections (relações dos sidecars e,
+  /// enquanto não migrados, os `refs` dos companheiros).
+  static Future<List<WorkLink>> linkedDetailed(
+    String worksRoot,
+    String entityId,
+  ) async {
+    if (!await Directory(worksRoot).exists()) return [];
+    final idx = await RelationIndex.shared(fileRoots: <String>[worksRoot]);
+    return fromIndex(idx, entityId);
+  }
+
+  /// Arquivos de [worksRoot] ligados a [entityId].
+  static Future<List<String>> linkedTo(String worksRoot, String entityId) async =>
+      [for (final w in await linkedDetailed(worksRoot, entityId)) w.path];
 
   /// Todos os arquivos (não ocultos) sob [worksRoot], para escolher o que vincular.
   static Future<List<String>> allFiles(String worksRoot) async {
@@ -83162,41 +86649,231 @@ class WorksLinks {
     return out;
   }
 
+  /// Companheiro antigo: `.cc/<arquivo>.md`.
   static File _companion(String absFile) {
     final f = File(absFile);
     final base = f.uri.pathSegments.where((s) => s.isNotEmpty).last;
     return File('${f.parent.path}/.cc/$base.md');
   }
 
-  static Future<void> link(String absFile, String entityId) async {
-    final c = _companion(absFile);
-    var fm = <String, dynamic>{};
-    var body = '';
-    if (await c.exists()) {
-      final text = await c.readAsString();
-      fm = readFrontmatter(text);
-      body = _bodyAfterFrontmatter(text);
-    }
-    final base = absFile.split('/').last;
-    fm['id'] = fm['id'] ?? newEntityId();
-    fm['file'] = base;
-    fm['size'] = await File(absFile).length();
-    fm['tags'] = fm['tags'] ?? <dynamic>[];
-    final refs = _asList(fm['refs']).map((x) => x.toString()).toList();
-    if (!refs.contains(entityId)) refs.add(entityId);
-    fm['refs'] = refs;
-    await c.parent.create(recursive: true);
-    await c.writeAsString('${_writeFrontmatter(fm)}$body');
+  static Future<CcTarget> _targetOf(String absFile) async =>
+      CcData.isMd(absFile) ? CcData.forMd(absFile) : CcData.forFile(absFile);
+
+  /// Liga [absFile] a [entityId]. [pred] é o predicado DO ARQUIVO para a
+  /// entidade (`escrito_por`, `traduzido_por`; padrão `relacionado_a`).
+  static Future<void> link(
+    String absFile,
+    String entityId, {
+    String pred = 'relacionado_a',
+  }) async {
+    final t = await _targetOf(absFile);
+    await CcData.addRelation(
+      t,
+      CcRelation(pred: pred, ref: CcRef(entityId, CcData.workspaceId)),
+      validate: false,
+    );
   }
 
+  /// Remove todas as relações do arquivo com [entityId] (e o `refs` antigo).
   static Future<void> unlink(String absFile, String entityId) async {
+    try {
+      final t = await _targetOf(absFile);
+      await CcData.mutate(t, (doc) {
+        final list = doc['relations'] is List
+            ? List<dynamic>.from(doc['relations'] as List)
+            : <dynamic>[];
+        list.removeWhere((x) => CcRelation.parse(x)?.ref.id == entityId);
+        doc['relations'] = list;
+      });
+    } catch (e) {
+      debugPrint('WorksLinks.unlink($absFile): $e');
+    }
     final c = _companion(absFile);
     if (!await c.exists()) return;
     final text = await c.readAsString();
     final fm = readFrontmatter(text);
-    final refs = _asList(fm['refs']).map((x) => x.toString()).toList()..remove(entityId);
+    final refs = _asList(fm['refs']).map((x) => x.toString()).toList()
+      ..remove(entityId);
     fm['refs'] = refs;
     await c.writeAsString('${_writeFrontmatter(fm)}${_bodyAfterFrontmatter(text)}');
+  }
+}
+
+// ── Migração dos companheiros `.cc/<arquivo>.md` para o sidecar `.yaml` ──────
+
+class WorkMigItem {
+  final String companion, file;
+  final int refs;
+  final bool fileMissing; // o arquivo não existe mais: companheiro mantido
+  final int missingEntities; // refs que não apontam para uma entidade
+  const WorkMigItem({
+    required this.companion,
+    required this.file,
+    required this.refs,
+    required this.fileMissing,
+    required this.missingEntities,
+  });
+}
+
+class WorkMigReport {
+  final List<WorkMigItem> items;
+  const WorkMigReport(this.items);
+  List<WorkMigItem> get migratable => items.where((i) => !i.fileMissing).toList();
+  List<WorkMigItem> get skipped => items.where((i) => i.fileMissing).toList();
+  int get relations => migratable.fold(0, (a, i) => a + i.refs);
+}
+
+class WorkMigResult {
+  int files = 0;
+  int relations = 0;
+  String backupDir = '';
+  final List<String> warnings = [];
+  final List<String> errors = [];
+}
+
+class WorksMigration {
+  /// Companheiros antigos sob [worksRoot]: `.cc/<arquivo>.md`.
+  static Future<List<File>> _companions(String worksRoot) async {
+    final root = Directory(worksRoot);
+    if (!await root.exists()) return [];
+    final out = <File>[];
+    await for (final e in root.list(recursive: true, followLinks: false)) {
+      if (e is! File || !e.path.endsWith('.md')) continue;
+      final segs = e.parent.uri.pathSegments.where((s) => s.isNotEmpty);
+      if (segs.isEmpty || segs.last != '.cc') continue;
+      out.add(e);
+    }
+    return out;
+  }
+
+  static Future<int> countLegacy(String worksRoot) async =>
+      (await _companions(worksRoot)).length;
+
+  static Future<WorkMigReport> preview(
+    String worksRoot,
+    Set<String> entityIds,
+  ) async {
+    final items = <WorkMigItem>[];
+    for (final c in await _companions(worksRoot)) {
+      final fm = readFrontmatter(await c.readAsString());
+      final refs = _asList(fm['refs']).map((x) => x.toString()).toList();
+      final file = '${c.parent.parent.path}/${_str(fm['file']) ?? ''}';
+      items.add(WorkMigItem(
+        companion: c.path,
+        file: file,
+        refs: refs.length,
+        fileMissing: (_str(fm['file']) ?? '').isEmpty || !await File(file).exists(),
+        missingEntities: refs.where((r) => !entityIds.contains(r)).length,
+      ));
+    }
+    return WorkMigReport(items);
+  }
+
+  /// Por arquivo: backup do companheiro, relações no sidecar, verificação e só
+  /// então a remoção do companheiro. Companheiro de arquivo que sumiu é mantido.
+  static Future<WorkMigResult> apply(
+    String worksRoot, {
+    required String backupRoot,
+  }) async {
+    final res = WorkMigResult();
+    final stamp = DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+    final backup = '$backupRoot/works-$stamp';
+    res.backupDir = backup;
+    try {
+      await PredicateRegistry.instance.ensureDefaults(const ['traduzido_por']);
+    } catch (e) {
+      res.warnings.add('registro de predicados não atualizado: $e');
+    }
+    for (final c in await _companions(worksRoot)) {
+      try {
+        final text = await c.readAsString();
+        final fm = readFrontmatter(text);
+        final body = _bodyAfterFrontmatter(text).trim();
+        final fileName = _str(fm['file']) ?? '';
+        final file = '${c.parent.parent.path}/$fileName';
+        if (fileName.isEmpty || !await File(file).exists()) {
+          res.warnings.add('${c.path}: arquivo ausente; companheiro mantido');
+          continue;
+        }
+        final refs = _asList(fm['refs'])
+            .map((x) => x.toString())
+            .where((x) => x.isNotEmpty)
+            .toList();
+
+        // 1) backup do companheiro, como estava
+        final rel = c.path
+            .substring(worksRoot.length)
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        final bf = File('$backup/$rel');
+        await bf.parent.create(recursive: true);
+        await bf.writeAsString(text);
+
+        // 2) dados e relações no sidecar do arquivo
+        final target = CcData.isMd(file)
+            ? await CcData.forMd(file)
+            : CcData.forFile(file);
+        await CcData.mutate(target, (doc) {
+          final cid = _str(fm['id']);
+          if (cid != null && cid.isNotEmpty) doc.putIfAbsent('id', () => cid);
+          final size = fm['size'];
+          if (size is int) doc.putIfAbsent('size', () => size);
+          if (body.isNotEmpty &&
+              (doc['description'] ?? '').toString().isEmpty) {
+            doc['description'] = body;
+            res.warnings.add('${c.path}: o texto do companheiro virou descrição');
+          }
+          final tags = doc['tags'] is List
+              ? List<dynamic>.from(doc['tags'] as List)
+              : <dynamic>[];
+          final have = <String>{
+            for (final t in tags)
+              (t is Map ? t['title'] : t).toString().toLowerCase(),
+          };
+          for (final t in _asList(fm['tags'])) {
+            final title = (t is Map ? t['title'] : t)?.toString() ?? '';
+            if (title.isEmpty || !have.add(title.toLowerCase())) continue;
+            tags.add(t is Map ? t : <String, dynamic>{'title': title});
+          }
+          if (tags.isNotEmpty) doc['tags'] = tags;
+          final list = doc['relations'] is List
+              ? List<dynamic>.from(doc['relations'] as List)
+              : <dynamic>[];
+          for (final id in refs) {
+            final r = CcRelation(
+              pred: 'relacionado_a',
+              predName: 'relacionado a',
+              ref: CcRef(id, CcData.workspaceId),
+            );
+            final dup = list.any((x) {
+              final p = CcRelation.parse(x);
+              return p != null && p.pred == r.pred && p.ref == r.ref;
+            });
+            if (!dup) list.add(r.toJson());
+          }
+          doc['relations'] = list;
+        });
+
+        // 3) verificação
+        final back = await CcData.read(target);
+        final have = <String>{for (final r in back.relations) r.ref.id};
+        if (!refs.every(have.contains)) {
+          res.errors.add('${c.path}: a verificação falhou; companheiro mantido');
+          continue;
+        }
+
+        // 4) só agora o companheiro antigo sai
+        await c.delete();
+        await CcData.pruneDir(c.parent);
+        res.files++;
+        res.relations += refs.length;
+      } on CcInvalidYamlException catch (err) {
+        res.errors.add('${c.path}: $err (companheiro mantido)');
+      } catch (err) {
+        res.errors.add('${c.path}: $err');
+      }
+    }
+    RelationIndex.invalidate();
+    return res;
   }
 }
 
@@ -87746,5 +91423,8257 @@ class _EntityTypeDesignerState extends State<EntityTypeDesigner> {
         ),
       ]),
     );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REFERÊNCIAS [[id|Título]] — lógica (antes em refs.dart)
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// refs.dart — referências entre notas/entidades por IDENTIDADE.
+//
+// PRINCÍPIO
+//   O link guarda o ID do alvo, não o caminho nem o nome. Mover ou renomear o
+//   alvo (dentro ou fora do app) não quebra o link; o título é só um rótulo.
+//
+// SINTAXE (texto guardado no .md)
+//   [[id|Título]]            forma canônica (o autocomplete grava esta)
+//   [[Título]]               aceita como entrada; resolve pelo título
+//   [[id#Cabeçalho|Título]]  seção opcional (preservada; ainda não navegada)
+//
+// ESPAÇO DE IDS (global — um único espaço para tudo que pode ser alvo)
+//   common:<ms>   nota comum          proj:<id>   nota de projeto
+//   task:<id>     nota de task        <32 hex>    entidade (frontmatter `id`)
+//
+// FONTE ÚNICA DA VERDADE
+//   Só o link de SAÍDA existe no texto. Backlinks são DERIVADOS aqui, no
+//   [RefIndex], e nunca gravados.
+//
+// Este arquivo é Dart puro (sem Flutter) para poder ser testado isoladamente.
+// A parte visual fica em refs_ui.dart.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Categoria do alvo. Ordem de prioridade na resolução por título e no
+/// autocomplete: tudo que não é `task` vem antes de `task`.
+enum RefKind { common, project, task, entity }
+
+int _tier(RefKind k) => k == RefKind.task ? 1 : 0;
+
+/// Algo que pode ser apontado por um link.
+class RefTarget {
+  final String id;
+  final String title;
+  final RefKind kind;
+
+  /// Entidades: caminho relativo (`person/Fulana`), usado para navegar.
+  final String? rel;
+
+  /// Entidades: rótulo do tipo (`Person`), só para exibição.
+  final String? typeLabel;
+
+  /// Para ordenar sugestões por recência (0 = desconhecido).
+  final int updatedMs;
+
+  /// Entidades: caminho absoluto do arquivo âncora (para reparar o id).
+  final String? anchorPath;
+
+  /// Fase 6: alvo vindo do cache local de um workspace (`''` = vivo, deste).
+  final String ws;
+  final String wsName;
+
+  /// O workspace do alvo não está montado: mostrado em cinza ("workspace
+  /// offline"), nunca como "sem destino".
+  final bool offline;
+
+  const RefTarget({
+    required this.id,
+    required this.title,
+    required this.kind,
+    this.rel,
+    this.typeLabel,
+    this.updatedMs = 0,
+    this.anchorPath,
+    this.ws = '',
+    this.wsName = '',
+    this.offline = false,
+  });
+}
+
+/// Um `[[...]]` encontrado no texto.
+class WikiLink {
+  /// Offsets no texto original (end exclusivo), cobrindo os colchetes.
+  final int start, end;
+
+  /// O que veio antes de `#`/`|`: um id ou um título.
+  final String target;
+  final String? heading;
+  final String? label;
+
+  const WikiLink({
+    required this.start,
+    required this.end,
+    required this.target,
+    this.heading,
+    this.label,
+  });
+
+  /// Texto mostrado ao leitor.
+  String get display => (label != null && label!.trim().isNotEmpty) ? label!.trim() : target;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parser
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `[[alvo]]`, `[[alvo#seção]]`, `[[alvo|rótulo]]`, `[[alvo#seção|rótulo]]`.
+/// O alvo não pode conter `[ ] | #` nem quebra de linha.
+final RegExp kWikiLinkRe = RegExp(
+  r'\[\[([^\[\]|#\n]+)(?:#([^\[\]|\n]*))?(?:\|([^\[\]\n]*))?\]\]',
+);
+
+final RegExp _inlineCodeRe = RegExp(r'`[^`\n]*`');
+
+String _blank(String s) => ' ' * s.length;
+
+/// Troca por espaços o que está dentro de `código inline`, preservando offsets.
+String maskInlineCode(String line) =>
+    line.replaceAllMapped(_inlineCodeRe, (m) => _blank(m.group(0)!));
+
+/// Troca por espaços blocos ``` e `código inline`, preservando offsets e
+/// quebras de linha. Links dentro de código não são links.
+String maskCode(String text) {
+  final lines = text.split('\n');
+  var inFence = false;
+  final out = <String>[];
+  for (final line in lines) {
+    if (line.trimLeft().startsWith('```')) {
+      inFence = !inFence;
+      out.add(_blank(line));
+      continue;
+    }
+    out.add(inFence ? _blank(line) : maskInlineCode(line));
+  }
+  return out.join('\n');
+}
+
+WikiLink _toLink(RegExpMatch m) => WikiLink(
+      start: m.start,
+      end: m.end,
+      target: m.group(1)!.trim(),
+      heading: (m.group(2) == null || m.group(2)!.trim().isEmpty) ? null : m.group(2)!.trim(),
+      label: m.group(3),
+    );
+
+/// Todos os links de [text] (ignora código em bloco e inline).
+List<WikiLink> parseWikiLinks(String text) {
+  if (!text.contains('[[')) return const [];
+  final masked = maskCode(text);
+  return [for (final m in kWikiLinkRe.allMatches(masked)) _toLink(m)];
+}
+
+/// Links de uma única linha (ignora só código inline). Offsets relativos à linha.
+/// Usado pelo editor, que já trata blocos ``` por conta própria.
+List<WikiLink> parseWikiLinksInLine(String line) {
+  if (!line.contains('[[')) return const [];
+  final masked = maskInlineCode(line);
+  return [for (final m in kWikiLinkRe.allMatches(masked)) _toLink(m)];
+}
+
+/// Remove o frontmatter YAML (`---` … `---`) do início de [text].
+String stripFrontmatter(String text) {
+  final t = text.replaceAll('\r\n', '\n');
+  if (!t.startsWith('---\n')) return text;
+  final end = t.indexOf('\n---', 3);
+  if (end < 0) return text;
+  var rest = t.substring(end + 4);
+  if (rest.startsWith('\n')) rest = rest.substring(1);
+  return rest;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Normalização e formatação
+// ─────────────────────────────────────────────────────────────────────────────
+
+const String _accFrom = 'áàâãäéèêëíìîïóòôõöúùûüçñ';
+const String _accTo = 'aaaaaeeeeiiiiooooouuuucn';
+
+/// minúsculas, sem acento, espaços colapsados — para comparar títulos.
+String normTitle(String s) {
+  final b = StringBuffer();
+  for (final r in s.toLowerCase().runes) {
+    final ch = String.fromCharCode(r);
+    final i = _accFrom.indexOf(ch);
+    b.write(i >= 0 ? _accTo[i] : ch);
+  }
+  return b.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+/// Rótulo seguro para ficar depois do `|` (sem `[`, `]`, `|` nem quebras).
+String sanitizeLabel(String s) =>
+    s.replaceAll(RegExp(r'[\[\]|\n\r]'), ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+
+/// Forma canônica gravada no texto.
+String formatWikiLink(String id, String title, {String? heading}) {
+  final h = (heading == null || heading.isEmpty) ? '' : '#$heading';
+  return '[[$id$h|${sanitizeLabel(title)}]]';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Índice
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Um documento: alvo + o texto onde ele escreve seus links de saída.
+class RefDoc {
+  final RefTarget target;
+  final String text;
+  const RefDoc(this.target, this.text);
+}
+
+/// Resultado de resolver um link.
+class RefResolution {
+  final RefTarget? target;
+
+  /// Vazio se resolveu por id; senão, quem tem esse título.
+  final List<RefTarget> candidates;
+  final bool viaTitle;
+
+  const RefResolution({this.target, this.candidates = const [], this.viaTitle = false});
+
+  bool get ok => target != null;
+  bool get ambiguous => target == null && candidates.length > 1;
+}
+
+/// Quem aponta para um alvo (agrupado por origem).
+class RefBacklink {
+  final RefTarget source;
+  final int count;
+  final String snippet;
+  const RefBacklink(this.source, this.count, this.snippet);
+}
+
+/// Cache de parse por id de documento: só reprocessa texto que mudou.
+class RefParseCache {
+  final Map<String, ({String text, List<WikiLink> links})> _m = {};
+
+  List<WikiLink> linksFor(String id, String text) {
+    final c = _m[id];
+    if (c != null && (identical(c.text, text) || c.text == text)) return c.links;
+    final links = parseWikiLinks(text);
+    _m[id] = (text: text, links: links);
+    return links;
+  }
+
+  void retainOnly(Set<String> ids) => _m.removeWhere((k, _) => !ids.contains(k));
+}
+
+class RefIndex {
+  final Map<String, RefTarget> byId;
+  final Map<String, List<RefTarget>> byTitle;
+
+  /// id → todos os alvos que o usam (só entradas com mais de um alvo).
+  final Map<String, List<RefTarget>> duplicates;
+
+  /// id da origem → links de saída (como escritos).
+  final Map<String, List<WikiLink>> outgoing;
+  final Map<String, List<RefBacklink>> _back;
+  final List<RefTarget> _all;
+
+  const RefIndex._(this.byId, this.byTitle, this.duplicates, this.outgoing, this._back, this._all);
+
+  static const RefIndex empty = RefIndex._({}, {}, {}, {}, {}, []);
+
+  int get size => _all.length;
+
+  factory RefIndex.build(Iterable<RefDoc> docs, {RefParseCache? cache}) {
+    final c = cache ?? RefParseCache();
+    final list = docs.toList();
+    final byId = <String, RefTarget>{};
+    final byTitle = <String, List<RefTarget>>{};
+    final seen = <String, List<RefTarget>>{};
+    final all = <RefTarget>[];
+
+    for (final d in list) {
+      final t = d.target;
+      if (t.id.isEmpty) continue;
+      all.add(t);
+      byId.putIfAbsent(t.id, () => t);
+      (seen[t.id] ??= []).add(t);
+      final nt = normTitle(t.title);
+      if (nt.isNotEmpty) (byTitle[nt] ??= []).add(t);
+    }
+    final duplicates = <String, List<RefTarget>>{
+      for (final e in seen.entries)
+        if (e.value.length > 1) e.key: e.value,
+    };
+
+    final index = RefIndex._(byId, byTitle, duplicates, {}, {}, all);
+    final outgoing = <String, List<WikiLink>>{};
+    final back = <String, Map<String, ({int n, String snip, RefTarget src})>>{};
+
+    for (final d in list) {
+      final src = d.target;
+      if (src.id.isEmpty) continue;
+      final links = c.linksFor(src.id, d.text);
+      if (links.isEmpty) continue;
+      outgoing[src.id] = links;
+      for (final l in links) {
+        final r = index.resolve(l);
+        final tgt = r.target;
+        if (tgt == null || tgt.id == src.id) continue;
+        final bucket = back.putIfAbsent(tgt.id, () => {});
+        final prev = bucket[src.id];
+        bucket[src.id] = (
+          n: (prev?.n ?? 0) + 1,
+          snip: prev?.snip ?? snippetFor(d.text, l),
+          src: src,
+        );
+      }
+    }
+    c.retainOnly({for (final t in all) t.id});
+
+    final backOut = <String, List<RefBacklink>>{};
+    for (final e in back.entries) {
+      final l = [for (final v in e.value.values) RefBacklink(v.src, v.n, v.snip)];
+      l.sort((a, b) {
+        final k = _tier(a.source.kind).compareTo(_tier(b.source.kind));
+        if (k != 0) return k;
+        return normTitle(a.source.title).compareTo(normTitle(b.source.title));
+      });
+      backOut[e.key] = l;
+    }
+    return RefIndex._(byId, byTitle, duplicates, outgoing, backOut, all);
+  }
+
+  /// Resolve por id; se não achar, pelo título (ignora `task` quando há outro
+  /// candidato). Ambíguo quando sobra mais de um.
+  RefResolution resolve(WikiLink l) {
+    final byid = byId[l.target.trim()];
+    if (byid != null) return RefResolution(target: byid);
+    final cands = byTitle[normTitle(l.target)] ?? const <RefTarget>[];
+    if (cands.isEmpty) return const RefResolution(viaTitle: true);
+    final best = cands.map((t) => _tier(t.kind)).reduce((a, b) => a < b ? a : b);
+    final top = cands.where((t) => _tier(t.kind) == best).toList();
+    if (top.length == 1) return RefResolution(target: top.first, candidates: cands, viaTitle: true);
+    return RefResolution(candidates: top, viaTitle: true);
+  }
+
+  List<RefBacklink> backlinksOf(String id) => _back[id] ?? const [];
+
+  /// Links de [text] que hoje resolvem só pelo título (candidatos a virar id).
+  int countFixable(String text) {
+    var n = 0;
+    for (final l in parseWikiLinks(text)) {
+      final r = resolve(l);
+      if (r.ok && r.viaTitle) n++;
+    }
+    return n;
+  }
+
+  /// Reescreve `[[Título]]` resolvido de forma única para `[[id|Título]]`.
+  /// O que o leitor vê não muda; o link passa a sobreviver a renomeações.
+  String fixateLinks(String text) {
+    final links = parseWikiLinks(text);
+    var out = text;
+    for (final l in links.reversed) {
+      final r = resolve(l);
+      if (!r.ok || !r.viaTitle) continue;
+      final shown = (l.label != null && l.label!.trim().isNotEmpty) ? l.label! : l.target;
+      out = out.replaceRange(
+        l.start,
+        l.end,
+        formatWikiLink(r.target!.id, shown, heading: l.heading),
+      );
+    }
+    return out;
+  }
+
+  // ── Autocomplete difuso ──────────────────────────────────────────────────
+
+  /// Alvos que casam com [query], melhores primeiro. `task` só aparece com
+  /// consulta de 2+ letras e no máximo 3 resultados.
+  List<RefTarget> suggest(String query, {String? excludeId, int limit = 8}) {
+    final q = normTitle(query);
+    final scored = <({RefTarget t, int s})>[];
+    for (final t in _all) {
+      if (t.id == excludeId) continue;
+      if (t.kind == RefKind.task && q.length < 2) continue;
+      final s = q.isEmpty ? 0 : _score(q, normTitle(t.title));
+      if (s < 0) continue;
+      scored.add((t: t, s: s));
+    }
+    scored.sort((a, b) {
+      if (a.s != b.s) return b.s.compareTo(a.s);
+      final k = _tier(a.t.kind).compareTo(_tier(b.t.kind));
+      if (k != 0) return k;
+      if (a.t.updatedMs != b.t.updatedMs) return b.t.updatedMs.compareTo(a.t.updatedMs);
+      return normTitle(a.t.title).compareTo(normTitle(b.t.title));
+    });
+    final out = <RefTarget>[];
+    var tasks = 0;
+    for (final e in scored) {
+      if (out.length >= limit) break;
+      if (e.t.kind == RefKind.task) {
+        if (tasks >= 3) continue;
+        tasks++;
+      }
+      out.add(e.t);
+    }
+    return out;
+  }
+}
+
+/// Pontuação difusa de [q] em [t] (ambos normalizados). < 0 = não casa.
+int _score(String q, String t) {
+  if (t == q) return 1000;
+  if (t.startsWith(q)) return 800 - (t.length - q.length).clamp(0, 200);
+  for (final w in t.split(' ')) {
+    if (w.startsWith(q)) return 600 - (t.length - q.length).clamp(0, 200);
+  }
+  final i = t.indexOf(q);
+  if (i >= 0) return 400 - i.clamp(0, 200);
+  // subsequência: todas as letras de q, em ordem
+  var qi = 0;
+  var gaps = 0;
+  var last = -1;
+  for (var ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] == q[qi]) {
+      if (last >= 0 && ti - last > 1) gaps += ti - last - 1;
+      last = ti;
+      qi++;
+    }
+  }
+  if (qi < q.length) return -1;
+  return 200 - gaps.clamp(0, 190);
+}
+
+/// Linha onde está [l], com todos os `[[…]]` trocados pelo rótulo; ~140 chars.
+String snippetFor(String text, WikiLink l) {
+  final ls = l.start == 0 ? 0 : text.lastIndexOf('\n', l.start - 1) + 1;
+  final le0 = text.indexOf('\n', l.end);
+  final le = le0 < 0 ? text.length : le0;
+  var line = text.substring(ls, le).trim();
+  line = line.replaceAllMapped(kWikiLinkRe, (m) {
+    final lab = m.group(3);
+    return (lab != null && lab.trim().isNotEmpty) ? lab.trim() : m.group(1)!.trim();
+  });
+  line = line.replaceFirst(RegExp(r'^(#{1,6} |[-*+] (\[[ xX]\] )?|\d+[.)] |> )'), '');
+  return line.length > 140 ? '${line.substring(0, 140)}…' : line;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gatilho do autocomplete (o usuário acabou de digitar `[[`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class WikiTrigger {
+  /// Offset do primeiro `[` do `[[`.
+  final int start;
+
+  /// O que já foi digitado depois do `[[`.
+  final String query;
+  const WikiTrigger(this.start, this.query);
+}
+
+/// Há um `[[` aberto antes do cursor, na mesma linha, ainda sem `]` nem `|`/`#`?
+WikiTrigger? findWikiTrigger(String text, int cursor) {
+  if (cursor < 2 || cursor > text.length) return null;
+  final ls = text.lastIndexOf('\n', cursor - 1) + 1;
+  final before = text.substring(ls, cursor);
+  final i = before.lastIndexOf('[[');
+  if (i < 0) return null;
+  final q = before.substring(i + 2);
+  if (q.contains(RegExp(r'[\[\]|#]'))) return null;
+  // dentro de `código inline`? (número ímpar de crases antes do gatilho)
+  if ('`'.allMatches(before.substring(0, i)).length.isOdd) return null;
+  return WikiTrigger(ls + i, q);
+}
+
+/// Aplica a escolha [t]: troca `[[consulta` por `[[id|Título]]`, consumindo
+/// `]]` que já estivessem logo após o cursor. Devolve texto e novo cursor.
+({String text, int cursor}) applyWikiCompletion(
+  String text,
+  int cursor,
+  WikiTrigger trig,
+  RefTarget t,
+) {
+  var end = cursor;
+  var closers = 0;
+  while (closers < 2 && end < text.length && text[end] == ']') {
+    end++;
+    closers++;
+  }
+  final link = formatWikiLink(t.id, t.title);
+  return (
+    text: text.replaceRange(trig.start, end, link),
+    cursor: trig.start + link.length,
+  );
+}
+
+/// O link cujo intervalo contém [offset] (em [line], offsets relativos à linha).
+WikiLink? wikiLinkAt(String text, int offset) {
+  final ls = offset == 0 ? 0 : text.lastIndexOf('\n', offset - 1) + 1;
+  final le0 = text.indexOf('\n', offset);
+  final le = le0 < 0 ? text.length : le0;
+  for (final l in parseWikiLinksInLine(text.substring(ls, le))) {
+    if (offset >= ls + l.start && offset <= ls + l.end) {
+      return WikiLink(
+        start: ls + l.start,
+        end: ls + l.end,
+        target: l.target,
+        heading: l.heading,
+        label: l.label,
+      );
+    }
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REFERÊNCIAS [[id|Título]] — UI (antes em refs_ui.dart)
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// refs_ui.dart — parte visual das referências [[id|Título]].
+// A lógica (parser, índice, resolução, backlinks) está em refs.dart.
+//
+// Integração: ver main.dart (RefsController `_refs`, `_openRefTarget`,
+// `_NotesEditorState` e a aba Connections das entidades).
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+
+
+class _RC {
+  static const link = Color(0xFF88C0D0); // resolvido
+  static const warn = Color(0xFFEBCB8B); // ambíguo
+  static const bad = Color(0xFFBF616A); // sem destino
+  static const offline = Color(0xFF7C8596); // workspace offline (cinza)
+  static const panel = Color(0xFF242933);
+  static const sel = Color(0xFF434C5E);
+  static const border = Color(0xFF3B4252);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Controller: guarda o índice atual e os callbacks do app
+// ─────────────────────────────────────────────────────────────────────────────
+
+class RefsController extends ChangeNotifier {
+  RefIndex _index = RefIndex.empty;
+  RefIndex get index => _index;
+
+  final RefParseCache _cache = RefParseCache();
+  List<RefDoc> _noteDocs = const [];
+  List<RefDoc> _entityDocs = const [];
+  bool _notifyScheduled = false;
+  bool _disposed = false;
+
+  /// Abre o alvo (nota → aba Notes; entidade → Visualizer).
+  void Function(RefTarget target)? onOpen;
+
+  /// Recarrega as entidades (assíncrono; o app limita a frequência).
+  Future<void> Function()? onRefreshEntities;
+
+  /// Gera um novo id para uma entidade com id duplicado.
+  Future<void> Function(RefTarget target)? onRegenerateId;
+
+  void setNoteDocs(List<RefDoc> docs) {
+    _noteDocs = docs;
+    _rebuild();
+  }
+
+  void setEntityDocs(List<RefDoc> docs) {
+    _entityDocs = docs;
+    _rebuild();
+  }
+
+  void _rebuild() {
+    _index = RefIndex.build([..._noteDocs, ..._entityDocs], cache: _cache);
+    // Notifica depois do frame atual: pode ser chamado de dentro de build().
+    if (_notifyScheduled) return;
+    _notifyScheduled = true;
+    scheduleMicrotask(() {
+      _notifyScheduled = false;
+      if (!_disposed) notifyListeners();
+    });
+  }
+
+  void open(RefTarget t) => onOpen?.call(t);
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+
+/// Índice usado por [buildEditorLinkSpans] quando o editor colore os links.
+/// O controller do editor grava aqui, logo antes de montar o TextSpan, o
+/// índice dele (a função de spans é global e não enxerga o widget).
+RefIndex kRefStyleIndex = RefIndex.empty;
+
+IconData refKindIcon(RefKind k) {
+  switch (k) {
+    case RefKind.common:
+      return Icons.sticky_note_2_outlined;
+    case RefKind.project:
+      return Icons.folder_special_outlined;
+    case RefKind.task:
+      return Icons.check_circle_outline_rounded;
+    case RefKind.entity:
+      return Icons.hub_outlined;
+  }
+}
+
+String refKindLabel(RefTarget t) {
+  switch (t.kind) {
+    case RefKind.common:
+      return 'Note';
+    case RefKind.project:
+      return 'Project';
+    case RefKind.task:
+      return 'Task';
+    case RefKind.entity:
+      final base = t.typeLabel ?? 'Entity';
+      if (t.ws.isEmpty) return base;
+      return [base, if (t.wsName.isNotEmpty) t.wsName, if (t.offline) 'workspace offline']
+          .join(' · ');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spans
+// ─────────────────────────────────────────────────────────────────────────────
+
+Color _refColorFor(RefResolution r) => r.ok
+    ? (r.target!.offline ? _RC.offline : _RC.link)
+    : (r.ambiguous ? _RC.warn : _RC.bad);
+
+TextStyle _hiddenStyle(TextStyle b) => b.copyWith(
+      color: Colors.transparent,
+      fontSize: 0.001,
+      height: 0.001,
+      decoration: TextDecoration.none,
+    );
+
+/// Editor (live preview). Devolve null se [text] não tem links.
+///
+/// Os trechos entre links voltam para [inner] (o construtor normal de
+/// markdown inline), então `_` e `*` dentro de um título nunca viram itálico.
+/// O comprimento do texto é preservado: o que está "oculto" só fica com
+/// fonte minúscula e transparente (mesma técnica dos `#` dos cabeçalhos).
+/// Com o cursor dentro do link, ele aparece inteiro.
+TextSpan? buildEditorLinkSpans(
+  String text,
+  TextStyle base,
+  int cursorPos,
+  RefIndex index,
+  TextSpan Function(String seg, TextStyle style, int cursor) inner,
+) {
+  final links = parseWikiLinksInLine(text);
+  if (links.isEmpty) return null;
+  final spans = <InlineSpan>[];
+  var pos = 0;
+
+  void addSegment(int from, int to) {
+    if (to <= from) return;
+    final cur = (cursorPos >= from && cursorPos <= to) ? cursorPos - from : -1;
+    spans.add(inner(text.substring(from, to), base, cur));
+  }
+
+  for (final l in links) {
+    addSegment(pos, l.start);
+    spans.add(_editorLinkSpan(text, l, base, cursorPos, index));
+    pos = l.end;
+  }
+  addSegment(pos, text.length);
+  return TextSpan(children: spans, style: base);
+}
+
+InlineSpan _editorLinkSpan(String text, WikiLink l, TextStyle base, int cursorPos, RefIndex index) {
+  final raw = text.substring(l.start, l.end);
+  final color = _refColorFor(index.resolve(l));
+  final shownStyle = base.copyWith(
+    color: color,
+    fontWeight: FontWeight.normal,
+    fontStyle: FontStyle.normal,
+    decoration: TextDecoration.underline,
+    decorationColor: color.withOpacity(0.55),
+  );
+  final inner = raw.substring(2, raw.length - 2);
+  final bar = inner.indexOf('|');
+  final hasLabel = bar >= 0 && inner.substring(bar + 1).trim().isNotEmpty;
+  final prefix = hasLabel ? inner.substring(0, bar + 1) : '';
+  final shown = hasLabel ? inner.substring(bar + 1) : inner;
+  final inside = cursorPos >= l.start && cursorPos <= l.end;
+  final edge = inside
+      ? base.copyWith(
+          color: (base.color ?? Colors.white).withOpacity(0.32),
+          fontWeight: FontWeight.normal,
+          fontStyle: FontStyle.normal,
+          decoration: TextDecoration.none,
+        )
+      : _hiddenStyle(base);
+  return TextSpan(
+    style: base,
+    children: [
+      TextSpan(text: '[[$prefix', style: edge),
+      TextSpan(text: shown, style: shownStyle),
+      TextSpan(text: ']]', style: edge),
+    ],
+  );
+}
+
+/// Modo leitura: mostra só o rótulo; toque abre o destino.
+/// [inner] monta o markdown inline dos trechos sem link.
+// Os TapGestureRecognizer são recriados a cada build e não são descartados
+// manualmente (a função é global); não seguram timers, então o GC resolve.
+TextSpan buildReadingLinkSpans(
+  String text,
+  TextStyle base,
+  RefIndex index,
+  void Function(RefResolution res) onTap,
+  TextSpan Function(String seg, TextStyle style) inner,
+) {
+  final links = parseWikiLinksInLine(text);
+  if (links.isEmpty) return inner(text, base);
+  final spans = <InlineSpan>[];
+  var pos = 0;
+  for (final l in links) {
+    if (l.start > pos) spans.add(inner(text.substring(pos, l.start), base));
+    final res = index.resolve(l);
+    final color = _refColorFor(res);
+    spans.add(TextSpan(
+      text: l.display,
+      style: base.copyWith(
+        color: color,
+        decoration: TextDecoration.underline,
+        decorationColor: color.withOpacity(0.55),
+      ),
+      recognizer: TapGestureRecognizer()..onTap = () => onTap(res),
+    ));
+    pos = l.end;
+  }
+  if (pos < text.length) spans.add(inner(text.substring(pos), base));
+  return TextSpan(children: spans, style: base);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Autocomplete
+// ─────────────────────────────────────────────────────────────────────────────
+
+class RefSuggestionList extends StatelessWidget {
+  final String query;
+  final List<RefTarget> items;
+  final int selected;
+  final void Function(RefTarget t) onPick;
+
+  const RefSuggestionList({
+    Key? key,
+    required this.query,
+    required this.items,
+    required this.selected,
+    required this.onPick,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    // TextFieldTapRegion: tocar aqui não tira o foco do editor.
+    return TextFieldTapRegion(
+      child: Material(
+        color: _RC.panel,
+        elevation: 10,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          width: 440,
+          constraints: const BoxConstraints(maxHeight: 330),
+          decoration: BoxDecoration(
+            border: Border.all(color: _RC.border),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: Text(
+                  query.isEmpty ? 'Link to…  (↑↓ Enter · Esc)' : 'Link to “$query”  (↑↓ Enter · Esc)',
+                  style: const TextStyle(fontSize: 11, color: Colors.white38),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (items.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(12, 4, 12, 12),
+                  child: Text('No match', style: TextStyle(fontSize: 12, color: Colors.white54)),
+                )
+              else
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    padding: const EdgeInsets.only(bottom: 4),
+                    itemCount: items.length,
+                    itemBuilder: (_, i) {
+                      final t = items[i];
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => onPick(t),
+                        child: Container(
+                          color: i == selected ? _RC.sel : Colors.transparent,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                          child: Row(
+                            children: [
+                              Icon(refKindIcon(t.kind), size: 15, color: Colors.white54),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  t.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 13, color: Colors.white),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                refKindLabel(t),
+                                style: const TextStyle(fontSize: 11, color: Colors.white38),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Escolha entre vários destinos quando o título de um link é ambíguo.
+Future<void> showRefPicker(
+  BuildContext context,
+  List<RefTarget> candidates,
+  void Function(RefTarget t) onPick,
+) async {
+  final picked = await showDialog<RefTarget>(
+    context: context,
+    builder: (ctx) => SimpleDialog(
+      backgroundColor: _RC.panel,
+      title: const Text(
+        'More than one item has this title',
+        style: TextStyle(fontSize: 14, color: Colors.white70),
+      ),
+      children: [
+        for (final t in candidates)
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, t),
+            child: Row(
+              children: [
+                Icon(refKindIcon(t.kind), size: 15, color: Colors.white54),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(t.title, style: const TextStyle(fontSize: 13, color: Colors.white)),
+                ),
+                Text(refKindLabel(t), style: const TextStyle(fontSize: 11, color: Colors.white38)),
+              ],
+            ),
+          ),
+      ],
+    ),
+  );
+  if (picked != null) onPick(picked);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Painel de backlinks (derivados do índice; nada é gravado)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class RefBacklinksPanel extends StatefulWidget {
+  final RefsController refs;
+  final String selfId;
+  final String title;
+
+  /// Quantos links do texto atual resolvem só pelo título (0 = não mostra).
+  final int fixableCount;
+  final VoidCallback? onFixate;
+
+  const RefBacklinksPanel({
+    Key? key,
+    required this.refs,
+    required this.selfId,
+    this.title = 'Backlinks',
+    this.fixableCount = 0,
+    this.onFixate,
+  }) : super(key: key);
+
+  @override
+  State<RefBacklinksPanel> createState() => _RefBacklinksPanelState();
+}
+
+class _RefBacklinksPanelState extends State<RefBacklinksPanel> {
+  bool _open = true;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: widget.refs,
+      builder: (context, _) {
+        final idx = widget.refs.index;
+        final back = idx.backlinksOf(widget.selfId);
+        final dups = idx.duplicates[widget.selfId] ?? const <RefTarget>[];
+        final showFix = widget.fixableCount > 0 && widget.onFixate != null;
+        if (back.isEmpty && dups.isEmpty && !showFix) return const SizedBox.shrink();
+
+        return Container(
+          decoration: const BoxDecoration(
+            border: Border(top: BorderSide(color: Colors.white10)),
+          ),
+          padding: const EdgeInsets.only(top: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (dups.length > 1) _duplicateBanner(dups),
+              if (showFix) _fixBanner(),
+              if (back.isNotEmpty) ...[
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => setState(() => _open = !_open),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        AnimatedRotation(
+                          turns: _open ? 0 : -0.25,
+                          duration: const Duration(milliseconds: 150),
+                          child: const Icon(Icons.expand_more_rounded, size: 16, color: Colors.white54),
+                        ),
+                        const SizedBox(width: 6),
+                        Icon(Icons.call_received_rounded, size: 13, color: Colors.white38),
+                        const SizedBox(width: 6),
+                        Text(
+                          '${widget.title} · ${back.length}',
+                          style: const TextStyle(fontSize: 12, color: Colors.white54),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (_open)
+                  for (final b in back) _row(b),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _row(RefBacklink b) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.refs.open(b.source),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(22, 5, 0, 5),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Icon(refKindIcon(b.source.kind), size: 14, color: Colors.white38),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          b.source.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13, color: _RC.link),
+                        ),
+                      ),
+                      if (b.count > 1)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 6),
+                          child: Text('×${b.count}', style: const TextStyle(fontSize: 11, color: Colors.white38)),
+                        ),
+                    ],
+                  ),
+                  if (b.snippet.isNotEmpty)
+                    Text(
+                      b.snippet,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11.5, color: Colors.white38),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _fixBanner() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.link_rounded, size: 14, color: _RC.warn),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '${widget.fixableCount} link${widget.fixableCount == 1 ? '' : 's'} resolved by title only '
+              '(breaks if the target is renamed)',
+              style: const TextStyle(fontSize: 12, color: Colors.white54),
+            ),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: _RC.warn),
+            onPressed: widget.onFixate,
+            child: const Text('Pin by id', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _duplicateBanner(List<RefTarget> dups) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: _RC.warn.withOpacity(0.08),
+        border: Border.all(color: _RC.warn.withOpacity(0.35)),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.error_outline_rounded, size: 14, color: _RC.warn),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Duplicate id — probably a copied item. Give the copy a new id:',
+                  style: TextStyle(fontSize: 12, color: Colors.white70),
+                ),
+              ),
+            ],
+          ),
+          for (final t in dups)
+            Padding(
+              padding: const EdgeInsets.only(left: 22, top: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      t.rel ?? t.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12, color: Colors.white54),
+                    ),
+                  ),
+                  if (widget.refs.onRegenerateId != null && t.anchorPath != null)
+                    TextButton(
+                      style: TextButton.styleFrom(foregroundColor: _RC.warn),
+                      onPressed: () => widget.refs.onRegenerateId!(t),
+                      child: const Text('New id', style: TextStyle(fontSize: 12)),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILES TAB (antes em files.dart)
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// files.dart — aba "Files": um gerenciador de arquivos no estilo TagSpaces.
+//
+// ONDE FICAM AS TAGS:
+//   Tags, descrição e cor de pasta ficam em SIDECARS dentro das próprias
+//   pastas do usuário, numa subpasta oculta `.cc/` (um YAML por item):
+//     arquivo  D/nome.ext  →  D/.cc/nome.ext.yaml
+//     pasta    D/sub       →  D/sub/.cc/__folder__.yaml
+//   Cada sidecar guarda as tags pelo TÍTULO (com cor), então é autossuficiente:
+//   mover, renomear ou copiar uma pasta (dentro ou FORA do app) leva toda a
+//   metadata junto — nada fica órfão. Só a biblioteca de tags (grupos e cores)
+//   e a lista de Locations ficam em <workspace>/metadata/files_meta.json.
+//
+//   Formato antigo (`.ts/`, compatível com o TagSpaces): lido uma vez por pasta
+//   e convertido; a pasta `.ts` vira `.ts.migrated` (backup, nunca mais lido).
+//
+// Notas .md: o sidecar é `D/.cc/<id>.yaml`, ligado pelo `id` do frontmatter do
+// .md (o app grava o id na primeira vez que a nota recebe metadata). Outros
+// arquivos guardam tamanho + hash. Mover/renomear FORA do app é religado ao
+// indexar a Location (um único candidato; ambíguo, o sidecar fica como está).
+//
+// Integração: ver main.dart (flag _isFilesView + _buildFilesNavContent +
+// _buildFilesMainArea).
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Paleta / helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _FC {
+  static const bg = Color(0xFF0E0E0E);
+  static const panel = Color(0xFF161618);
+  static const bar = Color(0xFF1A1A1A);
+  static const menu = Color(0xFF252525);
+  static const accent = Color(0xFF4FC3F7);
+  static const folder = Color(0xFF90A4AE);
+  static const tagPalette = <int>[
+    0xFFEF5350, 0xFFFF7043, 0xFFFFCA28, 0xFF9CCC65, 0xFF26A69A, 0xFF4FC3F7,
+    0xFF5C6BC0, 0xFFAB47BC, 0xFFEC407A, 0xFF8D6E63, 0xFF78909C, 0xFFBDBDBD,
+  ];
+}
+
+const Set<String> _imgExt = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'};
+const Set<String> _textExt = {
+  'txt', 'md', 'markdown', 'json', 'yaml', 'yml', 'csv', 'tsv', 'log', 'dart',
+  'py', 'js', 'ts', 'html', 'css', 'xml', 'ini', 'toml', 'tex', 'bib', 'c',
+  'cpp', 'h', 'java', 'sh', 'cfg', 'conf', 'm', 'ino',
+};
+
+String _normPath(String p) {
+  var s = p.replaceAll('\\', '/');
+  while (s.length > 1 && s.endsWith('/')) {
+    s = s.substring(0, s.length - 1);
+  }
+  return s;
+}
+
+String _baseName(String rel) {
+  final i = rel.lastIndexOf('/');
+  return i < 0 ? rel : rel.substring(i + 1);
+}
+
+String _parentRel(String rel) {
+  final i = rel.lastIndexOf('/');
+  return i < 0 ? '' : rel.substring(0, i);
+}
+
+String _joinRel(String dir, String name) => dir.isEmpty ? name : '$dir/$name';
+
+String _extOf(String name) {
+  final i = name.lastIndexOf('.');
+  return i <= 0 ? '' : name.substring(i + 1).toLowerCase();
+}
+
+String _fmtSize(int b) {
+  if (b < 1024) return '$b B';
+  if (b < 1048576) return '${(b / 1024).toStringAsFixed(1)} KB';
+  if (b < 1073741824) return '${(b / 1048576).toStringAsFixed(1)} MB';
+  return '${(b / 1073741824).toStringAsFixed(2)} GB';
+}
+
+String _fmtDate(DateTime d) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
+}
+
+/// Ordenação "natural": file2 < file10.
+int _natural(String a, String b) {
+  final re = RegExp(r'(\d+|\D+)');
+  final pa = re.allMatches(a.toLowerCase()).map((m) => m.group(0)!).toList();
+  final pb = re.allMatches(b.toLowerCase()).map((m) => m.group(0)!).toList();
+  for (var i = 0; i < pa.length && i < pb.length; i++) {
+    final x = pa[i];
+    final y = pb[i];
+    final nx = int.tryParse(x);
+    final ny = int.tryParse(y);
+    final r = (nx != null && ny != null) ? nx.compareTo(ny) : x.compareTo(y);
+    if (r != 0) return r;
+  }
+  return pa.length.compareTo(pb.length);
+}
+
+IconData _iconFor(FsItem it) {
+  if (it.isDir) return Icons.folder_rounded;
+  final e = it.ext;
+  if (_imgExt.contains(e)) return Icons.image_outlined;
+  if (e == 'pdf') return Icons.picture_as_pdf_outlined;
+  if (_textExt.contains(e)) return Icons.description_outlined;
+  if (const {'zip', 'rar', '7z', 'tar', 'gz'}.contains(e)) {
+    return Icons.archive_outlined;
+  }
+  if (const {'mp3', 'wav', 'flac', 'ogg', 'm4a'}.contains(e)) {
+    return Icons.audiotrack_outlined;
+  }
+  if (const {'mp4', 'mkv', 'mov', 'avi', 'webm'}.contains(e)) {
+    return Icons.movie_outlined;
+  }
+  if (const {'xlsx', 'xls', 'ods'}.contains(e)) return Icons.table_chart_outlined;
+  if (const {'docx', 'doc', 'odt'}.contains(e)) return Icons.article_outlined;
+  if (const {'pptx', 'ppt', 'odp'}.contains(e)) return Icons.slideshow_outlined;
+  return Icons.insert_drive_file_outlined;
+}
+
+InputDecoration _filesDeco(String hint, {Widget? prefix, Widget? suffix}) {
+  final border = OutlineInputBorder(
+    borderRadius: BorderRadius.circular(6),
+    borderSide: const BorderSide(color: Colors.white12),
+  );
+  return InputDecoration(
+    hintText: hint,
+    hintStyle: const TextStyle(color: Colors.white24, fontSize: 12.5),
+    isDense: true,
+    filled: true,
+    fillColor: _FC.panel,
+    prefixIcon: prefix,
+    suffixIcon: suffix,
+    prefixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 30),
+    suffixIconConstraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+    border: border,
+    enabledBorder: border,
+    focusedBorder: OutlineInputBorder(
+      borderRadius: BorderRadius.circular(6),
+      borderSide: const BorderSide(color: _FC.accent, width: 1),
+    ),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modelos
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FilesLocation {
+  final String id;
+  String name;
+  String path; // absoluto, '/' como separador, sem barra final
+  final bool builtin;
+  FilesLocation({
+    required this.id,
+    required this.name,
+    required this.path,
+    this.builtin = false,
+  });
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'path': path, 'builtin': builtin};
+  factory FilesLocation.fromJson(Map<String, dynamic> j) => FilesLocation(
+        id: j['id'] as String,
+        name: (j['name'] ?? '') as String,
+        path: _normPath((j['path'] ?? '') as String),
+        builtin: j['builtin'] == true,
+      );
+}
+
+class FileTagGroup {
+  final String id;
+  String name;
+  bool expanded;
+  FileTagGroup({required this.id, required this.name, this.expanded = true});
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'expanded': expanded};
+  factory FileTagGroup.fromJson(Map<String, dynamic> j) => FileTagGroup(
+        id: j['id'] as String,
+        name: (j['name'] ?? '') as String,
+        expanded: j['expanded'] != false,
+      );
+}
+
+class FileTagDef {
+  final String id;
+  String name;
+  int color; // ARGB
+  String groupId;
+  FileTagDef({
+    required this.id,
+    required this.name,
+    required this.color,
+    required this.groupId,
+  });
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'color': color, 'group': groupId};
+  factory FileTagDef.fromJson(Map<String, dynamic> j) => FileTagDef(
+        id: j['id'] as String,
+        name: (j['name'] ?? '') as String,
+        color: (j['color'] ?? 0xFF4FC3F7) as int,
+        groupId: (j['group'] ?? FilesMetaStore.defaultGroupId) as String,
+      );
+}
+
+/// Metadata de UM arquivo/pasta (espelha o sidecar `.ts/` correspondente).
+/// [tags] guarda ids da biblioteca; no disco as tags vão pelo título.
+class FileMeta {
+  List<String> tags;
+  String description;
+  int? color; // cor da pasta (ARGB)
+
+  FileMeta({
+    List<String>? tags,
+    this.description = '',
+    this.color,
+  }) : tags = tags ?? <String>[];
+
+  bool get isEmpty => tags.isEmpty && description.isEmpty && color == null;
+
+  FileMeta copy() => FileMeta(
+        tags: List<String>.of(tags),
+        description: description,
+        color: color,
+      );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Camada de acesso aos sidecars `.cc/` — propriedades e relações
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Um sidecar guarda, no mesmo YAML, tags/descrição/cor (aba Files), `props` e
+// `relations` (relações de SAÍDA do item; inversas e backlinks são derivados).
+// Toda leitura-modificação-gravação passa por [CcLocks] (um arquivo por vez) e
+// por [CcData.mutate], que:
+//   • preserva as chaves que não conhece;
+//   • NÃO sobrescreve um YAML que não parseia (lança [CcInvalidYamlException]);
+//   • apaga o sidecar (e o `.cc/` vazio) quando nada mais resta nele.
+//
+//   props:     {"telefone": "47 9...", "nascimento": "1990-05-01"}
+//   relations: [{"pred":"mora_em","pred_name":"mora em",
+//                "ref":{"id":"...","ws":"..."}}]
+//   Opcionais por relação: origem ("extraida"), status ("sugerida"), nota,
+//   trecho, em. "manual" e "confirmada" são o padrão e não são gravados.
+
+/// Exclusão mútua por arquivo: o mesmo sidecar nunca é lido-modificado-gravado
+/// por duas operações intercaladas (tags, props e relações escrevem nele).
+class CcLocks {
+  static final Map<String, Future<void>> _tails = {};
+
+  static Future<T> run<T>(String path, Future<T> Function() body) {
+    final key = path.replaceAll('\\', '/');
+    final prev = _tails[key] ?? Future<void>.value();
+    final done = Completer<T>();
+    final tail = prev.then((_) async {
+      try {
+        done.complete(await body());
+      } catch (e, st) {
+        done.completeError(e, st);
+      }
+    });
+    _tails[key] = tail;
+    tail.whenComplete(() {
+      if (identical(_tails[key], tail)) _tails.remove(key);
+    });
+    return done.future;
+  }
+}
+
+/// O sidecar existe mas não parseia: nada é gravado por cima.
+class CcInvalidYamlException implements Exception {
+  final String path;
+  const CcInvalidYamlException(this.path);
+  @override
+  String toString() => 'YAML inválido (não sobrescrito): $path';
+}
+
+/// Referência a um item: id + workspace (sempre gravados, mesmo dentro do
+/// mesmo workspace, para a relação sobreviver se o item mudar de workspace).
+class CcRef {
+  final String id;
+  final String ws;
+  const CcRef(this.id, this.ws);
+
+  factory CcRef.local(String id) => CcRef(id, CcData.workspaceId);
+
+  static CcRef? parse(Object? v) {
+    if (v is String && v.isNotEmpty) return CcRef(v, CcData.workspaceId);
+    if (v is Map) {
+      final id = (v['id'] ?? '').toString();
+      if (id.isEmpty) return null;
+      final ws = (v['ws'] ?? '').toString();
+      return CcRef(id, ws.isEmpty ? CcData.workspaceId : ws);
+    }
+    return null;
+  }
+
+  Map<String, dynamic> toJson() => <String, dynamic>{'id': id, 'ws': ws};
+
+  @override
+  bool operator ==(Object other) =>
+      other is CcRef && other.id == id && other.ws == ws;
+  @override
+  int get hashCode => id.hashCode ^ ws.hashCode;
+}
+
+/// Relação de saída de um item.
+class CcRelation {
+  final String pred; // id do predicado
+  final String predName; // nome gravado (reserva se o registro não o conhece)
+  final CcRef ref;
+  final String origem; // manual | extraida
+  final String status; // confirmada | sugerida
+  final String? nota; // rótulo livre (vindo das `connections` antigas)
+  final String? trecho;
+  final String? em;
+  final Map<String, dynamic> extra; // chaves desconhecidas, preservadas
+
+  const CcRelation({
+    required this.pred,
+    required this.ref,
+    this.predName = '',
+    this.origem = 'manual',
+    this.status = 'confirmada',
+    this.nota,
+    this.trecho,
+    this.em,
+    this.extra = const <String, dynamic>{},
+  });
+
+  static const Set<String> _known = {
+    'pred', 'pred_name', 'ref', 'origem', 'status', 'nota', 'trecho', 'em',
+  };
+
+  static CcRelation? parse(Object? v) {
+    if (v is! Map) return null;
+    final pred = (v['pred'] ?? '').toString();
+    final ref = CcRef.parse(v['ref']);
+    if (pred.isEmpty || ref == null) return null;
+    String? opt(String k) {
+      final s = (v[k] ?? '').toString();
+      return s.isEmpty ? null : s;
+    }
+
+    return CcRelation(
+      pred: pred,
+      predName: (v['pred_name'] ?? '').toString(),
+      ref: ref,
+      origem: opt('origem') ?? 'manual',
+      status: opt('status') ?? 'confirmada',
+      nota: opt('nota'),
+      trecho: opt('trecho'),
+      em: opt('em'),
+      extra: <String, dynamic>{
+        for (final e in v.entries)
+          if (!_known.contains(e.key.toString())) e.key.toString(): e.value,
+      },
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    final m = <String, dynamic>{'pred': pred};
+    if (predName.isNotEmpty) m['pred_name'] = predName;
+    m['ref'] = ref.toJson();
+    if (origem != 'manual') m['origem'] = origem;
+    if (status != 'confirmada') m['status'] = status;
+    if (nota != null) m['nota'] = nota;
+    if (trecho != null) m['trecho'] = trecho;
+    if (em != null) m['em'] = em;
+    m.addAll(extra);
+    return m;
+  }
+
+  /// Mesma aresta (predicado + alvo).
+  bool sameEdge(CcRelation o) => pred == o.pred && ref == o.ref;
+
+  CcRelation withPredName(String name) => CcRelation(
+        pred: pred,
+        ref: ref,
+        predName: name,
+        origem: origem,
+        status: status,
+        nota: nota,
+        trecho: trecho,
+        em: em,
+        extra: extra,
+      );
+}
+
+/// Conteúdo lido de um sidecar.
+class CcDoc {
+  final Map<String, dynamic> raw;
+  final bool exists;
+  final bool invalid; // existe, mas não parseia
+  const CcDoc(this.raw, {this.exists = true, this.invalid = false});
+
+  Map<String, dynamic> get props {
+    final p = raw['props'];
+    return p is Map ? Map<String, dynamic>.from(p) : <String, dynamic>{};
+  }
+
+  List<CcRelation> get relations {
+    final r = raw['relations'];
+    if (r is! List) return const <CcRelation>[];
+    final out = <CcRelation>[];
+    for (final x in r) {
+      final rel = CcRelation.parse(x);
+      if (rel != null) out.add(rel);
+    }
+    return out;
+  }
+}
+
+/// Onde os dados de um item moram: o arquivo do sidecar + os campos de
+/// identidade gravados quando ele é criado.
+class CcTarget {
+  final File file;
+  final Map<String, dynamic> identity;
+  const CcTarget(this.file, this.identity);
+}
+
+class CcData {
+  /// Id do workspace aberto (preenchido pelo app ao carregar o workspace).
+  static String workspaceId = '';
+
+  /// Sidecars que não parsearam (para a interface avisar). Só informativo.
+  static final Set<String> invalidFiles = <String>{};
+
+  static const Set<String> _identityKeys = {'title', 'kind', 'bind', 'id'};
+  static const Set<String> _stampKeys = {
+    'size', 'hash', 'mtime', 'app', 'updated',
+  };
+  static const List<String> _order = [
+    'title', 'kind', 'bind', 'id', 'tags', 'description', 'color',
+    'props', 'relations',
+  ];
+
+  static const String dirName = '.cc';
+  static const String folderFileName = '__folder__.yaml';
+
+  // ── Utilitários compartilhados com o FilesMetaStore ────────────────────────
+  static bool isMd(String name) => name.toLowerCase().endsWith('.md');
+
+  /// Nome de arquivo seguro para um id (`common:123` → `common_123`).
+  static String safeId(String id) =>
+      id.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+
+  static File idKeyedFile(String dirAbs, String id) =>
+      File('$dirAbs/$dirName/${safeId(id)}.yaml');
+
+  static int _seq = 0;
+  static final Random _rnd = Random();
+  static String newId(String prefix) =>
+      '$prefix${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}'
+      '${(_seq++).toRadixString(36)}${_rnd.nextInt(1296).toRadixString(36)}';
+
+  /// Lê um sidecar. `null` = não parseia (ou não é um mapa).
+  static Future<Map<String, dynamic>?> readYamlOrNull(File f) async {
+    try {
+      final text = await f.readAsString();
+      if (text.trim().isEmpty) return <String, dynamic>{};
+      final d = loadYaml(text);
+      return d is Map ? _asMap(d) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Grava [m] como YAML (uma chave por linha, valor em JSON — JSON é YAML
+  /// válido), por arquivo temporário + rename.
+  static Future<void> writeYaml(File f, Map<String, dynamic> m) async {
+    final b = StringBuffer();
+    for (final e in m.entries) {
+      b.writeln('${e.key}: ${jsonEncode(e.value)}');
+    }
+    await f.parent.create(recursive: true);
+    final tmp = File('${f.path}.tmp');
+    await tmp.writeAsString(b.toString(), flush: true);
+    await tmp.rename(f.path);
+  }
+
+  static Future<void> pruneDir(Directory d) async {
+    try {
+      if (await d.exists() && await d.list().isEmpty) await d.delete();
+    } catch (_) {}
+  }
+
+  // ── Consistência (4.7) ──────────────────────────────────────────────────────
+
+  /// Clona `.cc/<oldId>.yaml` de [dirAbs] para `.cc/<newId>.yaml`, regravando o
+  /// `id` dentro dele. Não apaga o original e não sobrescreve um destino que já
+  /// existe. Devolve false se não havia sidecar a clonar; lança
+  /// [CcInvalidYamlException] se o original não parseia (nada é gravado).
+  static Future<bool> cloneIdSidecar(
+    String dirAbs,
+    String oldId,
+    String newId,
+  ) async {
+    final src = idKeyedFile(dirAbs, oldId);
+    final dst = idKeyedFile(dirAbs, newId);
+    if (src.path == dst.path || !await src.exists()) return false;
+    return CcLocks.run(dst.path, () async {
+      if (await dst.exists()) return false;
+      final doc = await readYamlOrNull(src);
+      if (doc == null) {
+        invalidFiles.add(src.path);
+        throw CcInvalidYamlException(src.path);
+      }
+      if (doc.containsKey('id') || doc['bind'] == 'id') doc['id'] = newId;
+      doc['updated'] = DateTime.now().toUtc().toIso8601String();
+      await writeYaml(dst, _ordered(doc));
+      // conferência: o clone precisa reler com as mesmas relações
+      final back = await readYamlOrNull(dst);
+      final n = CcDoc(doc).relations.length;
+      if (back == null || CcDoc(back).relations.length != n) {
+        try {
+          await dst.delete();
+        } catch (_) {}
+        return false;
+      }
+      RelationIndex.invalidate(dirAbs);
+      return true;
+    });
+  }
+
+  /// Apaga `.cc/<id>.yaml` de [dirAbs] (e o `.cc/` se ficar vazio).
+  static Future<void> removeIdSidecar(String dirAbs, String id) async {
+    final f = idKeyedFile(dirAbs, id);
+    try {
+      await CcLocks.run(f.path, () async {
+        if (await f.exists()) await f.delete();
+      });
+      await pruneDir(f.parent);
+    } catch (e) {
+      debugPrint('CcData.removeIdSidecar($dirAbs, $id): $e');
+    }
+    RelationIndex.invalidate(dirAbs);
+  }
+
+  /// Remove os sidecars de UM arquivo prestes a ser apagado: o por nome
+  /// (`.cc/<nome>.yaml`), o por id (nota .md com id) e o companheiro antigo
+  /// (`.cc/<nome>.md`). Chame ANTES de apagar o arquivo (o id está nele).
+  /// Pastas não precisam: o `.cc/` delas vai junto.
+  static Future<void> removeItemSidecar(String abs) async {
+    final dir = _dirOf(abs);
+    final name = _base(abs);
+    final files = <File>[
+      File('$dir/$dirName/$name.yaml'),
+      File('$dir/$dirName/$name.md'),
+    ];
+    if (isMd(abs)) {
+      final id = await mdId(abs);
+      if (id != null) files.add(idKeyedFile(dir, id));
+    }
+    for (final f in files) {
+      try {
+        await CcLocks.run(f.path, () async {
+          if (await f.exists()) await f.delete();
+        });
+      } catch (e) {
+        debugPrint('CcData.removeItemSidecar(${f.path}): $e');
+      }
+    }
+    await pruneDir(Directory('$dir/$dirName'));
+    RelationIndex.invalidate(dir);
+  }
+
+  /// id → caminho dos `.md` com id em [abs] (o próprio, se for nota; todos os
+  /// de dentro, se for pasta; ocultos ignorados).
+  static Future<Map<String, String>> idsUnder(String abs) async {
+    final out = <String, String>{};
+    final type = FileSystemEntity.typeSync(abs);
+    if (type == FileSystemEntityType.file) {
+      if (isMd(abs)) {
+        final id = await mdId(abs);
+        if (id != null) out[id] = abs;
+      }
+      return out;
+    }
+    if (type != FileSystemEntityType.directory) return out;
+    try {
+      await for (final e in Directory(abs).list(recursive: true, followLinks: false)) {
+        if (e is! File || !isMd(e.path)) continue;
+        final rel = e.path.substring(abs.length + 1);
+        if (rel.split('/').any((s) => s.startsWith('.'))) continue;
+        final id = await mdId(e.path);
+        if (id != null) out.putIfAbsent(id, () => e.path);
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// `id` do frontmatter de um .md (lê só o começo do arquivo).
+  static Future<String?> mdId(String abs) async {
+    RandomAccessFile? raf;
+    try {
+      raf = await File(abs).open();
+      final bytes = await raf.read(8192);
+      final id = readFrontmatter(
+        utf8.decode(bytes, allowMalformed: true),
+      )['id']
+          ?.toString();
+      return (id == null || id.isEmpty) ? null : id;
+    } catch (_) {
+      return null;
+    } finally {
+      await raf?.close();
+    }
+  }
+
+  /// Grava [id] no frontmatter de um .md sem mexer no corpo (nem na data).
+  static Future<void> stampMdId(String abs, String id) async {
+    final f = File(abs);
+    final text = await f.readAsString();
+    final modified = (await f.stat()).modified;
+    final fm = readFrontmatter(text);
+    final String out;
+    if (fm.isNotEmpty) {
+      final merged = <String, dynamic>{'id': id, ...fm}..['id'] = id;
+      out = '${_writeFrontmatter(merged)}${stripFrontmatter(text)}';
+    } else {
+      out = '${_writeFrontmatter(<String, dynamic>{'id': id})}$text';
+    }
+    final tmp = File('$abs.tmp');
+    await tmp.writeAsString(out, flush: true);
+    await tmp.rename(abs);
+    try {
+      await f.setLastModified(modified);
+    } catch (_) {}
+  }
+
+  /// id do .md; se não tiver, gera um e grava no arquivo.
+  static Future<String?> ensureMdId(String abs) async {
+    final cur = await mdId(abs);
+    if (cur != null) return cur;
+    try {
+      final id = newId('md_');
+      await stampMdId(abs, id);
+      return id;
+    } catch (e) {
+      debugPrint('CcData.ensureMdId($abs): $e');
+      return null;
+    }
+  }
+
+  // ── Alvos (onde os dados de um item moram) ─────────────────────────────────
+  static String _base(String path) {
+    final p = path.replaceAll('\\', '/');
+    final i = p.lastIndexOf('/');
+    return i < 0 ? p : p.substring(i + 1);
+  }
+
+  static String _dirOf(String abs) {
+    final p = abs.replaceAll('\\', '/');
+    final i = p.lastIndexOf('/');
+    return i <= 0 ? '.' : p.substring(0, i);
+  }
+
+  /// Arquivo comum (não .md): sidecar por nome em `.cc/<nome>.yaml`.
+  static CcTarget forFile(String abs) {
+    final name = _base(abs);
+    return CcTarget(
+      File('${_dirOf(abs)}/$dirName/$name.yaml'),
+      <String, dynamic>{'title': name, 'kind': 'file'},
+    );
+  }
+
+  /// Pasta: `<pasta>/.cc/__folder__.yaml` (viaja com a pasta).
+  static CcTarget forFolder(String dirAbs) {
+    final d = dirAbs.replaceAll('\\', '/');
+    return CcTarget(
+      File('$d/$dirName/$folderFileName'),
+      <String, dynamic>{'title': _base(d), 'kind': 'folder'},
+    );
+  }
+
+  /// Nota .md: sidecar por id (`.cc/<id>.yaml`). Com [create], um .md sem id
+  /// ganha um (gravado no frontmatter) e absorve o sidecar por nome que já
+  /// tivesse (tags etc.). Sem [create] e sem id, devolve o alvo por nome.
+  static Future<CcTarget> forMd(String mdAbs, {bool create = false}) async {
+    final name = _base(mdAbs);
+    final dir = _dirOf(mdAbs);
+    final named = CcTarget(
+      File('$dir/$dirName/$name.yaml'),
+      <String, dynamic>{'title': name, 'kind': 'file'},
+    );
+    final id = create ? await ensureMdId(mdAbs) : await mdId(mdAbs);
+    if (id == null) return named;
+    final idFile = idKeyedFile(dir, id);
+    final identity = <String, dynamic>{
+      'title': name,
+      'kind': 'file',
+      'bind': 'id',
+      'id': id,
+    };
+    if (create && await named.file.exists() && !await idFile.exists()) {
+      await CcLocks.run(idFile.path, () async {
+        if (await idFile.exists()) return;
+        final legacy = await readYamlOrNull(named.file);
+        if (legacy == null) return; // inválido: não mexe
+        final doc = <String, dynamic>{...identity};
+        legacy.forEach((k, v) {
+          if (!_identityKeys.contains(k)) doc[k] = v;
+        });
+        await writeYaml(idFile, _ordered(doc));
+        await named.file.delete();
+        await pruneDir(named.file.parent);
+      });
+    }
+    return CcTarget(idFile, identity);
+  }
+
+  /// Escolhe o alvo certo para um caminho (pasta, .md ou arquivo comum).
+  static Future<CcTarget> forPath(String abs, {bool create = false}) async {
+    if (FileSystemEntity.typeSync(abs) == FileSystemEntityType.directory) {
+      return forFolder(abs);
+    }
+    if (isMd(abs)) return forMd(abs, create: create);
+    return forFile(abs);
+  }
+
+  // ── Leitura e escrita ──────────────────────────────────────────────────────
+  static Future<CcDoc> read(CcTarget t) async {
+    final f = t.file;
+    if (!await f.exists()) {
+      return const CcDoc(<String, dynamic>{}, exists: false);
+    }
+    final r = await readYamlOrNull(f);
+    if (r == null) {
+      invalidFiles.add(f.path);
+      return const CcDoc(<String, dynamic>{}, invalid: true);
+    }
+    invalidFiles.remove(f.path);
+    return CcDoc(r);
+  }
+
+  static Map<String, dynamic> _ordered(Map<String, dynamic> doc) {
+    final out = <String, dynamic>{};
+    for (final k in _order) {
+      if (doc.containsKey(k)) out[k] = doc[k];
+    }
+    doc.forEach((k, v) {
+      if (!out.containsKey(k) && !_stampKeys.contains(k)) out[k] = v;
+    });
+    for (final k in const ['size', 'hash', 'mtime', 'app', 'updated']) {
+      if (doc.containsKey(k)) out[k] = doc[k];
+    }
+    return out;
+  }
+
+  static void _tidy(Map<String, dynamic> doc) {
+    final p = doc['props'];
+    if (p is Map && p.isEmpty) doc.remove('props');
+    final r = doc['relations'];
+    if (r is List && r.isEmpty) doc.remove('relations');
+  }
+
+  static bool _hasContent(Map<String, dynamic> doc) {
+    for (final e in doc.entries) {
+      if (_identityKeys.contains(e.key) || _stampKeys.contains(e.key)) continue;
+      final v = e.value;
+      if (v == null) continue;
+      if (v is String && v.isEmpty) continue;
+      if (v is Iterable && v.isEmpty) continue;
+      if (v is Map && v.isEmpty) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /// Lê-modifica-grava o sidecar de [t], serializado por arquivo. Lança
+  /// [CcInvalidYamlException] se o arquivo existe e não parseia.
+  static Future<void> mutate(
+    CcTarget t,
+    void Function(Map<String, dynamic> doc) edit,
+  ) {
+    return CcLocks.run(t.file.path, () async {
+      final f = t.file;
+      var doc = <String, dynamic>{};
+      if (await f.exists()) {
+        final r = await readYamlOrNull(f);
+        if (r == null) {
+          invalidFiles.add(f.path);
+          throw CcInvalidYamlException(f.path);
+        }
+        invalidFiles.remove(f.path);
+        doc = r;
+      }
+      for (final e in t.identity.entries) {
+        doc.putIfAbsent(e.key, () => e.value);
+      }
+      edit(doc);
+      _tidy(doc);
+      if (!_hasContent(doc)) {
+        if (await f.exists()) {
+          await f.delete();
+          await pruneDir(f.parent);
+        }
+        RelationIndex.invalidate(f.parent.parent.path);
+        return;
+      }
+      doc['app'] = 'Chaos Control';
+      doc['updated'] = DateTime.now().toUtc().toIso8601String();
+      await writeYaml(f, _ordered(doc));
+      RelationIndex.invalidate(f.parent.parent.path);
+    });
+  }
+
+  // ── Propriedades ───────────────────────────────────────────────────────────
+  static Future<void> setProp(CcTarget t, String key, Object? value) {
+    if (value != null) PropertyRegistry.instance.noteUse(key, value);
+    return mutate(t, (doc) {
+      final p = doc['props'] is Map
+          ? Map<String, dynamic>.from(doc['props'] as Map)
+          : <String, dynamic>{};
+      if (value == null) {
+        p.remove(key);
+      } else {
+        p[key] = value;
+      }
+      doc['props'] = p;
+    });
+  }
+
+  static Future<void> removeProp(CcTarget t, String key) =>
+      setProp(t, key, null);
+
+  // ── Relações de saída ──────────────────────────────────────────────────────
+  static List<dynamic> _relList(Map<String, dynamic> doc) =>
+      doc['relations'] is List
+          ? List<dynamic>.from(doc['relations'] as List)
+          : <dynamic>[];
+
+  /// Insere a relação ou, se a aresta (predicado + alvo) já existe, a atualiza.
+  /// Com [validate], o predicado precisa estar no registro do workspace
+  /// ([CcUnknownPredicateException] caso contrário); o nome gravado é
+  /// preenchido a partir do registro. A migração e a importação entre
+  /// workspaces usam `validate: false`.
+  static Future<void> addRelation(
+    CcTarget t,
+    CcRelation r, {
+    bool validate = true,
+  }) {
+    final reg = PredicateRegistry.instance;
+    if (validate && reg.loaded && !reg.isDefined(r.pred)) {
+      return Future<void>.error(CcUnknownPredicateException(r.pred));
+    }
+    final rr = (r.predName.isEmpty && reg.isDefined(r.pred))
+        ? r.withPredName(reg.label(r.pred))
+        : r;
+    return mutate(t, (doc) {
+      final list = _relList(doc);
+      var replaced = false;
+      for (var i = 0; i < list.length; i++) {
+        final ex = CcRelation.parse(list[i]);
+        if (ex != null && ex.sameEdge(rr)) {
+          list[i] = rr.toJson();
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) list.add(rr.toJson());
+      doc['relations'] = list;
+    });
+  }
+
+  static Future<void> removeRelation(CcTarget t, String pred, CcRef ref) {
+    return mutate(t, (doc) {
+      final list = _relList(doc);
+      list.removeWhere((x) {
+        final ex = CcRelation.parse(x);
+        return ex != null && ex.pred == pred && ex.ref == ref;
+      });
+      doc['relations'] = list;
+    });
+  }
+
+  /// Substitui TODAS as relações (uso da migração). Entradas que não parseiam
+  /// também são substituídas: use só com a lista completa em mãos.
+  static Future<void> setRelations(CcTarget t, List<CcRelation> rs) {
+    return mutate(t, (doc) {
+      doc['relations'] = <dynamic>[for (final r in rs) r.toJson()];
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Registro de predicados — `<workspace>/.cc/registry/predicates.yaml`
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A semântica dos predicados (rótulo, inverso, domínio, imagem, frase-modelo)
+// mora aqui, e não em cada relação: renomear ou ajustar um predicado muda um
+// arquivo só. Cada relação guarda o id e o nome gravado, que serve de reserva
+// quando o registro de outro workspace não conhece o predicado.
+//
+// O arquivo é feito para ser editado à mão. O app só o reescreve ao criar o
+// padrão, ao adicionar/remover um predicado, e preserva suas entradas:
+//
+//   schema: 1
+//   predicates:
+//     amigo_de:
+//       label: "amigo de"
+//       symmetric: true
+//       phrase: "{s} é amigo de {o}"
+//     autor_de:
+//       label: "autor de"
+//       inverse: "escrito_por"
+//       phrase: "{s} é autor de {o}"
+//       domain: ["person"]        # opcional: tipos de entidade aceitos
+//       range: ["work"]           # opcional; vazio = qualquer tipo
+
+class PredicateDef {
+  final String id;
+  final String label;
+  final String? inverse; // id do predicado inverso
+  final bool symmetric; // A→B implica B→A com o mesmo predicado
+  final List<String> domain; // tipos do sujeito (vazio = qualquer)
+  final List<String> range; // tipos do objeto, a "imagem" (vazio = qualquer)
+  final String phrase; // modelo: {s} = sujeito, {o} = objeto
+  final String description;
+  final Map<String, dynamic> extra; // chaves desconhecidas, preservadas
+
+  const PredicateDef({
+    required this.id,
+    required this.label,
+    this.inverse,
+    this.symmetric = false,
+    this.domain = const <String>[],
+    this.range = const <String>[],
+    this.phrase = '',
+    this.description = '',
+    this.extra = const <String, dynamic>{},
+  });
+
+  static const Set<String> _known = {
+    'label', 'inverse', 'symmetric', 'domain', 'range', 'phrase',
+    'description',
+  };
+
+  factory PredicateDef.fromMap(String id, Map m) {
+    List<String> strs(Object? v) => v is List
+        ? <String>[
+            for (final x in v)
+              if (x != null && x.toString().isNotEmpty) x.toString(),
+          ]
+        : <String>[];
+    final inv = (m['inverse'] ?? '').toString();
+    final label = (m['label'] ?? '').toString();
+    return PredicateDef(
+      id: id,
+      label: label.isEmpty ? id.replaceAll('_', ' ') : label,
+      inverse: inv.isEmpty ? null : inv,
+      symmetric: m['symmetric'] == true,
+      domain: strs(m['domain']),
+      range: strs(m['range']),
+      phrase: (m['phrase'] ?? '').toString(),
+      description: (m['description'] ?? '').toString(),
+      extra: <String, dynamic>{
+        for (final e in m.entries)
+          if (!_known.contains(e.key.toString())) e.key.toString(): e.value,
+      },
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    final m = <String, dynamic>{'label': label};
+    if (symmetric) m['symmetric'] = true;
+    if (inverse != null) m['inverse'] = inverse;
+    if (domain.isNotEmpty) m['domain'] = domain;
+    if (range.isNotEmpty) m['range'] = range;
+    if (phrase.isNotEmpty) m['phrase'] = phrase;
+    if (description.isNotEmpty) m['description'] = description;
+    m.addAll(extra);
+    return m;
+  }
+
+  PredicateDef withInverse(String inv) => PredicateDef(
+        id: id,
+        label: label,
+        inverse: inv,
+        symmetric: symmetric,
+        domain: domain,
+        range: range,
+        phrase: phrase,
+        description: description,
+        extra: extra,
+      );
+
+  /// Frase em linguagem natural: `{s} mora em {o}` com os nomes dados.
+  String render(String subject, String object) {
+    final t = phrase.isEmpty ? '{s} $label {o}' : phrase;
+    return t.replaceAll('{s}', subject).replaceAll('{o}', object);
+  }
+}
+
+/// Predicado usado numa relação, mas que o registro não conhece.
+class CcUnknownPredicateException implements Exception {
+  final String pred;
+  const CcUnknownPredicateException(this.pred);
+  @override
+  String toString() => 'Predicado não definido neste workspace: $pred';
+}
+
+class PredicateRegistry {
+  PredicateRegistry._();
+  static final PredicateRegistry instance = PredicateRegistry._();
+
+  /// Ids de predicado: minúsculas, dígitos e `_`, começando por letra.
+  static final RegExp idPattern = RegExp(r'^[a-z][a-z0-9_]*$');
+
+  /// Lista inicial (um registro novo nasce com ela).
+  static const List<PredicateDef> defaults = [
+    PredicateDef(
+      id: 'relacionado_a',
+      label: 'relacionado a',
+      symmetric: true,
+      phrase: '{s} está relacionado a {o}',
+    ),
+    PredicateDef(
+      id: 'amigo_de',
+      label: 'amigo de',
+      symmetric: true,
+      phrase: '{s} é amigo de {o}',
+    ),
+    PredicateDef(
+      id: 'mora_em',
+      label: 'mora em',
+      phrase: '{s} mora em {o}',
+    ),
+    PredicateDef(
+      id: 'trabalha_em',
+      label: 'trabalha em',
+      phrase: '{s} trabalha em {o}',
+    ),
+    PredicateDef(
+      id: 'membro_de',
+      label: 'membro de',
+      phrase: '{s} é membro de {o}',
+    ),
+    PredicateDef(
+      id: 'parte_de',
+      label: 'parte de',
+      inverse: 'contem',
+      phrase: '{s} é parte de {o}',
+    ),
+    PredicateDef(
+      id: 'contem',
+      label: 'contém',
+      inverse: 'parte_de',
+      phrase: '{s} contém {o}',
+    ),
+    PredicateDef(
+      id: 'autor_de',
+      label: 'autor de',
+      inverse: 'escrito_por',
+      phrase: '{s} é autor de {o}',
+    ),
+    PredicateDef(
+      id: 'escrito_por',
+      label: 'escrito por',
+      inverse: 'autor_de',
+      phrase: '{s} foi escrito por {o}',
+    ),
+    PredicateDef(
+      id: 'tradutor_de',
+      label: 'tradutor de',
+      inverse: 'traduzido_por',
+      phrase: '{s} é tradutor de {o}',
+    ),
+    PredicateDef(
+      id: 'traduzido_por',
+      label: 'traduzido por',
+      inverse: 'tradutor_de',
+      phrase: '{s} foi traduzido por {o}',
+    ),
+  ];
+
+  /// Muda a cada alteração do registro (a interface pode escutar).
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  String _root = '';
+  bool loaded = false;
+
+  /// O arquivo existe mas não parseia: o app usa o padrão em memória e não
+  /// grava nada por cima.
+  bool invalid = false;
+
+  final Map<String, PredicateDef> _defs = <String, PredicateDef>{};
+  final Map<String, dynamic> _unparsed = <String, dynamic>{}; // entradas não-mapa
+  final Map<String, dynamic> _topExtra = <String, dynamic>{}; // chaves de topo
+
+  File? get file =>
+      _root.isEmpty ? null : File('$_root/.cc/registry/predicates.yaml');
+
+  // ── Consulta ────────────────────────────────────────────────────────────────
+  List<PredicateDef> get all => List<PredicateDef>.unmodifiable(_defs.values);
+  PredicateDef? defOf(String id) => _defs[id];
+  bool isDefined(String id) => _defs.containsKey(id);
+
+  /// Rótulo do predicado; se o registro não o conhece, [fallback] (o nome
+  /// gravado na relação) ou o próprio id sem os `_`.
+  String label(String id, {String fallback = ''}) =>
+      _defs[id]?.label ?? (fallback.isNotEmpty ? fallback : id.replaceAll('_', ' '));
+
+  bool isSymmetric(String id) => _defs[id]?.symmetric ?? false;
+
+  /// Predicado inverso: o próprio id se for simétrico, o declarado em
+  /// `inverse`, ou `null` se não houver (ou não estiver definido).
+  String? inverseOf(String id) {
+    final d = _defs[id];
+    if (d == null) return null;
+    if (d.symmetric) return id;
+    return d.inverse;
+  }
+
+  /// `null` se a relação é aceitável; senão a razão. Os tipos só são
+  /// conferidos quando o predicado os restringe e o tipo é conhecido.
+  String? validate(String pred, {String? subjectType, String? objectType}) {
+    final d = _defs[pred];
+    if (d == null) return 'predicado "$pred" não definido';
+    if (subjectType != null &&
+        d.domain.isNotEmpty &&
+        !d.domain.contains(subjectType)) {
+      return '"${d.label}" não se aplica a "$subjectType" como sujeito';
+    }
+    if (objectType != null &&
+        d.range.isNotEmpty &&
+        !d.range.contains(objectType)) {
+      return '"${d.label}" não se aplica a "$objectType" como objeto';
+    }
+    return null;
+  }
+
+  // ── Carga ───────────────────────────────────────────────────────────────────
+  void _useDefaults() {
+    _defs
+      ..clear()
+      ..addEntries(defaults.map((d) => MapEntry(d.id, d)));
+    _unparsed.clear();
+    _topExtra.clear();
+  }
+
+  void _ingest(Map<String, dynamic> r) {
+    _defs.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    r.forEach((k, v) {
+      if (k != 'schema' && k != 'predicates') _topExtra[k] = v;
+    });
+    final preds = r['predicates'];
+    if (preds is Map) {
+      for (final e in preds.entries) {
+        final id = e.key.toString();
+        final v = e.value;
+        if (v is Map) {
+          _defs[id] = PredicateDef.fromMap(id, v);
+        } else {
+          _unparsed[id] = v; // preservado ao regravar
+        }
+      }
+    }
+  }
+
+  void _bump() => revision.value++;
+
+  /// Carrega o registro do workspace em [workspaceRoot]. Arquivo ausente: cria
+  /// o padrão (só se a pasta do workspace existe). Inválido: usa o padrão em
+  /// memória e não grava.
+  Future<void> load(String workspaceRoot) async {
+    _root = workspaceRoot;
+    loaded = false;
+    invalid = false;
+    try {
+      if (!await Directory(workspaceRoot).exists()) {
+        _useDefaults(); // workspace offline: nada é criado em disco
+      } else {
+        final f = file!;
+        if (!await f.exists()) {
+          _useDefaults();
+          await CcLocks.run(f.path, () async {
+            if (!await f.exists()) await _write(f);
+          });
+        } else {
+          final r = await CcData.readYamlOrNull(f);
+          if (r == null) {
+            invalid = true;
+            CcData.invalidFiles.add(f.path);
+            _useDefaults();
+            debugPrint('PredicateRegistry: YAML inválido em ${f.path}');
+          } else {
+            CcData.invalidFiles.remove(f.path);
+            _ingest(r);
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('PredicateRegistry.load: $e');
+      if (_defs.isEmpty) _useDefaults();
+    }
+    loaded = true;
+    _bump();
+  }
+
+  /// Relê do disco (depois de uma edição à mão).
+  Future<void> reload() => _root.isEmpty ? Future<void>.value() : load(_root);
+
+  // ── Escrita ─────────────────────────────────────────────────────────────────
+  static String _key(String k) =>
+      idPattern.hasMatch(k) ? k : jsonEncode(k);
+
+  String _serialize() {
+    final b = StringBuffer()
+      ..writeln('# Registro de predicados do workspace (pode ser editado à mão).')
+      ..writeln('# {s} = sujeito, {o} = objeto. inverse/symmetric definem o inverso.')
+      ..writeln('schema: 1');
+    _topExtra.forEach((k, v) => b.writeln('${_key(k)}: ${jsonEncode(v)}'));
+    if (_defs.isEmpty && _unparsed.isEmpty) {
+      b.writeln('predicates: {}');
+    } else {
+      b.writeln('predicates:');
+      for (final d in _defs.values) {
+        b.writeln('  ${_key(d.id)}:');
+        d.toMap().forEach((k, v) {
+          b.writeln('    ${_key(k)}: ${jsonEncode(v)}');
+        });
+      }
+      _unparsed.forEach((k, v) => b.writeln('  ${_key(k)}: ${jsonEncode(v)}'));
+    }
+    return b.toString();
+  }
+
+  Future<void> _write(File f) async {
+    await f.parent.create(recursive: true);
+    final tmp = File('${f.path}.tmp');
+    await tmp.writeAsString(_serialize(), flush: true);
+    await tmp.rename(f.path);
+  }
+
+  /// Junta edições externas antes de gravar. Lança se o arquivo está inválido.
+  Future<void> _mergeFromDisk(File f) async {
+    if (!await f.exists()) return;
+    final r = await CcData.readYamlOrNull(f);
+    if (r == null) {
+      invalid = true;
+      CcData.invalidFiles.add(f.path);
+      throw CcInvalidYamlException(f.path);
+    }
+    invalid = false;
+    CcData.invalidFiles.remove(f.path);
+    _ingest(r);
+  }
+
+  /// Adiciona ou atualiza um predicado.
+  Future<void> upsert(PredicateDef d) async {
+    if (!idPattern.hasMatch(d.id)) {
+      throw ArgumentError('id de predicado inválido: "${d.id}"');
+    }
+    final f = file;
+    if (f == null) throw StateError('registro de predicados não carregado');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _defs[d.id] = d;
+      await _write(f);
+    });
+    _bump();
+  }
+
+  /// Garante predicados padrão que o app usa (nunca sobrescreve os que já
+  /// existem). Se o predicado acrescentado declara um inverso que existe sem
+  /// inverso, os dois passam a se apontar. Lança [CcInvalidYamlException] se o
+  /// arquivo está inválido.
+  Future<void> ensureDefaults(Iterable<String> ids) async {
+    final f = file;
+    if (f == null) return;
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      var changed = false;
+      for (final id in ids) {
+        if (_defs.containsKey(id)) continue;
+        PredicateDef? d;
+        for (final x in defaults) {
+          if (x.id == id) d = x;
+        }
+        if (d == null) continue;
+        _defs[id] = d;
+        changed = true;
+        final inv = d.inverse;
+        final other = inv == null ? null : _defs[inv];
+        if (other != null && other.inverse == null && !other.symmetric) {
+          _defs[inv!] = other.withInverse(id);
+        }
+      }
+      if (changed) await _write(f);
+    });
+    _bump();
+  }
+
+  /// Remove um predicado do registro (as relações que o usam continuam, com o
+  /// nome gravado, e passam a aparecer como "não definido").
+  Future<void> remove(String id) async {
+    final f = file;
+    if (f == null) throw StateError('registro de predicados não carregado');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _defs.remove(id);
+      _unparsed.remove(id);
+      await _write(f);
+    });
+    _bump();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 5 — registros do workspace e estado local
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// No `.cc/` do workspace (viaja com ele):
+//   registry/tags.yaml        biblioteca de tags (grupos, cores, ordem)
+//   registry/properties.yaml  esquema das propriedades (`props`)
+//   registry/predicates.yaml  predicados (fase 4)
+//   locations.yaml            Locations da aba Files
+//   views.yaml                views salvas (cada uma é um item nomeado)
+//
+// Fora do workspace (só nesta máquina), em <config>/chaos_control/state/:
+//   <workspace_id>.json       aba aberta, seções recolhidas, dobras do editor,
+//                             grupos de tag expandidos, caminho das Locations
+
+/// Chave de mapa YAML: puro se for simples, senão entre aspas.
+String _ccKey(String k) =>
+    RegExp(r'^[A-Za-z_][A-Za-z0-9_.-]*$').hasMatch(k) ? k : jsonEncode(k);
+
+/// Grava texto por arquivo temporário + rename.
+Future<void> _ccWriteText(File f, String text) async {
+  await f.parent.create(recursive: true);
+  final tmp = File('${f.path}.tmp');
+  await tmp.writeAsString(text, flush: true);
+  await tmp.rename(f.path);
+}
+
+/// Chaves de `workspace_<id>.json` que são estado de interface: ficam no cache
+/// local (LocalState), não no workspace.
+const List<String> kUiStateKeys = [
+  'openNoteTabs', 'activeNoteId',
+  'notesOrgNotesCollapsed', 'notesOrgTasksCollapsed',
+  'collapsedNavProjectFolders',
+  'notesSectionTaskExpanded', 'notesSectionProjectExpanded',
+  'notesSectionCommonExpanded',
+  'collapsedNoteTaskFolders', 'collapsedNoteProjectFolders',
+  'collapsedNoteCommonFolders',
+  'isTasksView', 'isNotesView', 'isSettingsView', 'isVisualizerView',
+  'isFilesView', 'tasksNavSection', 'notesNavSection',
+  'fgsSectionFilterCollapsed', 'fgsSectionGroupCollapsed',
+  'fgsSectionSortCollapsed', 'fgsPlannerFilterCollapsed',
+  'fgsPlannerSortCollapsed',
+];
+
+/// Cache local por workspace (JSON em <config>/chaos_control/state/). Nunca
+/// viaja com o workspace. Cada seção é lida-modificada-gravada sob lock.
+class LocalState {
+  static String? get _dir {
+    final xdg = Platform.environment['XDG_CONFIG_HOME'] ?? '';
+    if (xdg.isNotEmpty) return '$xdg/chaos_control/state';
+    final home = Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '';
+    return home.isEmpty ? null : '$home/.config/chaos_control/state';
+  }
+
+  static File? file(String wsId) {
+    final d = _dir;
+    return (d == null || wsId.isEmpty) ? null : File('$d/$wsId.json');
+  }
+
+  static Future<Map<String, dynamic>> read(String wsId) async {
+    final f = file(wsId);
+    if (f == null) return <String, dynamic>{};
+    try {
+      if (!await f.exists()) return <String, dynamic>{};
+      final d = jsonDecode(await f.readAsString());
+      return d is Map ? Map<String, dynamic>.from(d) : <String, dynamic>{};
+    } catch (_) {
+      return <String, dynamic>{}; // cache: se estiver ruim, recomeça
+    }
+  }
+
+  static Future<void> update(
+    String wsId,
+    void Function(Map<String, dynamic> m) edit,
+  ) async {
+    final f = file(wsId);
+    if (f == null) return;
+    try {
+      await CcLocks.run(f.path, () async {
+        final m = await read(wsId);
+        edit(m);
+        await _ccWriteText(f, jsonEncode(m));
+      });
+    } catch (e) {
+      debugPrint('LocalState.update: $e');
+    }
+  }
+}
+
+// ── Fase 6: cache local do índice por `workspace_id` ────────────────────────
+//
+//   <config>/chaos_control/state/index/<workspace_id>.json
+//
+//   { "schema": 1, "workspace_id": "...", "name": "...", "updated": <ms>,
+//     "entries": [ { "id", "title", "type", "type_label",
+//                    "rels": [ { "pred", "pred_name", "ref": {"id","ws"},
+//                                "status", "nota" } ] } ] }
+//
+// Um arquivo por workspace (o deste e os anexados). Guarda só o que links,
+// autocomplete e backlinks precisam: id, título, tipo e relações de SAÍDA de
+// cada entidade. Com o disco do workspace desconectado, o app lê daqui.
+// Fica fora do workspace (nunca viaja) e é descartável: apagar o arquivo só
+// faz o índice ser refeito na próxima vez que o workspace estiver montado.
+
+class CachedRelation {
+  final String pred, predName, id, ws, status;
+  final String? nota;
+  const CachedRelation({
+    required this.pred,
+    required this.id,
+    required this.ws,
+    this.predName = '',
+    this.status = 'confirmada',
+    this.nota,
+  });
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'pred': pred,
+        if (predName.isNotEmpty) 'pred_name': predName,
+        'ref': <String, dynamic>{'id': id, 'ws': ws},
+        'status': status,
+        if (nota != null) 'nota': nota,
+      };
+
+  static CachedRelation? fromJson(Object? v) {
+    if (v is! Map) return null;
+    final ref = v['ref'];
+    if (ref is! Map) return null;
+    final pred = (v['pred'] ?? '').toString();
+    final id = (ref['id'] ?? '').toString();
+    if (pred.isEmpty || id.isEmpty) return null;
+    final nota = (v['nota'] ?? '').toString();
+    return CachedRelation(
+      pred: pred,
+      predName: (v['pred_name'] ?? '').toString(),
+      id: id,
+      ws: (ref['ws'] ?? '').toString(),
+      status: (v['status'] ?? 'confirmada').toString(),
+      nota: nota.isEmpty ? null : nota,
+    );
+  }
+}
+
+class CachedEntry {
+  final String id, title, type, typeLabel;
+  final List<CachedRelation> rels;
+  const CachedEntry({
+    required this.id,
+    required this.title,
+    required this.type,
+    this.typeLabel = '',
+    this.rels = const <CachedRelation>[],
+  });
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'title': title,
+        'type': type,
+        if (typeLabel.isNotEmpty) 'type_label': typeLabel,
+        'rels': [for (final r in rels) r.toJson()],
+      };
+
+  static CachedEntry? fromJson(Object? v) {
+    if (v is! Map) return null;
+    final id = (v['id'] ?? '').toString();
+    if (id.isEmpty) return null;
+    final rels = v['rels'];
+    return CachedEntry(
+      id: id,
+      title: (v['title'] ?? '').toString(),
+      type: (v['type'] ?? '').toString(),
+      typeLabel: (v['type_label'] ?? '').toString(),
+      rels: [
+        if (rels is List)
+          for (final r in rels)
+            if (CachedRelation.fromJson(r) != null) CachedRelation.fromJson(r)!,
+      ],
+    );
+  }
+}
+
+class WorkspaceIndexSnapshot {
+  final String wsId, name;
+  final int updatedMs;
+  final List<CachedEntry> entries;
+  WorkspaceIndexSnapshot({
+    required this.wsId,
+    required this.name,
+    required this.entries,
+    int? updatedMs,
+  }) : updatedMs = updatedMs ?? DateTime.now().millisecondsSinceEpoch;
+
+  Map<String, CachedEntry>? _byId;
+  Map<String, CachedEntry> get byId =>
+      _byId ??= <String, CachedEntry>{for (final e in entries) e.id: e};
+
+  String? _fp;
+
+  /// Conteúdo (sem data/nome): só regrava o arquivo quando isto muda.
+  String get fingerprint =>
+      _fp ??= jsonEncode([for (final e in entries) e.toJson()]);
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'schema': WorkspaceIndexCache.schema,
+        'workspace_id': wsId,
+        'name': name,
+        'updated': updatedMs,
+        'entries': [for (final e in entries) e.toJson()],
+      };
+
+  static WorkspaceIndexSnapshot? fromJson(Object? v, String wsId) {
+    if (v is! Map) return null;
+    final list = v['entries'];
+    if (list is! List) return null;
+    final updated = v['updated'];
+    return WorkspaceIndexSnapshot(
+      wsId: wsId,
+      name: (v['name'] ?? '').toString(),
+      updatedMs: updated is int ? updated : 0,
+      entries: [
+        for (final x in list)
+          if (CachedEntry.fromJson(x) != null) CachedEntry.fromJson(x)!,
+      ],
+    );
+  }
+}
+
+class WorkspaceIndexCache {
+  static const int schema = 1;
+
+  static final Map<String, WorkspaceIndexSnapshot> _mem =
+      <String, WorkspaceIndexSnapshot>{};
+  static final Set<String> _tried = <String>{};
+  static final Map<String, String> _written = <String, String>{};
+
+  static File? file(String wsId) {
+    final d = LocalState._dir;
+    if (d == null || wsId.isEmpty) return null;
+    final safe = wsId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    return File('$d/index/$safe.json');
+  }
+
+  /// O que já está em memória (sem E/S).
+  static WorkspaceIndexSnapshot? peek(String wsId) => _mem[wsId];
+
+  /// Lê o cache de [wsId] (uma vez; depois vem da memória). Arquivo ruim ou
+  /// ausente: `null` (é só cache).
+  static Future<WorkspaceIndexSnapshot?> load(String wsId) async {
+    final hit = _mem[wsId];
+    if (hit != null) return hit;
+    if (!_tried.add(wsId)) return null;
+    final f = file(wsId);
+    if (f == null) return null;
+    try {
+      if (!await f.exists()) return null;
+      final s = WorkspaceIndexSnapshot.fromJson(jsonDecode(await f.readAsString()), wsId);
+      if (s != null) {
+        _mem[wsId] = s;
+        _written[wsId] = s.fingerprint;
+      }
+      return s;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Guarda [s] em memória e no disco. `true` se o conteúdo mudou.
+  static Future<bool> save(WorkspaceIndexSnapshot s) async {
+    final fp = s.fingerprint;
+    final changed = _mem[s.wsId]?.fingerprint != fp;
+    _mem[s.wsId] = s;
+    _tried.add(s.wsId);
+    if (_written[s.wsId] == fp) return changed;
+    final f = file(s.wsId);
+    if (f == null) return changed;
+    try {
+      await CcLocks.run(f.path, () => _ccWriteText(f, jsonEncode(s.toJson())));
+      _written[s.wsId] = fp;
+    } catch (e) {
+      debugPrint('WorkspaceIndexCache.save: $e');
+    }
+    return changed;
+  }
+
+  /// Snapshot a partir do índice de entidades de um workspace.
+  /// `connections` antigas entram como relações do mesmo workspace (a relação
+  /// tipada para o mesmo alvo vence, como no [RelationIndex]).
+  static WorkspaceIndexSnapshot fromEntityIndex(
+    String wsId,
+    String name,
+    EntityIndex idx,
+    String Function(String typeId) labelOf,
+  ) {
+    final out = <CachedEntry>[];
+    for (final e in idx.entries) {
+      final typed = <String>{};
+      final rels = <CachedRelation>[];
+      for (final r in e.relations) {
+        rels.add(CachedRelation(
+          pred: r.pred,
+          predName: r.predName,
+          id: r.ref.id,
+          ws: r.ref.ws.isEmpty ? wsId : r.ref.ws,
+          status: r.status,
+          nota: r.nota,
+        ));
+        if (r.status == 'confirmada' && (r.ref.ws.isEmpty || r.ref.ws == wsId)) {
+          typed.add(r.ref.id);
+        }
+      }
+      for (final c in e.legacy) {
+        if (typed.contains(c.ref)) continue;
+        rels.add(CachedRelation(
+          pred: ConnectionsMigration.predId,
+          predName: ConnectionsMigration.predName,
+          id: c.ref,
+          ws: wsId,
+          nota: c.label.isEmpty ? null : c.label,
+        ));
+      }
+      out.add(CachedEntry(
+        id: e.id,
+        title: e.name,
+        type: e.typeId,
+        typeLabel: labelOf(e.typeId),
+        rels: rels,
+      ));
+    }
+    out.sort((a, b) => a.id.compareTo(b.id));
+    return WorkspaceIndexSnapshot(wsId: wsId, name: name, entries: out);
+  }
+
+  /// Escaneia a raiz de um workspace anexado, SÓ LENDO. `null` se falhar.
+  /// Relações sem `ws` gravado (formato antigo) são lidas como do workspace
+  /// local; o formato atual sempre grava o `ws`.
+  static Future<WorkspaceIndexSnapshot?> scanRoot(
+    String wsId,
+    String name,
+    String root,
+  ) async {
+    try {
+      final gen = '$root/files/generalized';
+      if (!await Directory(root).exists()) return null;
+      final reg = await EntityTypeRegistry.load('$gen/.types');
+      final idx = await EntityIndex.build(EntityLocator(reg, gen));
+      return fromEntityIndex(wsId, name, idx, (t) => reg[t]?.label ?? '');
+    } catch (e) {
+      debugPrint('WorkspaceIndexCache.scanRoot: $e');
+      return null;
+    }
+  }
+
+  /// Anexo online: reescaneia e grava. Offline (ou falha): devolve o cache.
+  static Future<WorkspaceIndexSnapshot?> refreshAttached(AttachedWorkspace a) async {
+    final att = AttachedWorkspaces.instance;
+    final root = att.rootIfOnline(a.workspaceId);
+    if (root == null) return load(a.workspaceId);
+    final name = att.mountOf(a.workspaceId).name;
+    final s = await scanRoot(a.workspaceId, name.isEmpty ? a.name : name, root);
+    if (s == null) return load(a.workspaceId);
+    await save(s);
+    return s;
+  }
+}
+
+// ── Registro de propriedades — `.cc/registry/properties.yaml` ───────────────
+//
+//   schema: 1
+//   properties:
+//     telefone:
+//       label: "Telefone"
+//       type: "phone"          # text | phone | email | date | number | bool
+//
+// Descreve o tipo e o rótulo das chaves de `props` dos sidecars. Autorreparável:
+// uma chave gravada em `props` e desconhecida entra aqui com o tipo inferido.
+
+class PropertyDef {
+  final String id; // chave em `props`
+  final String label;
+  final String type;
+  final String description;
+  final Map<String, dynamic> extra;
+
+  const PropertyDef({
+    required this.id,
+    required this.label,
+    this.type = 'text',
+    this.description = '',
+    this.extra = const <String, dynamic>{},
+  });
+
+  static const Set<String> types = {
+    'text', 'phone', 'email', 'date', 'number', 'bool',
+  };
+  static const Set<String> _known = {'label', 'type', 'description'};
+
+  factory PropertyDef.fromMap(String id, Map m) {
+    final label = (m['label'] ?? '').toString();
+    final type = (m['type'] ?? 'text').toString();
+    return PropertyDef(
+      id: id,
+      label: label.isEmpty ? id : label,
+      type: types.contains(type) ? type : 'text',
+      description: (m['description'] ?? '').toString(),
+      extra: <String, dynamic>{
+        for (final e in m.entries)
+          if (!_known.contains(e.key.toString())) e.key.toString(): e.value,
+      },
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    final m = <String, dynamic>{'label': label, 'type': type};
+    if (description.isNotEmpty) m['description'] = description;
+    m.addAll(extra);
+    return m;
+  }
+
+  /// Tipo provável de um valor (usado no autorreparo).
+  static String infer(Object? v) {
+    if (v is bool) return 'bool';
+    if (v is num) return 'number';
+    if (v is String) {
+      final t = v.trim();
+      if (RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(t)) return 'email';
+      if (RegExp(r'^\d{4}-\d{2}-\d{2}([T ].*)?$').hasMatch(t)) return 'date';
+      if (RegExp(r'^\+?[\d\s().-]{8,}$').hasMatch(t)) return 'phone';
+    }
+    return 'text';
+  }
+}
+
+class PropertyRegistry {
+  PropertyRegistry._();
+  static final PropertyRegistry instance = PropertyRegistry._();
+
+  static const List<PropertyDef> defaults = [
+    PropertyDef(id: 'telefone', label: 'Telefone', type: 'phone'),
+    PropertyDef(id: 'email', label: 'E-mail', type: 'email'),
+    PropertyDef(id: 'nascimento', label: 'Nascimento', type: 'date'),
+  ];
+
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+  String _root = '';
+  bool loaded = false;
+  bool invalid = false;
+  Timer? _timer;
+  final Map<String, PropertyDef> _defs = <String, PropertyDef>{};
+  final Map<String, dynamic> _unparsed = <String, dynamic>{};
+  final Map<String, dynamic> _topExtra = <String, dynamic>{};
+
+  File? get file =>
+      _root.isEmpty ? null : File('$_root/.cc/registry/properties.yaml');
+
+  List<PropertyDef> get all => List<PropertyDef>.unmodifiable(_defs.values);
+  PropertyDef? defOf(String key) => _defs[key];
+  bool isDefined(String key) => _defs.containsKey(key);
+  String label(String key) => _defs[key]?.label ?? key;
+  String typeOf(String key) => _defs[key]?.type ?? 'text';
+
+  void _useDefaults() {
+    _defs
+      ..clear()
+      ..addEntries(defaults.map((d) => MapEntry(d.id, d)));
+    _unparsed.clear();
+    _topExtra.clear();
+  }
+
+  void _ingest(Map<String, dynamic> r) {
+    _defs.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    r.forEach((k, v) {
+      if (k != 'schema' && k != 'properties') _topExtra[k] = v;
+    });
+    final ps = r['properties'];
+    if (ps is Map) {
+      for (final e in ps.entries) {
+        final id = e.key.toString();
+        if (e.value is Map) {
+          _defs[id] = PropertyDef.fromMap(id, e.value as Map);
+        } else {
+          _unparsed[id] = e.value;
+        }
+      }
+    }
+  }
+
+  void _bump() => revision.value++;
+
+  String _serialize() {
+    final b = StringBuffer()
+      ..writeln('# Registro de propriedades do workspace (pode ser editado à mão).')
+      ..writeln('# type: text | phone | email | date | number | bool')
+      ..writeln('schema: 1');
+    _topExtra.forEach((k, v) => b.writeln('${_ccKey(k)}: ${jsonEncode(v)}'));
+    if (_defs.isEmpty && _unparsed.isEmpty) {
+      b.writeln('properties: {}');
+    } else {
+      b.writeln('properties:');
+      for (final d in _defs.values) {
+        b.writeln('  ${_ccKey(d.id)}:');
+        d.toMap().forEach((k, v) {
+          b.writeln('    ${_ccKey(k)}: ${jsonEncode(v)}');
+        });
+      }
+      _unparsed.forEach((k, v) => b.writeln('  ${_ccKey(k)}: ${jsonEncode(v)}'));
+    }
+    return b.toString();
+  }
+
+  /// Carrega o registro. Ausente: cria o padrão e, em segundo plano, registra
+  /// as chaves de `props` que já existem nos sidecars de [scanFilesDir].
+  Future<void> load(String workspaceRoot, {String scanFilesDir = ''}) async {
+    _timer?.cancel();
+    _root = workspaceRoot;
+    loaded = false;
+    invalid = false;
+    var created = false;
+    try {
+      if (!await Directory(workspaceRoot).exists()) {
+        _useDefaults();
+      } else {
+        final f = file!;
+        if (!await f.exists()) {
+          _useDefaults();
+          created = true;
+          await CcLocks.run(f.path, () async {
+            if (!await f.exists()) await _ccWriteText(f, _serialize());
+          });
+        } else {
+          final r = await CcData.readYamlOrNull(f);
+          if (r == null) {
+            invalid = true;
+            CcData.invalidFiles.add(f.path);
+            _useDefaults();
+            debugPrint('PropertyRegistry: YAML inválido em ${f.path}');
+          } else {
+            CcData.invalidFiles.remove(f.path);
+            _ingest(r);
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('PropertyRegistry.load: $e');
+      if (_defs.isEmpty) _useDefaults();
+    }
+    loaded = true;
+    _bump();
+    if (created && scanFilesDir.isNotEmpty) {
+      unawaited(_scanProps(scanFilesDir));
+    }
+  }
+
+  Future<void> reload() => _root.isEmpty ? Future<void>.value() : load(_root);
+
+  /// Autorreparo: [key] foi gravada em `props`; se o registro não a conhece,
+  /// ela entra com o tipo inferido (gravação adiada, em lote).
+  void noteUse(String key, Object? value) {
+    if (!loaded || invalid || key.isEmpty || _defs.containsKey(key)) return;
+    _defs[key] = PropertyDef(
+      id: key,
+      label: key,
+      type: PropertyDef.infer(value),
+      extra: const <String, dynamic>{'auto': true},
+    );
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 700), () {
+      unawaited(_flush());
+    });
+    _bump();
+  }
+
+  Future<void> _mergeFromDisk(File f) async {
+    if (!await f.exists()) return;
+    final r = await CcData.readYamlOrNull(f);
+    if (r == null) {
+      invalid = true;
+      CcData.invalidFiles.add(f.path);
+      throw CcInvalidYamlException(f.path);
+    }
+    final mine = Map<String, PropertyDef>.from(_defs);
+    _ingest(r);
+    // O que foi acrescentado nesta sessão e ainda não está no disco permanece.
+    mine.forEach((k, v) => _defs.putIfAbsent(k, () => v));
+  }
+
+  Future<void> _flush() async {
+    final f = file;
+    if (f == null || invalid) return;
+    try {
+      if (!await Directory(_root).exists()) return;
+      await CcLocks.run(f.path, () async {
+        await _mergeFromDisk(f);
+        await _ccWriteText(f, _serialize());
+      });
+    } catch (e) {
+      debugPrint('PropertyRegistry._flush: $e');
+    }
+  }
+
+  Future<void> upsert(PropertyDef d) async {
+    final f = file;
+    if (f == null) throw StateError('registro de propriedades não carregado');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _defs[d.id] = d;
+      await _ccWriteText(f, _serialize());
+    });
+    _bump();
+  }
+
+  Future<void> remove(String key) async {
+    final f = file;
+    if (f == null) throw StateError('registro de propriedades não carregado');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _defs.remove(key);
+      _unparsed.remove(key);
+      await _ccWriteText(f, _serialize());
+    });
+    _bump();
+  }
+
+  /// Varre os sidecars sob [filesDir] e registra as chaves de `props`.
+  Future<void> _scanProps(String filesDir) async {
+    final found = <String, Object?>{};
+    final stack = <String>[filesDir];
+    var visited = 0;
+    while (stack.isNotEmpty && visited < 30000) {
+      final dir = stack.removeLast();
+      visited++;
+      try {
+        await for (final e in Directory(dir).list(followLinks: false)) {
+          if (e is! Directory) continue;
+          final name = e.path.replaceAll('\\', '/').split('/').last;
+          if (name == '.cc') {
+            await for (final f in e.list(followLinks: false)) {
+              if (f is! File || !f.path.endsWith('.yaml')) continue;
+              final j = await CcData.readYamlOrNull(f);
+              final p = j?['props'];
+              if (p is Map) {
+                p.forEach((k, v) => found.putIfAbsent(k.toString(), () => v));
+              }
+            }
+          } else if (!name.startsWith('.')) {
+            stack.add(e.path);
+          }
+        }
+      } catch (_) {}
+      if (visited % 40 == 0) await Future<void>.delayed(Duration.zero);
+    }
+    found.forEach(noteUse);
+  }
+}
+
+// ── Views salvas — `.cc/views.yaml` ─────────────────────────────────────────
+//
+// Cada view é um item nomeado e independente, referenciando por id (de
+// propriedade, de predicado, de item), nunca por caminho. As operações
+// releem o arquivo antes de gravar: duas máquinas que editam views diferentes
+// não se sobrescrevem.
+//
+//   schema: 1
+//   views:
+//     pessoas_joinville:
+//       name: "Pessoas em Joinville"
+//       scope: "entities"
+//       filters: [{"field":"props.cidade","op":"eq","value":"Joinville"}]
+//       group_by: "props.cidade"
+//       sort: [{"field":"title","dir":"asc"}]
+//       refs: {"type":"person"}
+//       updated: "2026-11-15T12:00:00Z"
+
+class ViewDef {
+  final String id;
+  final String name;
+  final String scope; // onde a view vale: entities | files | notes | works…
+  final String description;
+  final List<Map<String, dynamic>> filters;
+  final String groupBy;
+  final List<Map<String, dynamic>> sort;
+  final Map<String, dynamic> refs;
+  final String updated;
+  final Map<String, dynamic> extra;
+
+  const ViewDef({
+    required this.id,
+    required this.name,
+    this.scope = '',
+    this.description = '',
+    this.filters = const <Map<String, dynamic>>[],
+    this.groupBy = '',
+    this.sort = const <Map<String, dynamic>>[],
+    this.refs = const <String, dynamic>{},
+    this.updated = '',
+    this.extra = const <String, dynamic>{},
+  });
+
+  static const Set<String> _known = {
+    'name', 'scope', 'description', 'filters', 'group_by', 'sort', 'refs',
+    'updated',
+  };
+
+  factory ViewDef.fromMap(String id, Map m) {
+    List<Map<String, dynamic>> maps(Object? v) => v is List
+        ? <Map<String, dynamic>>[
+            for (final x in v)
+              if (x is Map) Map<String, dynamic>.from(x),
+          ]
+        : <Map<String, dynamic>>[];
+    final name = (m['name'] ?? '').toString();
+    return ViewDef(
+      id: id,
+      name: name.isEmpty ? id : name,
+      scope: (m['scope'] ?? '').toString(),
+      description: (m['description'] ?? '').toString(),
+      filters: maps(m['filters']),
+      groupBy: (m['group_by'] ?? '').toString(),
+      sort: maps(m['sort']),
+      refs: m['refs'] is Map
+          ? Map<String, dynamic>.from(m['refs'] as Map)
+          : <String, dynamic>{},
+      updated: (m['updated'] ?? '').toString(),
+      extra: <String, dynamic>{
+        for (final e in m.entries)
+          if (!_known.contains(e.key.toString())) e.key.toString(): e.value,
+      },
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    final m = <String, dynamic>{'name': name};
+    if (scope.isNotEmpty) m['scope'] = scope;
+    if (description.isNotEmpty) m['description'] = description;
+    if (filters.isNotEmpty) m['filters'] = filters;
+    if (groupBy.isNotEmpty) m['group_by'] = groupBy;
+    if (sort.isNotEmpty) m['sort'] = sort;
+    if (refs.isNotEmpty) m['refs'] = refs;
+    if (updated.isNotEmpty) m['updated'] = updated;
+    m.addAll(extra);
+    return m;
+  }
+
+  ViewDef touched() => ViewDef(
+        id: id,
+        name: name,
+        scope: scope,
+        description: description,
+        filters: filters,
+        groupBy: groupBy,
+        sort: sort,
+        refs: refs,
+        updated: DateTime.now().toUtc().toIso8601String(),
+        extra: extra,
+      );
+}
+
+class ViewsStore {
+  ViewsStore._();
+  static final ViewsStore instance = ViewsStore._();
+
+  static final RegExp idPattern = RegExp(r'^[a-z][a-z0-9_]*$');
+
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+  String _root = '';
+  bool loaded = false;
+  bool invalid = false;
+  final Map<String, ViewDef> _views = <String, ViewDef>{};
+  final Map<String, dynamic> _unparsed = <String, dynamic>{};
+  final Map<String, dynamic> _topExtra = <String, dynamic>{};
+
+  File? get file => _root.isEmpty ? null : File('$_root/.cc/views.yaml');
+
+  List<ViewDef> get all => List<ViewDef>.unmodifiable(_views.values);
+  ViewDef? get(String id) => _views[id];
+
+  /// Id livre derivado do nome ("Pessoas em Joinville" → pessoas_em_joinville).
+  String freshId(String name) {
+    var base = name
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'^_+|_+$'), '');
+    if (base.isEmpty || !RegExp(r'^[a-z]').hasMatch(base)) base = 'view_$base';
+    var id = base;
+    var n = 2;
+    while (_views.containsKey(id)) {
+      id = '${base}_${n++}';
+    }
+    return id;
+  }
+
+  void _ingest(Map<String, dynamic> r) {
+    _views.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    r.forEach((k, v) {
+      if (k != 'schema' && k != 'views') _topExtra[k] = v;
+    });
+    final vs = r['views'];
+    if (vs is Map) {
+      for (final e in vs.entries) {
+        final id = e.key.toString();
+        if (e.value is Map) {
+          _views[id] = ViewDef.fromMap(id, e.value as Map);
+        } else {
+          _unparsed[id] = e.value;
+        }
+      }
+    }
+  }
+
+  void _bump() => revision.value++;
+
+  String _serialize() {
+    final b = StringBuffer()
+      ..writeln('# Views salvas do workspace (cada uma é independente).')
+      ..writeln('schema: 1');
+    _topExtra.forEach((k, v) => b.writeln('${_ccKey(k)}: ${jsonEncode(v)}'));
+    if (_views.isEmpty && _unparsed.isEmpty) {
+      b.writeln('views: {}');
+    } else {
+      b.writeln('views:');
+      for (final v in _views.values) {
+        b.writeln('  ${_ccKey(v.id)}:');
+        v.toMap().forEach((k, x) {
+          b.writeln('    ${_ccKey(k)}: ${jsonEncode(x)}');
+        });
+      }
+      _unparsed.forEach((k, v) => b.writeln('  ${_ccKey(k)}: ${jsonEncode(v)}'));
+    }
+    return b.toString();
+  }
+
+  /// Carrega as views. Não cria o arquivo: ele nasce na primeira view salva.
+  Future<void> load(String workspaceRoot) async {
+    _root = workspaceRoot;
+    loaded = false;
+    invalid = false;
+    _views.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    try {
+      final f = file!;
+      if (await Directory(workspaceRoot).exists() && await f.exists()) {
+        final r = await CcData.readYamlOrNull(f);
+        if (r == null) {
+          invalid = true;
+          CcData.invalidFiles.add(f.path);
+          debugPrint('ViewsStore: YAML inválido em ${f.path}');
+        } else {
+          CcData.invalidFiles.remove(f.path);
+          _ingest(r);
+        }
+      }
+    } catch (e) {
+      debugPrint('ViewsStore.load: $e');
+    }
+    loaded = true;
+    _bump();
+  }
+
+  Future<void> reload() => _root.isEmpty ? Future<void>.value() : load(_root);
+
+  Future<void> _mergeFromDisk(File f) async {
+    if (!await f.exists()) return;
+    final r = await CcData.readYamlOrNull(f);
+    if (r == null) {
+      invalid = true;
+      CcData.invalidFiles.add(f.path);
+      throw CcInvalidYamlException(f.path);
+    }
+    invalid = false;
+    _ingest(r);
+  }
+
+  /// Salva (ou atualiza) uma view; `updated` é carimbado agora.
+  Future<void> upsert(ViewDef v) async {
+    if (!idPattern.hasMatch(v.id)) {
+      throw ArgumentError('id de view inválido: "${v.id}"');
+    }
+    final f = file;
+    if (f == null) throw StateError('views não carregadas');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _views[v.id] = v.touched();
+      await _ccWriteText(f, _serialize());
+    });
+    _bump();
+  }
+
+  Future<void> remove(String id) async {
+    final f = file;
+    if (f == null) throw StateError('views não carregadas');
+    await CcLocks.run(f.path, () async {
+      await _mergeFromDisk(f);
+      _views.remove(id);
+      _unparsed.remove(id);
+      await _ccWriteText(f, _serialize());
+    });
+    _bump();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 6 — workspaces anexados (federação): `.cc/attached.yaml`
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Cada workspace é completo e funciona sozinho; "Island" é só uma relação:
+// anexar outro workspace torna-o Island em relação a este. A lista mora no
+// `.cc/` do workspace que anexa e guarda, por anexo, o `workspace_id`, o último
+// caminho conhecido, um apelido e o modo (rw é o padrão, ro = só leitura):
+//
+//   schema: 1
+//   attached:
+//     - {"workspace_id":"19a5c4b3","name":"HD Externo","alias":"HD",
+//        "path":"E:/workspace","mode":"rw"}
+//
+// O caminho é uma dica: cada máquina guarda o seu no cache local (LocalState)
+// e ele vence ao abrir. Estado de montagem: online se o caminho existe E o
+// `workspace_id` do `.cc/workspace.yaml` de lá confere; offline caso contrário.
+// Nada aqui cria, grava ou apaga algo dentro de um workspace anexado, e um
+// caminho ausente (HD desconectado) nunca é criado.
+
+/// `.cc/workspace.yaml` de um workspace (leitura tolerante: um id só de dígitos
+/// ou parecido com `1e5` seria lido pelo YAML como número).
+class WorkspaceManifest {
+  final String id;
+  final String name;
+  const WorkspaceManifest(this.id, this.name);
+
+  static WorkspaceManifest? parse(String text) {
+    String? find(String key) {
+      final m = RegExp('^$key:[ \t]*(.*?)[ \t]*\$', multiLine: true)
+          .firstMatch(text);
+      if (m == null) return null;
+      var v = m.group(1)!.trim();
+      if (v.startsWith('"')) {
+        try {
+          return jsonDecode(v) as String;
+        } catch (_) {}
+      }
+      if (v.length >= 2 && v.startsWith("'") && v.endsWith("'")) {
+        v = v.substring(1, v.length - 1);
+      }
+      return v;
+    }
+
+    final id = find('workspace_id');
+    if (id == null || id.isEmpty) return null;
+    return WorkspaceManifest(id, find('name') ?? '');
+  }
+
+  /// Lê o manifesto de [root] sem criar nada. `null` se não há ou não lê.
+  static Future<WorkspaceManifest?> read(String root) async {
+    try {
+      final f = File('$root/.cc/workspace.yaml');
+      if (!await f.exists().timeout(const Duration(seconds: 4))) return null;
+      final text = await f.readAsString().timeout(const Duration(seconds: 4));
+      return parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Um workspace anexado.
+class AttachedWorkspace {
+  final String workspaceId;
+  final String name; // nome do workspace na última leitura (informativo)
+  final String alias;
+  final String path; // último caminho conhecido, '/' como separador
+  final String mode; // rw | ro
+  final Map<String, dynamic> extra; // chaves desconhecidas, preservadas
+
+  const AttachedWorkspace({
+    required this.workspaceId,
+    this.name = '',
+    this.alias = '',
+    this.path = '',
+    this.mode = 'rw',
+    this.extra = const <String, dynamic>{},
+  });
+
+  static const Set<String> _known = {
+    'workspace_id', 'name', 'alias', 'path', 'mode',
+  };
+
+  String get label => alias.isNotEmpty
+      ? alias
+      : (name.isNotEmpty ? name : workspaceId);
+  bool get writable => mode != 'ro';
+
+  AttachedWorkspace copyWith({
+    String? name,
+    String? alias,
+    String? path,
+    String? mode,
+  }) =>
+      AttachedWorkspace(
+        workspaceId: workspaceId,
+        name: name ?? this.name,
+        alias: alias ?? this.alias,
+        path: path ?? this.path,
+        mode: mode ?? this.mode,
+        extra: extra,
+      );
+
+  static AttachedWorkspace? fromMap(Object? v) {
+    if (v is! Map) return null;
+    final id = (v['workspace_id'] ?? '').toString().trim();
+    if (id.isEmpty) return null;
+    final mode = (v['mode'] ?? 'rw').toString();
+    return AttachedWorkspace(
+      workspaceId: id,
+      name: (v['name'] ?? '').toString(),
+      alias: (v['alias'] ?? '').toString(),
+      path: AttachedWorkspaces.normPath((v['path'] ?? '').toString()),
+      mode: mode == 'ro' ? 'ro' : 'rw',
+      extra: <String, dynamic>{
+        for (final e in v.entries)
+          if (!_known.contains(e.key.toString())) e.key.toString(): e.value,
+      },
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    final m = <String, dynamic>{'workspace_id': workspaceId};
+    if (name.isNotEmpty) m['name'] = name;
+    if (alias.isNotEmpty) m['alias'] = alias;
+    m['path'] = path;
+    m['mode'] = mode;
+    m.addAll(extra);
+    return m;
+  }
+}
+
+/// Resultado de uma sondagem de montagem.
+class MountInfo {
+  final bool online;
+
+  /// Vazio se online. Senão: `path_empty`, `path_missing` (HD desconectado),
+  /// `not_a_workspace` (a pasta existe mas não tem `.cc/workspace.yaml`),
+  /// `id_mismatch` (outro workspace está nesse caminho) ou `unchecked`.
+  final String reason;
+  final String name; // nome lido do manifesto, se houve leitura
+  final String foundId; // id lido do manifesto, se houve leitura
+  const MountInfo(this.online, this.reason, {this.name = '', this.foundId = ''});
+  static const MountInfo unchecked = MountInfo(false, 'unchecked');
+}
+
+/// Resultado de anexar / religar.
+class AttachResult {
+  final bool ok;
+
+  /// `path_missing`, `not_a_workspace`, `self`, `nested`, `id_mismatch`,
+  /// `no_root`, `invalid_yaml`, `unknown_workspace`.
+  final String code;
+  final AttachedWorkspace? item;
+  const AttachResult(this.ok, this.code, [this.item]);
+}
+
+class AttachedWorkspaces {
+  AttachedWorkspaces._();
+  static final AttachedWorkspaces instance = AttachedWorkspaces._();
+
+  /// Muda quando a lista ou o estado de montagem de algum anexo muda.
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  String _root = ''; // raiz do workspace que anexa
+  String _wsId = ''; // id do workspace que anexa
+  bool loaded = false;
+
+  /// O arquivo existe mas não parseia: nada é gravado por cima.
+  bool invalid = false;
+
+  final List<AttachedWorkspace> _items = <AttachedWorkspace>[];
+  final List<dynamic> _unparsed = <dynamic>[];
+  final Map<String, dynamic> _topExtra = <String, dynamic>{};
+  final Map<String, MountInfo> _mounts = <String, MountInfo>{};
+  Map<String, String> _localPaths = <String, String>{};
+  String _localWritten = '';
+  Timer? _watch;
+  bool _probing = false;
+
+  File? get file => _root.isEmpty ? null : File('$_root/.cc/attached.yaml');
+
+  List<AttachedWorkspace> get all =>
+      List<AttachedWorkspace>.unmodifiable(_items);
+  AttachedWorkspace? byId(String id) {
+    for (final a in _items) {
+      if (a.workspaceId == id) return a;
+    }
+    return null;
+  }
+
+  MountInfo mountOf(String id) => _mounts[id] ?? MountInfo.unchecked;
+  bool isOnline(String id) => mountOf(id).online;
+
+  /// Online E modo leitura-e-escrita.
+  bool canWrite(String id) => isOnline(id) && (byId(id)?.writable ?? false);
+
+  /// Raiz do anexo, só se estiver online (senão `null`: nunca um caminho morto).
+  String? rootIfOnline(String id) => isOnline(id) ? byId(id)?.path : null;
+
+  static String normPath(String p) {
+    var s = p.trim().replaceAll('\\', '/');
+    while (s.length > 1 && s.endsWith('/')) {
+      s = s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
+  static Future<bool> _exists(String path) async {
+    if (path.isEmpty) return false;
+    try {
+      return await Directory(path).exists().timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => false,
+          );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Sonda um caminho: online só se existe e o `workspace_id` de lá é
+  /// [expectedId]. Só lê; nunca cria nada.
+  static Future<MountInfo> probe(String path, String expectedId) async {
+    if (path.isEmpty) return const MountInfo(false, 'path_empty');
+    if (!await _exists(path)) return const MountInfo(false, 'path_missing');
+    final mf = await WorkspaceManifest.read(path);
+    if (mf == null) return const MountInfo(false, 'not_a_workspace');
+    if (mf.id != expectedId) {
+      return MountInfo(false, 'id_mismatch', name: mf.name, foundId: mf.id);
+    }
+    return MountInfo(true, '', name: mf.name, foundId: mf.id);
+  }
+
+  // ── Carga ───────────────────────────────────────────────────────────────────
+  void _ingest(Map<String, dynamic> r) {
+    _items.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    r.forEach((k, v) {
+      if (k != 'schema' && k != 'attached') _topExtra[k] = v;
+    });
+    final list = r['attached'];
+    if (list is List) {
+      final seen = <String>{};
+      for (final x in list) {
+        final a = AttachedWorkspace.fromMap(x);
+        if (a == null) {
+          _unparsed.add(x); // preservado ao regravar
+        } else if (seen.add(a.workspaceId)) {
+          _items.add(a);
+        }
+      }
+    }
+  }
+
+  /// O caminho desta máquina (cache local) vence o do arquivo, se existir aqui.
+  Future<void> _applyLocalPaths() async {
+    for (var i = 0; i < _items.length; i++) {
+      final ov = _localPaths[_items[i].workspaceId];
+      if (ov != null && ov.isNotEmpty && await _exists(ov)) {
+        _items[i] = _items[i].copyWith(path: normPath(ov));
+      }
+    }
+  }
+
+  void _bump() => revision.value++;
+
+  /// Carrega a lista do workspace [workspaceRoot] e sonda cada anexo. Não cria
+  /// o arquivo: ele nasce no primeiro anexo.
+  Future<void> load(String workspaceRoot, String workspaceId) async {
+    _watch?.cancel();
+    _watch = null;
+    _root = workspaceRoot;
+    _wsId = workspaceId;
+    loaded = false;
+    invalid = false;
+    _items.clear();
+    _unparsed.clear();
+    _topExtra.clear();
+    _mounts.clear();
+    _localWritten = '';
+    try {
+      final raw = (await LocalState.read(workspaceId))['attached'];
+      final paths = raw is Map ? raw['paths'] : null;
+      _localPaths = paths is Map
+          ? <String, String>{
+              for (final e in paths.entries) e.key.toString(): e.value.toString(),
+            }
+          : <String, String>{};
+      final f = file!;
+      if (await _exists(workspaceRoot) && await f.exists()) {
+        final r = await CcData.readYamlOrNull(f);
+        if (r == null) {
+          invalid = true;
+          CcData.invalidFiles.add(f.path);
+          debugPrint('AttachedWorkspaces: YAML inválido em ${f.path}');
+        } else {
+          CcData.invalidFiles.remove(f.path);
+          _ingest(r);
+        }
+      }
+      await _applyLocalPaths();
+    } catch (e) {
+      debugPrint('AttachedWorkspaces.load: $e');
+    }
+    loaded = true;
+    await refreshMounts(force: true);
+    if (_items.isNotEmpty) {
+      _watch = Timer.periodic(const Duration(seconds: 20), (_) {
+        unawaited(refreshMounts());
+      });
+    }
+    debugPrint(describe());
+  }
+
+  Future<void> reload() =>
+      _root.isEmpty ? Future<void>.value() : load(_root, _wsId);
+
+  // ── Estado de montagem ──────────────────────────────────────────────────────
+
+  /// Sonda todos os anexos. Quando um está online e o nome no manifesto mudou,
+  /// o `name` informativo do `attached.yaml` é atualizado (só isso).
+  Future<void> refreshMounts({bool force = false}) async {
+    if (_probing) return;
+    _probing = true;
+    try {
+      var changed = force;
+      final renames = <String, String>{};
+      for (final a in List<AttachedWorkspace>.of(_items)) {
+        final info = await probe(a.path, a.workspaceId);
+        final prev = _mounts[a.workspaceId];
+        if (prev == null ||
+            prev.online != info.online ||
+            prev.reason != info.reason) {
+          changed = true;
+          if (prev != null) {
+            debugPrint(
+              'AttachedWorkspaces: ${a.label} -> '
+              '${info.online ? 'online' : 'offline (${info.reason})'}',
+            );
+          }
+        }
+        _mounts[a.workspaceId] = info;
+        if (info.online && info.name.isNotEmpty && info.name != a.name) {
+          renames[a.workspaceId] = info.name;
+        }
+      }
+      if (renames.isNotEmpty && !invalid) {
+        try {
+          await _persist(() {
+            for (var i = 0; i < _items.length; i++) {
+              final n = renames[_items[i].workspaceId];
+              if (n != null) _items[i] = _items[i].copyWith(name: n);
+            }
+          });
+        } catch (e) {
+          debugPrint('AttachedWorkspaces: nome não atualizado ($e)');
+        }
+      }
+      if (changed) _bump();
+    } finally {
+      _probing = false;
+    }
+  }
+
+  /// Uma linha por anexo (para log e diagnóstico).
+  String describe() {
+    if (_items.isEmpty) return 'AttachedWorkspaces: nenhum anexo';
+    final b = StringBuffer('AttachedWorkspaces: ${_items.length} anexo(s)');
+    for (final a in _items) {
+      final m = mountOf(a.workspaceId);
+      b.write(
+        '\n  - ${a.label} [${a.mode}] '
+        '${m.online ? 'online' : 'offline (${m.reason})'} ${a.path}',
+      );
+    }
+    return b.toString();
+  }
+
+  // ── Gravação (sempre no `.cc/` do workspace que anexa) ──────────────────────
+  String _serialize() {
+    final b = StringBuffer()
+      ..writeln('# Workspaces anexados a este (pode ser editado à mão).')
+      ..writeln('# path é a última dica conhecida; mode: rw | ro.')
+      ..writeln('schema: 1');
+    _topExtra.forEach((k, v) => b.writeln('${_ccKey(k)}: ${jsonEncode(v)}'));
+    if (_items.isEmpty && _unparsed.isEmpty) {
+      b.writeln('attached: []');
+    } else {
+      b.writeln('attached:');
+      for (final a in _items) {
+        b.writeln('  - ${jsonEncode(a.toMap())}');
+      }
+      for (final u in _unparsed) {
+        b.writeln('  - ${jsonEncode(u)}');
+      }
+    }
+    return b.toString();
+  }
+
+  /// Relê o arquivo (edições de outra máquina), aplica [edit] e grava. Não
+  /// grava se a pasta do workspace que anexa não existe, nem sobre YAML inválido.
+  Future<void> _persist(void Function() edit) async {
+    final f = file;
+    if (f == null) throw StateError('anexos não carregados');
+    if (!await _exists(_root)) return;
+    await CcLocks.run(f.path, () async {
+      if (await f.exists()) {
+        final r = await CcData.readYamlOrNull(f);
+        if (r == null) {
+          invalid = true;
+          CcData.invalidFiles.add(f.path);
+          throw CcInvalidYamlException(f.path);
+        }
+        invalid = false;
+        // O que está só na memória (ainda não gravado) não é perdido: os itens
+        // do disco entram e os daqui prevalecem pelo id.
+        final mine = <String, AttachedWorkspace>{
+          for (final a in _items) a.workspaceId: a,
+        };
+        _ingest(r);
+        for (var i = 0; i < _items.length; i++) {
+          final m = mine[_items[i].workspaceId];
+          if (m != null) _items[i] = m;
+        }
+      }
+      edit();
+      await _ccWriteText(f, _serialize());
+    });
+    await _saveLocalPaths();
+    _bump();
+  }
+
+  Future<void> _saveLocalPaths() async {
+    if (_wsId.isEmpty) return;
+    final paths = <String, String>{
+      for (final a in _items) a.workspaceId: a.path,
+    };
+    final j = jsonEncode(paths);
+    if (j == _localWritten) return;
+    _localWritten = j;
+    _localPaths = paths;
+    await LocalState.update(
+      _wsId,
+      (m) => m['attached'] = <String, dynamic>{'paths': paths},
+    );
+  }
+
+  // ── Operações ───────────────────────────────────────────────────────────────
+
+  static bool _nested(String a, String b) {
+    final x = a.toLowerCase();
+    final y = b.toLowerCase();
+    return x.startsWith('$y/') || y.startsWith('$x/');
+  }
+
+  /// Valida [path] como workspace anexável: existe, tem manifesto, não é este
+  /// workspace nem está dentro (ou contém) a pasta dele.
+  Future<AttachResult> _validate(String path) async {
+    if (_root.isEmpty || !await _exists(_root)) {
+      return const AttachResult(false, 'no_root');
+    }
+    final norm = normPath(path);
+    if (norm.isEmpty || !await _exists(norm)) {
+      return const AttachResult(false, 'path_missing');
+    }
+    final me = normPath(_root);
+    if (norm.toLowerCase() == me.toLowerCase()) {
+      return const AttachResult(false, 'self');
+    }
+    if (_nested(norm, me)) return const AttachResult(false, 'nested');
+    final mf = await WorkspaceManifest.read(norm);
+    if (mf == null) return const AttachResult(false, 'not_a_workspace');
+    if (mf.id == _wsId) return const AttachResult(false, 'self');
+    return AttachResult(
+      true,
+      'ok',
+      AttachedWorkspace(workspaceId: mf.id, name: mf.name, path: norm),
+    );
+  }
+
+  /// Anexa o workspace em [path]. Se ele já estava anexado, só atualiza o
+  /// caminho (apelido e modo são mantidos). Não altera nada no anexo.
+  Future<AttachResult> attach(
+    String path, {
+    String alias = '',
+    String mode = 'rw',
+  }) async {
+    final v = await _validate(path);
+    if (!v.ok) return v;
+    final found = v.item!;
+    AttachedWorkspace? result;
+    try {
+      await _persist(() {
+        final i = _items.indexWhere((a) => a.workspaceId == found.workspaceId);
+        if (i >= 0) {
+          result = _items[i].copyWith(name: found.name, path: found.path);
+          _items[i] = result!;
+        } else {
+          result = found.copyWith(alias: alias, mode: mode == 'ro' ? 'ro' : 'rw');
+          _items.add(result!);
+        }
+      });
+    } on CcInvalidYamlException {
+      return const AttachResult(false, 'invalid_yaml');
+    }
+    // A pasta do workspace que anexa não existe: nada foi gravado.
+    if (result == null) return const AttachResult(false, 'no_root');
+    await refreshMounts(force: true);
+    _ensureWatching();
+    return AttachResult(true, 'ok', result);
+  }
+
+  /// Aponta um anexo existente para outro caminho (o HD veio com outra letra,
+  /// a pasta foi movida). O manifesto de lá precisa ter o mesmo `workspace_id`.
+  Future<AttachResult> relocate(String workspaceId, String newPath) async {
+    if (byId(workspaceId) == null) {
+      return const AttachResult(false, 'unknown_workspace');
+    }
+    final v = await _validate(newPath);
+    if (!v.ok) return v;
+    if (v.item!.workspaceId != workspaceId) {
+      return const AttachResult(false, 'id_mismatch');
+    }
+    AttachedWorkspace? result;
+    try {
+      await _persist(() {
+        final i = _items.indexWhere((a) => a.workspaceId == workspaceId);
+        if (i < 0) return;
+        result = _items[i].copyWith(name: v.item!.name, path: v.item!.path);
+        _items[i] = result!;
+      });
+    } on CcInvalidYamlException {
+      return const AttachResult(false, 'invalid_yaml');
+    }
+    if (result == null) return const AttachResult(false, 'unknown_workspace');
+    await refreshMounts(force: true);
+    return AttachResult(true, 'ok', result);
+  }
+
+  Future<void> detach(String workspaceId) async {
+    await _persist(() {
+      _items.removeWhere((a) => a.workspaceId == workspaceId);
+    });
+    _mounts.remove(workspaceId);
+    _bump();
+  }
+
+  Future<void> update(String workspaceId, {String? alias, String? mode}) async {
+    await _persist(() {
+      final i = _items.indexWhere((a) => a.workspaceId == workspaceId);
+      if (i < 0) return;
+      _items[i] = _items[i].copyWith(
+        alias: alias,
+        mode: mode == null ? null : (mode == 'ro' ? 'ro' : 'rw'),
+      );
+    });
+  }
+
+  void _ensureWatching() {
+    if (_watch != null || _items.isEmpty) return;
+    _watch = Timer.periodic(const Duration(seconds: 20), (_) {
+      unawaited(refreshMounts());
+    });
+  }
+}
+
+/// Impressão digital barata de um arquivo: tamanho + hash do começo e do fim.
+class _FileFp {
+  final int size;
+  final String hash;
+  const _FileFp(this.size, this.hash);
+}
+
+/// Sidecar `.cc/` cujo alvo não está mais na pasta (movido/renomeado fora do
+/// app). Liga por id (notas .md) ou por tamanho + hash (outros arquivos).
+class _Orphan {
+  final File yaml;
+  final String dirAbs;
+  final String? id; // nota .md ligada por id
+  final String? name; // arquivo comum ligado por nome
+  final int? size;
+  final String? hash;
+  const _Orphan(
+    this.yaml,
+    this.dirAbs, {
+    this.id,
+    this.name,
+    this.size,
+    this.hash,
+  });
+}
+
+class FsItem {
+  final String rel; // caminho relativo à Location, '/' como separador
+  final String name;
+  final bool isDir;
+  final int size;
+  final int modifiedMs;
+  const FsItem({
+    required this.rel,
+    required this.name,
+    required this.isDir,
+    required this.size,
+    required this.modifiedMs,
+  });
+  String get ext => isDir ? '' : _extOf(name);
+  String get parent => _parentRel(rel);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Store — biblioteca de tags + sidecars `.cc/` (tags de cada item)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FilesMetaStore extends ChangeNotifier {
+  FilesMetaStore({
+    required this.metaPath,
+    required String builtinPath,
+    this.workspaceRoot = '',
+    this.workspaceId = '',
+  }) : builtinPath = _normPath(builtinPath);
+
+  static const String builtinId = 'workspace';
+  static const String defaultGroupId = 'g_default';
+
+  /// Pasta de sidecars: `.cc/`, ao lado dos itens que descreve.
+  static const String sidecarDirName = '.cc';
+
+  /// Metadata da PRÓPRIA pasta fica em `<pasta>/.cc/__folder__.yaml`.
+  static const String folderSidecarName = '__folder__.yaml';
+
+  /// Formato antigo (compatível com o TagSpaces): `.ts/<nome>.json` e
+  /// `.ts/tsm.json`. Só é lido para migrar; depois a pasta vira `.ts.migrated`.
+  static const String legacyDirName = '.ts';
+  static const String legacyFolderSidecarName = 'tsm.json';
+  static const String legacyBackupDirName = '.ts.migrated';
+
+  /// Chaves de um sidecar que o app gerencia aqui. Qualquer outra chave
+  /// (props, relações, ...) é preservada e mantém o arquivo vivo.
+  static const Set<String> _cosmeticKeys = {
+    'title', 'kind', 'bind', 'id', 'size', 'hash', 'mtime',
+    'app', 'updated', 'tags', 'description', 'color',
+  };
+
+  /// Biblioteca de tags e Locations ficam no `.cc/` do workspace
+  /// (`registry/tags.yaml`, `locations.yaml`). As tags de cada arquivo/pasta
+  /// ficam nos sidecars `.cc/` dentro das próprias pastas. [metaPath] é o
+  /// `files_meta.json` antigo: só é lido para migrar.
+  final String metaPath;
+  final String builtinPath;
+  final String workspaceRoot;
+  final String workspaceId;
+
+  File? get _tagsFile => workspaceRoot.isEmpty
+      ? null
+      : File('$workspaceRoot/.cc/registry/tags.yaml');
+  File? get _locsFile =>
+      workspaceRoot.isEmpty ? null : File('$workspaceRoot/.cc/locations.yaml');
+
+  bool _registryInvalid = false; // um dos YAMLs não parseia: não grava por cima
+  bool _legacyToRetire = false; // files_meta.json lido; aposentar após gravar
+  String _lastTagsYaml = '';
+  String _lastLocsYaml = '';
+  String _localFilesWritten = '';
+  Map<String, dynamic> _localFiles = <String, dynamic>{};
+
+  final List<FilesLocation> locations = [];
+  final List<FileTagGroup> groups = [];
+  final List<FileTagDef> tags = [];
+
+  /// Cache em memória: locationId -> caminho relativo -> metadata. A fonte da
+  /// verdade são os sidecars no disco; o cache é preenchido por pasta (ao
+  /// listar) e por indexação da Location inteira.
+  final Map<String, Map<String, FileMeta>> entries = {};
+
+  final Set<String> _indexed = {}; // locations já indexadas por inteiro
+  final Set<String> _indexingIds = {};
+  final Set<String> _loadedDirs = {}; // 'loc\u0001dirRel'
+  final Map<String, Set<String>> _childKeys = {}; // 'loc\u0001dirRel' -> rels
+  final Map<String, Map<String, FileMeta>> _legacy = {}; // files_meta.json v1
+
+  bool loaded = false;
+  bool indexing = false;
+  bool _dirty = false; // arquivo do workspace (locations + biblioteca)
+  final Set<String> _dirtyItems = {}; // 'loc\u0001rel' com sidecar a gravar
+  bool _disposed = false;
+  Timer? _timer;
+  int _batchDepth = 0;
+  bool _pending = false;
+  Future<void> _saving = Future<void>.value();
+  Future<void>? _propagation;
+
+  static const String _sep = '\u0001';
+  String _key(String loc, String rel) => '$loc$_sep$rel';
+
+  FilesLocation? _loc(String id) {
+    for (final l in locations) {
+      if (l.id == id) return l;
+    }
+    return null;
+  }
+
+  // ── Persistência do workspace (locations + biblioteca de tags) ────────────
+
+  Future<void> load() async {
+    final tf = _tagsFile;
+    final lf = _locsFile;
+    var fromYaml = false;
+    try {
+      if (tf != null && lf != null && (await tf.exists() || await lf.exists())) {
+        fromYaml = true;
+        final raw = (await LocalState.read(workspaceId))['files'];
+        _localFiles = raw is Map ? Map<String, dynamic>.from(raw) : {};
+        await _loadFromYaml(tf, lf);
+      }
+    } catch (e) {
+      debugPrint('FilesMetaStore.load(yaml): $e');
+    }
+    if (!fromYaml) {
+      // Formato antigo: metadata/files_meta.json. Lido uma vez; a primeira
+      // gravação cria os YAMLs no `.cc/` e o arquivo antigo vira `.migrated`.
+      final f = File(metaPath);
+      try {
+        if (await f.exists()) {
+          final raw = await f.readAsString();
+          try {
+            final j = jsonDecode(raw);
+            if (j is Map<String, dynamic>) {
+              _fromJson(j);
+              if (workspaceRoot.isNotEmpty &&
+                  await Directory(workspaceRoot).exists()) {
+                _dirty = true;
+                _legacyToRetire = true;
+              }
+            }
+          } catch (e) {
+            // JSON corrompido: guarda uma cópia antes de qualquer regravação,
+            // para nunca perder a biblioteca de tags silenciosamente.
+            debugPrint('FilesMetaStore: corrupt meta, backing up ($e)');
+            try {
+              await f.copy(
+                  '$metaPath.corrupt-${DateTime.now().millisecondsSinceEpoch}');
+            } catch (_) {}
+          }
+        }
+      } catch (e) {
+        debugPrint('FilesMetaStore.load: $e');
+      }
+    }
+    if (!groups.any((g) => g.id == defaultGroupId)) {
+      groups.insert(0, FileTagGroup(id: defaultGroupId, name: 'Tags'));
+    }
+    final i = locations.indexWhere((l) => l.id == builtinId);
+    if (i < 0) {
+      locations.insert(
+        0,
+        FilesLocation(
+          id: builtinId,
+          name: 'Workspace files',
+          path: builtinPath,
+          builtin: true,
+        ),
+      );
+    } else {
+      locations[i].path = builtinPath; // o workspace pode ter sido movido
+    }
+    loaded = true;
+    await _migrateLegacy();
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Lê `registry/tags.yaml` e `locations.yaml`. Um arquivo que não parseia
+  /// nunca é sobrescrito: o app segue com o que tem em memória.
+  Future<void> _loadFromYaml(File tf, File lf) async {
+    final expandedRaw = _localFiles['groupExpanded'];
+    final expanded = expandedRaw is Map ? expandedRaw : const {};
+    final pathsRaw = _localFiles['locationPaths'];
+    final paths = pathsRaw is Map ? pathsRaw : const {};
+
+    if (await tf.exists()) {
+      final m = await _readYaml(tf);
+      if (m == null) {
+        _registryInvalid = true;
+        CcData.invalidFiles.add(tf.path);
+        debugPrint('FilesMetaStore: YAML inválido em ${tf.path}');
+      } else {
+        final g = m['groups'];
+        if (g is Map) {
+          for (final e in g.entries) {
+            final id = e.key.toString();
+            final v = e.value;
+            final name = (v is Map ? v['name'] : v)?.toString() ?? id;
+            groups.add(FileTagGroup(
+              id: id,
+              name: name,
+              expanded: expanded[id] != false,
+            ));
+          }
+        }
+        final t = m['tags'];
+        if (t is List) {
+          for (final x in t) {
+            if (x is! Map) continue;
+            final name = (x['name'] ?? '').toString().trim();
+            if (name.isEmpty || tagByName(name) != null) continue;
+            var id = (x['id'] ?? '').toString();
+            if (id.isEmpty || tags.any((y) => y.id == id)) {
+              id = _newId('t'); // tag acrescentada à mão: ganha id e é regravada
+              _dirty = true;
+            }
+            tags.add(FileTagDef(
+              id: id,
+              name: name,
+              color: _parseColor(x['color']) ??
+                  _FC.tagPalette[tags.length % _FC.tagPalette.length],
+              groupId: (x['group'] ?? defaultGroupId).toString(),
+            ));
+          }
+        }
+        if (!_dirty) _lastTagsYaml = _tagsYaml();
+      }
+    }
+
+    if (await lf.exists()) {
+      final m = await _readYaml(lf);
+      if (m == null) {
+        _registryInvalid = true;
+        CcData.invalidFiles.add(lf.path);
+        debugPrint('FilesMetaStore: YAML inválido em ${lf.path}');
+      } else {
+        final l = m['locations'];
+        if (l is List) {
+          for (final x in l) {
+            if (x is! Map) continue;
+            final id = (x['id'] ?? '').toString();
+            if (id.isEmpty) continue;
+            var path = _normPath((x['path'] ?? '').toString());
+            // O caminho é desta máquina: o do cache local vence o do arquivo,
+            // que é só a última dica conhecida.
+            final ov = paths[id];
+            if (ov is String &&
+                ov.isNotEmpty &&
+                Directory(ov).existsSync()) {
+              path = _normPath(ov);
+            }
+            locations.add(FilesLocation(
+              id: id,
+              name: (x['name'] ?? '').toString(),
+              path: path,
+              builtin: x['builtin'] == true,
+            ));
+          }
+        }
+        if (!_dirty) _lastLocsYaml = _locationsYaml();
+      }
+    }
+  }
+
+  void _fromJson(Map<String, dynamic> j) {
+    for (final l in (j['locations'] as List? ?? const [])) {
+      locations.add(FilesLocation.fromJson(Map<String, dynamic>.from(l as Map)));
+    }
+    for (final g in (j['groups'] as List? ?? const [])) {
+      groups.add(FileTagGroup.fromJson(Map<String, dynamic>.from(g as Map)));
+    }
+    for (final t in (j['tags'] as List? ?? const [])) {
+      tags.add(FileTagDef.fromJson(Map<String, dynamic>.from(t as Map)));
+    }
+    // Versão antiga (v1) guardava as tags de cada arquivo aqui. Lê só para
+    // migrar para os sidecars `.ts/`; nunca mais é gravado neste arquivo.
+    final ent = j['entries'];
+    if (ent is Map) {
+      ent.forEach((locId, bucket) {
+        if (bucket is! Map) return;
+        final m = <String, FileMeta>{};
+        bucket.forEach((rel, meta) {
+          if (meta is! Map) return;
+          m[rel.toString()] = FileMeta(
+            tags: (meta['tags'] as List?)?.map((e) => e.toString()).toList(),
+            description: (meta['desc'] ?? '').toString(),
+            color: meta['color'] is int ? meta['color'] as int : null,
+          );
+        });
+        if (m.isNotEmpty) _legacy[locId.toString()] = m;
+      });
+    }
+  }
+
+  String _tagsYaml() {
+    final b = StringBuffer()
+      ..writeln('# Biblioteca de tags do workspace (pode ser editada à mão).')
+      ..writeln('# Nos arquivos, as tags vão pelo título; aqui ficam cor e grupo.')
+      ..writeln('schema: 1');
+    if (groups.isEmpty) {
+      b.writeln('groups: {}');
+    } else {
+      b.writeln('groups:');
+      for (final g in groups) {
+        b.writeln('  ${_ccKey(g.id)}:');
+        b.writeln('    name: ${jsonEncode(g.name)}');
+      }
+    }
+    if (tags.isEmpty) {
+      b.writeln('tags: []');
+    } else {
+      b.writeln('tags:');
+      for (final t in tags) {
+        final entry = jsonEncode(<String, dynamic>{
+          'id': t.id,
+          'name': t.name,
+          'color': _hex(t.color),
+          'group': t.groupId,
+        });
+        b.writeln('  - $entry');
+      }
+    }
+    return b.toString();
+  }
+
+  String _locationsYaml() {
+    final b = StringBuffer()
+      ..writeln('# Locations da aba Files. O caminho é a última dica conhecida;')
+      ..writeln('# cada máquina guarda o seu no cache local.')
+      ..writeln('schema: 1');
+    b.writeln('locations:');
+    for (final l in locations) {
+      final entry = jsonEncode(<String, dynamic>{
+        'id': l.id,
+        'name': l.name,
+        if (!l.builtin) 'path': l.path,
+        if (l.builtin) 'builtin': true,
+      });
+      b.writeln('  - $entry');
+    }
+    return b.toString();
+  }
+
+  /// Grava a biblioteca e as Locations no `.cc/` do workspace. Pula o arquivo
+  /// cujo conteúdo não mudou (abrir/fechar um grupo não o regrava).
+  Future<void> _writeRegistries() async {
+    final tf = _tagsFile;
+    final lf = _locsFile;
+    if (tf == null || lf == null) {
+      // Sem pasta de workspace: mantém o arquivo antigo.
+      final f = File(metaPath);
+      await f.parent.create(recursive: true);
+      await _ccWriteText(
+        f,
+        const JsonEncoder.withIndent('  ').convert(_toJson()),
+      );
+      return;
+    }
+    if (!await Directory(workspaceRoot).exists()) {
+      debugPrint('FilesMetaStore: workspace offline; registros não gravados');
+      return;
+    }
+    if (_registryInvalid) {
+      debugPrint('FilesMetaStore: YAML inválido; registros não gravados');
+      return;
+    }
+    final tagsText = _tagsYaml();
+    if (tagsText != _lastTagsYaml || !await tf.exists()) {
+      await CcLocks.run(tf.path, () => _ccWriteText(tf, tagsText));
+      _lastTagsYaml = tagsText;
+    }
+    final locsText = _locationsYaml();
+    if (locsText != _lastLocsYaml || !await lf.exists()) {
+      await CcLocks.run(lf.path, () => _ccWriteText(lf, locsText));
+      _lastLocsYaml = locsText;
+    }
+    await _saveLocalFiles();
+    if (_legacyToRetire) await _retireLegacy(tf, lf);
+  }
+
+  /// Estado só desta máquina: grupos de tag expandidos e caminho das Locations.
+  Future<void> _saveLocalFiles() async {
+    if (workspaceId.isEmpty) return;
+    final snap = <String, dynamic>{
+      'groupExpanded': {for (final g in groups) g.id: g.expanded},
+      'locationPaths': {
+        for (final l in locations)
+          if (!l.builtin) l.id: l.path,
+      },
+    };
+    final j = jsonEncode(snap);
+    if (j == _localFilesWritten) return;
+    _localFilesWritten = j;
+    await LocalState.update(workspaceId, (m) => m['files'] = snap);
+  }
+
+  /// Depois de conferir os YAMLs gravados, o `files_meta.json` antigo vira
+  /// `.migrated` (backup; nunca mais lido).
+  Future<void> _retireLegacy(File tf, File lf) async {
+    final t = await _readYaml(tf);
+    final l = await _readYaml(lf);
+    final nTags = t?['tags'] is List ? (t!['tags'] as List).length : -1;
+    final nLocs = l?['locations'] is List ? (l!['locations'] as List).length : -1;
+    final nGroups = t?['groups'] is Map ? (t!['groups'] as Map).length : -1;
+    if (nTags != tags.length ||
+        nLocs != locations.length ||
+        nGroups != groups.length) {
+      debugPrint('FilesMetaStore: conferência falhou; files_meta.json mantido');
+      return;
+    }
+    final legacy = File(metaPath);
+    if (await legacy.exists()) {
+      var target = '$metaPath.migrated';
+      if (File(target).existsSync()) {
+        target = '$target-${DateTime.now().millisecondsSinceEpoch}';
+      }
+      await legacy.rename(target);
+    }
+    _legacyToRetire = false;
+    debugPrint('FilesMetaStore: files_meta.json -> .cc/ (tags.yaml, locations.yaml)');
+  }
+
+  Map<String, dynamic> _toJson() => {
+        'version': 2,
+        'locations': [for (final l in locations) l.toJson()],
+        'groups': [for (final g in groups) g.toJson()],
+        'tags': [for (final t in tags) t.toJson()],
+      };
+
+  /// Migra a metadata central (v1) para sidecars `.ts/` ao lado dos itens.
+  Future<void> _migrateLegacy() async {
+    if (_legacy.isEmpty) return;
+    for (final e in _legacy.entries) {
+      final l = _loc(e.key);
+      if (l == null) continue;
+      for (final m in e.value.entries) {
+        if (m.value.isEmpty) continue;
+        final abs = m.key.isEmpty ? l.path : '${l.path}/${m.key}';
+        final type = FileSystemEntity.typeSync(abs);
+        if (type == FileSystemEntityType.notFound) continue;
+        final sc = sidecarFileFor(
+            l.path, m.key, type == FileSystemEntityType.directory);
+        if (await sc.exists()) continue; // o sidecar já existente vence
+        _bucket(l.id)[m.key] = m.value;
+        _dirtyItems.add(_key(l.id, m.key));
+      }
+    }
+    _legacy.clear();
+    _dirty = true; // regrava o arquivo do workspace sem 'entries'
+    _scheduleSave();
+  }
+
+  void _scheduleSave() {
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 400), save);
+  }
+
+  /// Grava o que estiver pendente: biblioteca/locations e sidecars alterados.
+  Future<void> save() {
+    _timer?.cancel();
+    _timer = null;
+    return _saving = _saving.then((_) => _doSave());
+  }
+
+  Future<void> _doSave() async {
+    if (_dirty) {
+      _dirty = false;
+      try {
+        await _writeRegistries();
+      } catch (e) {
+        _dirty = true;
+        debugPrint('FilesMetaStore.save: $e');
+      }
+    }
+    if (_dirtyItems.isNotEmpty) {
+      final keys = _dirtyItems.toList();
+      _dirtyItems.clear();
+      for (final k in keys) {
+        final i = k.indexOf(_sep);
+        await _writeItem(k.substring(0, i), k.substring(i + 1));
+      }
+    }
+  }
+
+  /// Notifica a UI e agenda o salvamento. Dentro de [batch], só uma vez no fim.
+  void changed() {
+    if (_batchDepth > 0) {
+      _pending = true;
+      return;
+    }
+    _scheduleSave();
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Mudança só na biblioteca/Locations (grupo expandido, etc.).
+  void libraryChanged() {
+    _dirty = true;
+    changed();
+  }
+
+  void batch(void Function() fn) {
+    _batchDepth++;
+    try {
+      fn();
+    } finally {
+      _batchDepth--;
+      if (_batchDepth == 0 && _pending) {
+        _pending = false;
+        changed();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _timer?.cancel();
+    if (_dirty || _dirtyItems.isNotEmpty) unawaited(save());
+    super.dispose();
+  }
+
+  String _newId(String prefix) => CcData.newId(prefix);
+
+  // ── Formato dos sidecars `.cc/` ────────────────────────────────────────────
+  //
+  //   arquivo  D/nome.ext  →  D/.cc/nome.ext.yaml
+  //   pasta    D/sub       →  D/sub/.cc/__folder__.yaml  (viaja com a pasta)
+  //
+  //   title: "nome.ext"          # informativo, sem valor de verdade
+  //   kind: "file"
+  //   tags: [{"title":"x","color":"#ef5350","textcolor":"#ffffff"}]
+  //   description: "..."
+  //   color: "#90a4ae"
+  //   app: "Chaos Control"
+  //   updated: "2026-11-14T..."
+  //
+  // Cada valor é JSON (JSON é YAML válido), como o frontmatter do app. As
+  // tags são identificadas pelo TÍTULO (não por id), então o sidecar é
+  // autossuficiente: mover/copiar a pasta leva as tags junto. Chaves
+  // desconhecidas são preservadas.
+
+  static File sidecarFileFor(String locPath, String rel, bool isDir) {
+    final abs = rel.isEmpty ? locPath : '$locPath/$rel';
+    if (isDir) return File('$abs/$sidecarDirName/$folderSidecarName');
+    final parent = _parentRel(rel);
+    final dirAbs = parent.isEmpty ? locPath : '$locPath/$parent';
+    return File('$dirAbs/$sidecarDirName/${_baseName(rel)}.yaml');
+  }
+
+  static String _hex(int argb) =>
+      '#${(argb & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+  static int? _parseColor(dynamic v) {
+    if (v is int) return v;
+    if (v is! String) return null;
+    var s = v.trim();
+    if (s.startsWith('#')) s = s.substring(1);
+    if (s.length == 3) s = s.split('').map((c) => '$c$c').join();
+    if (s.length == 6) {
+      final n = int.tryParse(s, radix: 16);
+      return n == null ? null : (0xFF000000 | n);
+    }
+    if (s.length == 8) return int.tryParse(s, radix: 16);
+    return null;
+  }
+
+  static String _textHex(int argb) =>
+      Color(argb).computeLuminance() > 0.55 ? '#000000' : '#ffffff';
+
+  FileMeta _metaFromSidecar(Map<String, dynamic> j) {
+    final ids = <String>[];
+    for (final t in (j['tags'] as List? ?? const [])) {
+      final title = (t is Map ? t['title'] : t)?.toString().trim() ?? '';
+      if (title.isEmpty) continue;
+      var def = tagByName(title);
+      if (def == null) {
+        // Tag desconhecida (veio de outra máquina/pasta): entra na biblioteca.
+        def = FileTagDef(
+          id: _newId('t'),
+          name: title,
+          color: (t is Map ? _parseColor(t['color']) : null) ??
+              _FC.tagPalette[tags.length % _FC.tagPalette.length],
+          groupId: defaultGroupId,
+        );
+        tags.add(def);
+        _dirty = true;
+        _scheduleSave();
+      }
+      if (!ids.contains(def.id)) ids.add(def.id);
+    }
+    return FileMeta(
+      tags: ids,
+      description: (j['description'] ?? j['desc'] ?? '').toString(),
+      color: _parseColor(j['color']),
+    );
+  }
+
+  Future<Map<String, dynamic>?> _readJson(File f) async {
+    try {
+      final d = jsonDecode(await f.readAsString());
+      return d is Map ? Map<String, dynamic>.from(d) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _readYaml(File f) => CcData.readYamlOrNull(f);
+
+  Future<void> _writeYamlFile(File f, Map<String, dynamic> m) =>
+      CcData.writeYaml(f, m);
+
+  /// Aplica [patch] a um sidecar mantendo a ordem e as demais chaves.
+  Future<void> _patchYaml(File f, Map<String, dynamic> patch) {
+    return CcLocks.run(f.path, () async {
+      final j = await _readYaml(f);
+      if (j == null) return; // inválido ou ausente: não toca
+      var same = true;
+      patch.forEach((k, v) {
+        if (jsonEncode(j[k]) != jsonEncode(v)) same = false;
+      });
+      if (same) return;
+      j.addAll(patch);
+      await _writeYamlFile(f, j);
+    });
+  }
+
+  /// Atualiza só o `title` informativo de um sidecar (depois de mover/copiar).
+  Future<void> _retitle(File f, String title) =>
+      _patchYaml(f, <String, dynamic>{'title': title});
+
+  // ── Notas .md: o sidecar é ligado pelo id do frontmatter ──────────────────
+  //
+  //   nota D/x.md (frontmatter id: "abc")  →  D/.cc/abc.yaml
+  //
+  // Renomear o .md por fora do app não perde nada: o id viaja no arquivo.
+  // Um .md sem id continua ligado pelo nome até ganhar metadata; nesse
+  // momento o app grava o id nele (só então o arquivo é alterado).
+
+  static bool _isMd(String name) => CcData.isMd(name);
+
+  /// Nome de arquivo seguro para um id (`common:123` → `common_123`).
+  static String _safeId(String id) => CcData.safeId(id);
+
+  File _idKeyedFile(String dirAbs, String id) =>
+      CcData.idKeyedFile(dirAbs, id);
+
+  /// `id` do frontmatter de um .md (lê só o começo do arquivo).
+  Future<String?> _mdId(String abs) => CcData.mdId(abs);
+
+  /// id → nomes dos .md da pasta que o declaram no frontmatter.
+  Future<Map<String, List<String>>> _mdIdsIn(String dirAbs) async {
+    final out = <String, List<String>>{};
+    try {
+      await for (final e
+          in Directory(dirAbs).list(followLinks: false).handleError((_) {})) {
+        if (e is! File) continue;
+        final name = _baseName(e.path.replaceAll('\\', '/'));
+        if (!_isMd(name)) continue;
+        final id = await _mdId(e.path);
+        if (id != null) (out[id] ??= <String>[]).add(name);
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  Future<void> _stampMdId(String abs, String id) =>
+      CcData.stampMdId(abs, id);
+
+  Future<String?> _ensureMdId(String abs) => CcData.ensureMdId(abs);
+
+  // ── Impressão digital (arquivos que não são .md) ──────────────────────────
+  static const int _fpSample = 65536;
+
+  Future<_FileFp?> _fingerprint(String abs) async {
+    RandomAccessFile? raf;
+    try {
+      raf = await File(abs).open();
+      final size = await raf.length();
+      var h = -3750763034362895579; // FNV-1a 64 bits (0xcbf29ce484222325)
+      void feed(List<int> bytes) {
+        for (final b in bytes) {
+          h = (h ^ b) * 0x100000001b3;
+        }
+      }
+
+      feed(await raf.read(size < _fpSample ? size : _fpSample));
+      if (size > _fpSample) {
+        final tail = size - _fpSample > _fpSample ? _fpSample : size - _fpSample;
+        await raf.setPosition(size - tail);
+        feed(await raf.read(tail));
+      }
+      final hi = ((h >> 32) & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0');
+      final lo = (h & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0');
+      return _FileFp(size, '$hi$lo');
+    } catch (_) {
+      return null;
+    } finally {
+      await raf?.close();
+    }
+  }
+
+  // ── Reconciliação: sidecars cujo alvo foi movido/renomeado fora do app ────
+  //
+  // Roda ao indexar a Location. Um sidecar sem alvo é religado ao arquivo que
+  // tem o mesmo id (.md) ou o mesmo tamanho + hash (demais). Só liga quando há
+  // exatamente UM candidato; ambíguo ou sem candidato, o sidecar fica como está.
+
+  Future<void> _walkFiles(
+    FilesLocation l,
+    Future<void> Function(String abs, String name) onFile,
+  ) async {
+    final stack = <String>[l.path];
+    var visited = 0;
+    while (stack.isNotEmpty && visited < 60000) {
+      final dir = stack.removeLast();
+      visited++;
+      try {
+        await for (final e
+            in Directory(dir).list(followLinks: false).handleError((_) {})) {
+          final name = _baseName(e.path.replaceAll('\\', '/'));
+          if (e is Directory) {
+            if (!name.startsWith('.') && name != 'node_modules') {
+              stack.add('$dir/$name');
+            }
+          } else if (e is File) {
+            if (name.startsWith('.')) continue;
+            await onFile('$dir/$name', name);
+          }
+        }
+      } catch (_) {}
+      if (visited % 40 == 0) await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  /// Religar por nome (plano C) quando o hash não acha o arquivo: cobre o
+  /// arquivo editado e depois movido para outra pasta. Só liga se houver um
+  /// único arquivo com aquele nome, ainda sem sidecar.
+  static const bool _kReconcileByName = true;
+
+  /// Mantém `size`/`hash`/`mtime` do sidecar em dia com o arquivo. Sem isso o
+  /// hash fica velho quando o arquivo é editado (ex.: PDF anotado) e o plano B
+  /// falha se ele for renomeado depois. Também preenche os sidecars vindos da
+  /// migração do `.ts`, que não tinham hash.
+  Future<void> _refreshFingerprint(
+    File yaml,
+    String abs,
+    Map<String, dynamic> j,
+  ) async {
+    try {
+      final st = await File(abs).stat();
+      final mt = st.modified.millisecondsSinceEpoch;
+      if (j['size'] == st.size && j['mtime'] == mt && j['hash'] is String) {
+        return;
+      }
+      final fp = await _fingerprint(abs);
+      if (fp == null) return;
+      await _patchYaml(yaml, <String, dynamic>{
+        'size': fp.size,
+        'hash': fp.hash,
+        'mtime': mt,
+      });
+    } catch (e) {
+      debugPrint('FilesMetaStore._refreshFingerprint($abs): $e');
+    }
+  }
+
+  Future<void> _reconcileLocation(FilesLocation l) async {
+    try {
+      final orphans = <_Orphan>[];
+      await _walkTs(l, (rel) async {
+        final dirAbs = rel.isEmpty ? l.path : '${l.path}/$rel';
+        await _migrateLegacyDir(dirAbs);
+        final cc = Directory('$dirAbs/$sidecarDirName');
+        if (!await cc.exists()) return;
+        Map<String, List<String>>? mdIds;
+        await for (final e in cc.list(followLinks: false).handleError((_) {})) {
+          if (e is! File) continue;
+          final fn = _baseName(e.path.replaceAll('\\', '/'));
+          if (!fn.endsWith('.yaml') || fn == folderSidecarName) continue;
+          final j = await _readYaml(e);
+          if (j == null) continue;
+          if (j['bind'] == 'id') {
+            final id = (j['id'] ?? '').toString();
+            if (id.isEmpty) continue;
+            mdIds ??= await _mdIdsIn(dirAbs);
+            if (!mdIds.containsKey(id)) orphans.add(_Orphan(e, dirAbs, id: id));
+          } else {
+            final name = fn.substring(0, fn.length - 5);
+            final tType = FileSystemEntity.typeSync('$dirAbs/$name');
+            if (tType != FileSystemEntityType.notFound) {
+              // Alvo presente: mantém a impressão digital em dia.
+              if (tType == FileSystemEntityType.file && !_isMd(name)) {
+                await _refreshFingerprint(e, '$dirAbs/$name', j);
+              }
+              continue;
+            }
+            final size = j['size'];
+            final hash = j['hash'];
+            orphans.add(_Orphan(
+              e,
+              dirAbs,
+              name: name,
+              size: size is int ? size : null,
+              hash: hash is String && hash.isNotEmpty ? hash : null,
+            ));
+          }
+        }
+      });
+      if (orphans.isEmpty) return;
+
+      final sizes = <int>{for (final o in orphans) if (o.size != null) o.size!};
+      final ids = <String>{for (final o in orphans) if (o.id != null) o.id!};
+      final names = <String>{
+        if (_kReconcileByName)
+          for (final o in orphans) if (o.name != null) o.name!,
+      };
+      final byHash = <String, List<String>>{};
+      final byId = <String, List<String>>{};
+      final byName = <String, List<String>>{};
+      await _walkFiles(l, (abs, name) async {
+        if (ids.isNotEmpty && _isMd(name)) {
+          final id = await _mdId(abs);
+          if (id != null && ids.contains(id)) (byId[id] ??= <String>[]).add(abs);
+        }
+        final wantName = names.contains(name);
+        if (!wantName && sizes.isEmpty) return;
+        final dir = abs.substring(0, abs.lastIndexOf('/'));
+        // Quem já tem sidecar próprio não é candidato.
+        if (await File('$dir/$sidecarDirName/$name.yaml').exists()) return;
+        if (wantName) (byName[name] ??= <String>[]).add(abs);
+        if (sizes.isEmpty) return;
+        final size = await File(abs).length();
+        if (!sizes.contains(size)) return;
+        final fp = await _fingerprint(abs);
+        if (fp != null) (byHash['${fp.size}:${fp.hash}'] ??= <String>[]).add(abs);
+      });
+
+      final claimed = <String>{};
+      var relinked = 0;
+      var byNameCount = 0;
+      for (final o in orphans) {
+        String? picked;
+        var viaName = false;
+        if (o.id != null) {
+          final c = byId[o.id!];
+          if (c != null && c.length == 1) {
+            picked = c.first;
+          } else if (c != null && c.length > 1) {
+            debugPrint(
+              'FilesMetaStore: sidecar "${o.yaml.path}" ambíguo '
+              '(${c.length} notas com o mesmo id): mantido',
+            );
+          }
+        } else {
+          final h = (o.size != null && o.hash != null)
+              ? byHash['${o.size}:${o.hash}']
+              : null;
+          if (h != null && h.length == 1) {
+            picked = h.first;
+          } else if (h != null && h.length > 1) {
+            // Cópias idênticas: desempata pelo nome, se só uma o tiver.
+            final named = [
+              for (final c in h)
+                if (c.endsWith('/${o.name}')) c,
+            ];
+            if (named.length == 1) {
+              picked = named.first;
+            } else {
+              debugPrint(
+                'FilesMetaStore: sidecar "${o.yaml.path}" ambíguo '
+                '(${h.length} candidatos): mantido',
+              );
+            }
+          }
+          // Plano C: o hash não achou nada (arquivo editado e movido).
+          if (picked == null && h == null && o.name != null) {
+            final c = byName[o.name!];
+            if (c != null && c.length == 1) {
+              picked = c.first;
+              viaName = true;
+            }
+          }
+        }
+        if (picked == null) continue;
+        final target = picked;
+        if (!claimed.add(target)) continue;
+        final i = target.lastIndexOf('/');
+        final newDir = target.substring(0, i);
+        final newName = target.substring(i + 1);
+        final yamlName = o.id != null
+            ? _baseName(o.yaml.path.replaceAll('\\', '/'))
+            : '$newName.yaml';
+        final dst = File('$newDir/$sidecarDirName/$yamlName');
+        if (dst.path == o.yaml.path || await dst.exists()) continue;
+        await dst.parent.create(recursive: true);
+        try {
+          await o.yaml.rename(dst.path);
+        } on FileSystemException {
+          await o.yaml.copy(dst.path);
+          await o.yaml.delete();
+        }
+        await _retitle(dst, newName);
+        await _pruneTsDir(o.yaml.parent);
+        relinked++;
+        if (viaName) {
+          byNameCount++;
+          debugPrint(
+            'FilesMetaStore: religado por nome "${o.name}" -> $target',
+          );
+          // O hash guardado era do conteúdo antigo: atualiza para o atual.
+          await _refreshFingerprint(dst, target, await _readYaml(dst) ?? {});
+        }
+      }
+      debugPrint(
+        'FilesMetaStore: reconciliação "${l.name}": $relinked religados '
+        '($byNameCount por nome), ${orphans.length - relinked} órfãos restantes',
+      );
+    } catch (e) {
+      debugPrint('FilesMetaStore._reconcileLocation: $e');
+    }
+  }
+
+  // ── Migração `.ts/` → `.cc/` (por pasta, na primeira leitura) ─────────────
+  final Map<String, Future<void>> _migrating = {};
+
+  Future<void> _migrateLegacyDir(String dirAbs) {
+    if (!Directory('$dirAbs/$legacyDirName').existsSync()) {
+      return Future<void>.value();
+    }
+    return _migrating[dirAbs] ??=
+        _doMigrateLegacyDir(dirAbs).whenComplete(() {
+      _migrating.remove(dirAbs);
+    });
+  }
+
+  Map<String, dynamic> _coreOf(Map<String, dynamic> j) => {
+        'tags': j['tags'],
+        'description': j['description'] ?? '',
+        'color': j['color'],
+      };
+
+  /// Converte todos os `.ts/*.json` da pasta em `.cc/*.yaml`. O `.cc/` já
+  /// existente vence. Cada item é relido e comparado; só se tudo conferir a
+  /// pasta `.ts` é renomeada para `.ts.migrated` (backup, nunca mais lido).
+  Future<void> _doMigrateLegacyDir(String dirAbs) async {
+    final ts = Directory('$dirAbs/$legacyDirName');
+    try {
+      var ok = true;
+      var converted = 0;
+      await for (final e in ts.list(followLinks: false).handleError((_) {})) {
+        if (e is! File) continue;
+        final fn = _baseName(e.path.replaceAll('\\', '/'));
+        if (!fn.endsWith('.json')) continue;
+        final isFolder = fn == legacyFolderSidecarName;
+        final name = isFolder ? '' : fn.substring(0, fn.length - 5);
+        if (!isFolder && name.isEmpty) continue;
+        final dst = File(
+          '$dirAbs/$sidecarDirName/${isFolder ? folderSidecarName : '$name.yaml'}',
+        );
+        if (await dst.exists()) continue;
+        final j = await _readJson(e);
+        if (j == null) {
+          ok = false;
+          continue;
+        }
+        final core = <String, dynamic>{};
+        final tagList = j['tags'];
+        if (tagList is List && tagList.isNotEmpty) core['tags'] = tagList;
+        final desc = (j['description'] ?? j['desc'] ?? '').toString();
+        if (desc.isNotEmpty) core['description'] = desc;
+        if (j['color'] != null) core['color'] = j['color'];
+        if (core.isEmpty) continue;
+        final item = <String, dynamic>{
+          'title': isFolder ? _baseName(dirAbs) : name,
+          'kind': isFolder ? 'folder' : 'file',
+          ...core,
+          'app': 'Chaos Control',
+          'updated': DateTime.now().toUtc().toIso8601String(),
+        };
+        await _writeYamlFile(dst, item);
+        final back = await _readYaml(dst);
+        if (back == null ||
+            jsonEncode(_coreOf(back)) != jsonEncode(_coreOf(item))) {
+          ok = false;
+          continue;
+        }
+        converted++;
+      }
+      if (ok) {
+        var target = '$dirAbs/$legacyBackupDirName';
+        if (Directory(target).existsSync()) {
+          target = '$target-${DateTime.now().millisecondsSinceEpoch}';
+        }
+        await ts.rename(target);
+      }
+      debugPrint(
+        'FilesMetaStore: .ts -> .cc em "$dirAbs": $converted itens'
+        '${ok ? '' : ' (incompleto: .ts mantido)'}',
+      );
+    } catch (e) {
+      debugPrint('FilesMetaStore._migrateLegacyDir($dirAbs): $e');
+    }
+  }
+
+  Future<void> _pruneTsDir(Directory ts) async {
+    try {
+      if (await ts.exists() && await ts.list().isEmpty) await ts.delete();
+    } catch (_) {}
+  }
+
+  Future<void> _writeItem(String locId, String rel) async {
+    final l = _loc(locId);
+    if (l == null) return;
+    final abs = rel.isEmpty ? l.path : '${l.path}/$rel';
+    final type = FileSystemEntity.typeSync(abs);
+    if (type == FileSystemEntityType.notFound) return; // foi movido/apagado
+    final isDir = type == FileSystemEntityType.directory;
+    final meta = entries[locId]?[rel];
+    final m = (meta == null || meta.isEmpty) ? null : meta;
+    try {
+      final byName = sidecarFileFor(l.path, rel, isDir);
+      // Um `.ts/` ainda não migrado desta pasta entra primeiro, senão ele
+      // seria ignorado depois que o `.cc/` passar a existir.
+      await _migrateLegacyDir(byName.parent.parent.path);
+
+      // Nota .md: ligada pelo id do frontmatter (gerado só quando há metadata).
+      String? mdId;
+      var target = byName;
+      if (!isDir && _isMd(rel)) {
+        mdId = m != null ? await _ensureMdId(abs) : await _mdId(abs);
+        if (mdId != null) {
+          target = _idKeyedFile(byName.parent.parent.path, mdId);
+        }
+      }
+      final f = target;
+      final legacyNamed = (mdId != null) ? byName : null;
+
+      // Impressão digital fora do lock (lê o arquivo do usuário, pode demorar).
+      _FileFp? fp;
+      int? mt;
+      if (!isDir && mdId == null) {
+        fp = await _fingerprint(abs);
+        if (fp != null) {
+          mt = (await File(abs).stat()).modified.millisecondsSinceEpoch;
+        }
+      }
+
+      final fpF = fp;
+      final mtF = mt;
+
+      // Tags, props e relações escrevem no mesmo YAML: uma operação por vez.
+      await CcLocks.run(f.path, () async {
+        var json = <String, dynamic>{};
+        if (await f.exists()) {
+          final r = await _readYaml(f);
+          if (r == null) {
+            // YAML quebrado (editado à mão): nunca grava por cima.
+            CcData.invalidFiles.add(f.path);
+            debugPrint(
+              'FilesMetaStore._writeItem($rel): YAML inválido em ${f.path} '
+              '— não sobrescrito',
+            );
+            return;
+          }
+          CcData.invalidFiles.remove(f.path);
+          json = r;
+        } else if (legacyNamed != null && await legacyNamed.exists()) {
+          // Passa do sidecar por nome para o por id, levando as chaves extras.
+          json = await _readYaml(legacyNamed) ?? <String, dynamic>{};
+        }
+        final hasOther = json.entries.any(
+          (e) => !_cosmeticKeys.contains(e.key) && _hasValue(e.value),
+        );
+        if (m == null && !hasOther) {
+          for (final x in <File?>[f, legacyNamed]) {
+            if (x != null && await x.exists()) {
+              await x.delete();
+              await _pruneTsDir(x.parent);
+            }
+          }
+          return;
+        }
+        final tagList = <Map<String, dynamic>>[];
+        if (m != null) {
+          for (final id in m.tags) {
+            final t = tag(id);
+            if (t == null) continue;
+            tagList.add({
+              'title': t.name,
+              'color': _hex(t.color),
+              'textcolor': _textHex(t.color),
+            });
+          }
+        }
+        final out = <String, dynamic>{
+          'title': rel.isEmpty ? l.name : _baseName(rel),
+          'kind': isDir ? 'folder' : 'file',
+        };
+        if (mdId != null) {
+          out['bind'] = 'id';
+          out['id'] = mdId;
+        }
+        if (tagList.isNotEmpty) out['tags'] = tagList;
+        if (m != null && m.description.isNotEmpty) {
+          out['description'] = m.description;
+        }
+        if (m != null && m.color != null) out['color'] = _hex(m.color!);
+        json.forEach((k, v) {
+          if (!_cosmeticKeys.contains(k)) out[k] = v;
+        });
+        // Arquivos comuns: tamanho + hash permitem religar o sidecar se o
+        // arquivo for movido/renomeado fora do app.
+        if (fpF != null && mtF != null) {
+          out['size'] = fpF.size;
+          out['hash'] = fpF.hash;
+          out['mtime'] = mtF;
+        }
+        out['app'] = 'Chaos Control';
+        out['updated'] = DateTime.now().toUtc().toIso8601String();
+        await _writeYamlFile(f, out);
+        if (legacyNamed != null && await legacyNamed.exists()) {
+          await legacyNamed.delete();
+          await _pruneTsDir(legacyNamed.parent);
+        }
+      });
+    } catch (e) {
+      debugPrint('FilesMetaStore._writeItem($rel): $e');
+    }
+  }
+
+  static bool _hasValue(Object? v) {
+    if (v == null) return false;
+    if (v is String) return v.isNotEmpty;
+    if (v is Iterable) return v.isNotEmpty;
+    if (v is Map) return v.isNotEmpty;
+    return true;
+  }
+
+  // ── Leitura dos sidecars ───────────────────────────────────────────────────
+
+  Future<void> _loadFolderSelf(
+      FilesLocation l, String rel, Map<String, FileMeta> bucket) async {
+    await _migrateLegacyDir(rel.isEmpty ? l.path : '${l.path}/$rel');
+    final f = sidecarFileFor(l.path, rel, true);
+    if (!await f.exists()) {
+      bucket.remove(rel);
+      return;
+    }
+    final j = await _readYaml(f);
+    final m = j == null ? null : _metaFromSidecar(j);
+    if (m == null || m.isEmpty) {
+      bucket.remove(rel);
+    } else {
+      bucket[rel] = m;
+    }
+  }
+
+  Future<void> _loadFolderChildren(
+      FilesLocation l, String rel, Map<String, FileMeta> bucket) async {
+    final ck = _key(l.id, rel);
+    final prev = _childKeys[ck] ?? const <String>{};
+    final found = <String>{};
+    final dirAbs = rel.isEmpty ? l.path : '${l.path}/$rel';
+    await _migrateLegacyDir(dirAbs);
+    final ts = Directory('$dirAbs/$sidecarDirName');
+    if (await ts.exists()) {
+      final idKeyed = <String, Map<String, dynamic>>{};
+      await for (final e in ts.list(followLinks: false).handleError((_) {})) {
+        if (e is! File) continue;
+        final fn = _baseName(e.path.replaceAll('\\', '/'));
+        if (!fn.endsWith('.yaml') || fn == folderSidecarName) continue;
+        final j = await _readYaml(e);
+        if (j == null) continue;
+        if (j['bind'] == 'id') {
+          // Nota .md: o alvo é o .md da pasta com esse id (resolvido abaixo).
+          final id = (j['id'] ?? '').toString();
+          if (id.isNotEmpty) idKeyed[id] = j;
+          continue;
+        }
+        final name = fn.substring(0, fn.length - 5);
+        if (name.isEmpty) continue;
+        final childRel = _joinRel(rel, name);
+        // Sidecar órfão (o arquivo foi movido/apagado fora do app): ignora.
+        if (FileSystemEntity.typeSync('$dirAbs/$name') ==
+            FileSystemEntityType.notFound) {
+          continue;
+        }
+        final m = _metaFromSidecar(j);
+        if (m.isEmpty) continue;
+        bucket[childRel] = m;
+        found.add(childRel);
+      }
+      if (idKeyed.isNotEmpty) {
+        final ids = await _mdIdsIn(dirAbs);
+        for (final e in idKeyed.entries) {
+          final m = _metaFromSidecar(e.value);
+          if (m.isEmpty) continue;
+          for (final name in ids[e.key] ?? const <String>[]) {
+            final childRel = _joinRel(rel, name);
+            bucket[childRel] = m.copy();
+            found.add(childRel); // o sidecar por id vence o por nome
+          }
+        }
+      }
+    }
+    for (final k in prev) {
+      if (!found.contains(k)) bucket.remove(k);
+    }
+    _childKeys[ck] = found;
+  }
+
+  /// Garante que a metadata dos itens listados esteja no cache. A pasta atual
+  /// é sempre relida (pode ter mudado fora do app); as demais só se a Location
+  /// ainda não foi indexada por inteiro.
+  Future<void> ensureLoaded(
+    FilesLocation l,
+    Iterable<FsItem> items,
+    String dir,
+  ) async {
+    final pend = _propagation;
+    if (pend != null) await pend; // não ler tags enquanto são renomeadas
+    final bucket = _bucket(l.id);
+    final indexed = _indexed.contains(l.id);
+    final dirs = <String>{dir};
+    final folders = <String>[];
+    for (final it in items) {
+      dirs.add(it.parent);
+      if (it.isDir && (it.parent == dir || !indexed)) folders.add(it.rel);
+    }
+    final jobs = <Future<void> Function()>[];
+    for (final d in dirs) {
+      final k = _key(l.id, d);
+      if (d == dir || (!indexed && !_loadedDirs.contains(k))) {
+        _loadedDirs.add(k);
+        jobs.add(() => _loadFolderChildren(l, d, bucket));
+      }
+    }
+    for (final fr in folders) {
+      jobs.add(() => _loadFolderSelf(l, fr, bucket));
+    }
+    // até 16 leituras simultâneas
+    for (var i = 0; i < jobs.length; i += 16) {
+      await Future.wait([
+        for (final j in jobs.skip(i).take(16)) j(),
+      ]);
+    }
+  }
+
+  /// Percorre a Location inteira e carrega todos os sidecars `.ts/`. Dá
+  /// contagens de uso corretas e permite buscar por tag em qualquer subpasta.
+  Future<void> indexLocation(String locId, {bool force = false}) async {
+    if (!force && (_indexed.contains(locId) || _indexingIds.contains(locId))) {
+      return;
+    }
+    final l = _loc(locId);
+    if (l == null || _indexingIds.contains(locId)) return;
+    _indexingIds.add(locId);
+    indexing = true;
+    if (!_disposed) notifyListeners();
+    try {
+      await save(); // o que está pendente vai para o disco antes de reler
+      await _reconcileLocation(l); // religa sidecars de itens movidos por fora
+      final bucket = <String, FileMeta>{};
+      _childKeys.removeWhere((k, _) => k.startsWith('$locId$_sep'));
+      await _walkTs(l, (rel) async {
+        await _loadFolderSelf(l, rel, bucket);
+        await _loadFolderChildren(l, rel, bucket);
+      });
+      // Mudanças feitas durante a varredura (ainda não gravadas) prevalecem.
+      final old = entries[locId];
+      for (final k in _dirtyItems) {
+        final i = k.indexOf(_sep);
+        if (k.substring(0, i) != locId) continue;
+        final r = k.substring(i + 1);
+        final v = old?[r];
+        if (v != null) {
+          bucket[r] = v;
+        } else {
+          bucket.remove(r);
+        }
+      }
+      entries[locId] = bucket;
+      _indexed.add(locId);
+    } catch (e) {
+      debugPrint('FilesMetaStore.indexLocation: $e');
+    } finally {
+      _indexingIds.remove(locId);
+      indexing = _indexingIds.isNotEmpty;
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  /// Chama [onTs] para cada pasta da Location que contém uma subpasta `.ts`.
+  Future<void> _walkTs(
+    FilesLocation l,
+    Future<void> Function(String rel) onTs,
+  ) async {
+    final stack = <String>[''];
+    var visited = 0;
+    while (stack.isNotEmpty && visited < 60000) {
+      final rel = stack.removeLast();
+      visited++;
+      var hasTs = false;
+      try {
+        final d = Directory(rel.isEmpty ? l.path : '${l.path}/$rel');
+        await for (final e in d.list(followLinks: false).handleError((_) {})) {
+          if (e is! Directory) continue;
+          final n = _baseName(e.path.replaceAll('\\', '/'));
+          if (n == sidecarDirName || n == legacyDirName) {
+            hasTs = true;
+          } else if (!n.startsWith('.') && n != 'node_modules') {
+            stack.add(_joinRel(rel, n));
+          }
+        }
+      } catch (_) {}
+      if (hasTs) await onTs(rel);
+      if (visited % 40 == 0) await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  // ── Entradas ───────────────────────────────────────────────────────────────
+
+  Map<String, FileMeta> _bucket(String loc) =>
+      entries.putIfAbsent(loc, () => <String, FileMeta>{});
+
+  FileMeta? metaOf(String loc, String rel) => entries[loc]?[rel];
+
+  FileMeta _ensure(String loc, String rel) =>
+      _bucket(loc).putIfAbsent(rel, () => FileMeta());
+
+  void _prune(String loc, String rel) {
+    final m = entries[loc]?[rel];
+    if (m != null && m.isEmpty) entries[loc]!.remove(rel);
+  }
+
+  void _mark(String loc, String rel) => _dirtyItems.add(_key(loc, rel));
+
+  void addTag(String loc, String rel, String tagId) {
+    final m = _ensure(loc, rel);
+    if (!m.tags.contains(tagId)) m.tags.add(tagId);
+    _mark(loc, rel);
+    changed();
+  }
+
+  void removeTag(String loc, String rel, String tagId) {
+    final m = entries[loc]?[rel];
+    if (m == null) return;
+    m.tags.remove(tagId);
+    _prune(loc, rel);
+    _mark(loc, rel);
+    changed();
+  }
+
+  void setDescription(String loc, String rel, String text) {
+    if (text.isEmpty && entries[loc]?[rel] == null) return;
+    _ensure(loc, rel).description = text;
+    _prune(loc, rel);
+    _mark(loc, rel);
+    changed();
+  }
+
+  void setColor(String loc, String rel, int? color) {
+    if (color == null && entries[loc]?[rel] == null) return;
+    _ensure(loc, rel).color = color;
+    _prune(loc, rel);
+    _mark(loc, rel);
+    changed();
+  }
+
+  // ── Mover / copiar / apagar (sidecars acompanham o item) ──────────────────
+  //
+  // Pastas: o `.ts/` está DENTRO da pasta, então renomear/mover/copiar a pasta
+  // já leva toda a metadata (dela e de tudo que ela contém). Aqui só o cache é
+  // reindexado. Arquivos: o sidecar vive na pasta-pai, então é movido/copiado
+  // junto com o arquivo.
+
+  Future<void> moveMeta(
+    String fromLoc,
+    String fromRel,
+    String toLoc,
+    String toRel, {
+    required bool isDir,
+  }) async {
+    final src = entries[fromLoc];
+    if (src != null) {
+      final moved = <String, FileMeta>{};
+      for (final k in src.keys.toList()) {
+        if (k == fromRel) {
+          moved[toRel] = src.remove(k)!;
+        } else if (k.startsWith('$fromRel/')) {
+          moved['$toRel${k.substring(fromRel.length)}'] = src.remove(k)!;
+        }
+      }
+      if (moved.isNotEmpty) _bucket(toLoc).addAll(moved);
+    }
+    _dirtyItems.removeWhere((k) =>
+        k == _key(fromLoc, fromRel) || k.startsWith('${_key(fromLoc, fromRel)}/'));
+    if (!isDir) await _transferSidecar(fromLoc, fromRel, toLoc, toRel, copy: false);
+    if (!_disposed) notifyListeners();
+  }
+
+  Future<void> copyMeta(
+    String fromLoc,
+    String fromRel,
+    String toLoc,
+    String toRel, {
+    required bool isDir,
+  }) async {
+    final src = entries[fromLoc];
+    if (src != null) {
+      final copied = <String, FileMeta>{};
+      for (final e in src.entries) {
+        if (e.key == fromRel) {
+          copied[toRel] = e.value.copy();
+        } else if (e.key.startsWith('$fromRel/')) {
+          copied['$toRel${e.key.substring(fromRel.length)}'] = e.value.copy();
+        }
+      }
+      if (copied.isNotEmpty) _bucket(toLoc).addAll(copied);
+    }
+    if (!isDir) await _transferSidecar(fromLoc, fromRel, toLoc, toRel, copy: true);
+    if (!_disposed) notifyListeners();
+  }
+
+  Future<void> removeMeta(String loc, String rel, {required bool isDir}) async {
+    final src = entries[loc];
+    src?.removeWhere((k, _) => k == rel || k.startsWith('$rel/'));
+    _dirtyItems.removeWhere(
+        (k) => k == _key(loc, rel) || k.startsWith('${_key(loc, rel)}/'));
+    final l = _loc(loc);
+    if (!isDir && l != null) {
+      final f = sidecarFileFor(l.path, rel, false);
+      try {
+        if (await f.exists()) {
+          await f.delete();
+          await _pruneTsDir(f.parent);
+        }
+      } catch (_) {}
+    }
+    if (!_disposed) notifyListeners();
+  }
+
+  Future<void> _transferSidecar(
+    String fromLoc,
+    String fromRel,
+    String toLoc,
+    String toRel, {
+    required bool copy,
+  }) async {
+    final fl = _loc(fromLoc);
+    final tl = _loc(toLoc);
+    if (fl == null || tl == null) return;
+    try {
+      // Nota .md com id: o arquivo já está no destino (mover/copiar vêm depois
+      // da operação em disco), então o id é lido de lá.
+      if (_isMd(toRel)) {
+        final toAbs = '${tl.path}/$toRel';
+        final id = await _mdId(toAbs);
+        if (id != null) {
+          final fromParent = _parentRel(fromRel);
+          final toParent = _parentRel(toRel);
+          final fromDir = fromParent.isEmpty ? fl.path : '${fl.path}/$fromParent';
+          final toDir = toParent.isEmpty ? tl.path : '${tl.path}/$toParent';
+          final idSrc = _idKeyedFile(fromDir, id);
+          if (await idSrc.exists()) {
+            if (copy) {
+              // A cópia ganha id próprio: dois .md não podem dividir o id.
+              final newId = _newId('md_');
+              await _stampMdId(toAbs, newId);
+              final dst = _idKeyedFile(toDir, newId);
+              await dst.parent.create(recursive: true);
+              await idSrc.copy(dst.path);
+              await _patchYaml(dst, <String, dynamic>{
+                'id': newId,
+                'title': _baseName(toRel),
+              });
+            } else {
+              final dst = _idKeyedFile(toDir, id);
+              if (dst.path != idSrc.path) {
+                await dst.parent.create(recursive: true);
+                try {
+                  await idSrc.rename(dst.path);
+                } on FileSystemException {
+                  await idSrc.copy(dst.path);
+                  await idSrc.delete();
+                }
+                await _pruneTsDir(idSrc.parent);
+              }
+              await _retitle(dst, _baseName(toRel));
+            }
+            return;
+          }
+        }
+      }
+      final src = sidecarFileFor(fl.path, fromRel, false);
+      if (!await src.exists()) return;
+      final dst = sidecarFileFor(tl.path, toRel, false);
+      await dst.parent.create(recursive: true);
+      if (copy) {
+        await src.copy(dst.path);
+      } else {
+        try {
+          await src.rename(dst.path);
+        } on FileSystemException {
+          await src.copy(dst.path);
+          await src.delete();
+        }
+        await _pruneTsDir(src.parent);
+      }
+      await _retitle(dst, _baseName(toRel));
+    } catch (e) {
+      debugPrint('FilesMetaStore._transferSidecar: $e');
+    }
+  }
+
+  // ── Tags e grupos ──────────────────────────────────────────────────────────
+
+  FileTagDef? tag(String id) {
+    for (final t in tags) {
+      if (t.id == id) return t;
+    }
+    return null;
+  }
+
+  FileTagDef? tagByName(String name) {
+    final n = name.trim().toLowerCase();
+    if (n.isEmpty) return null;
+    for (final t in tags) {
+      if (t.name.toLowerCase() == n) return t;
+    }
+    return null;
+  }
+
+  List<FileTagDef> tagsOf(FileMeta? m) {
+    if (m == null) return const <FileTagDef>[];
+    final out = <FileTagDef>[];
+    for (final id in m.tags) {
+      final t = tag(id);
+      if (t != null) out.add(t);
+    }
+    return out;
+  }
+
+  FileTagDef createTag(String name, {int? color, String? groupId}) {
+    final existing = tagByName(name);
+    if (existing != null) return existing;
+    final t = FileTagDef(
+      id: _newId('t'),
+      name: name.trim(),
+      color: color ?? _FC.tagPalette[tags.length % _FC.tagPalette.length],
+      groupId: groupId ?? defaultGroupId,
+    );
+    tags.add(t);
+    _dirty = true;
+    changed();
+    return t;
+  }
+
+  /// Renomear/recolorir uma tag reescreve os sidecars que a usam (em todas as
+  /// Locations), em segundo plano.
+  void updateTag(FileTagDef t, {String? name, int? color, String? groupId}) {
+    final oldName = t.name;
+    final oldColor = t.color;
+    if (name != null) t.name = name.trim();
+    if (color != null) t.color = color;
+    if (groupId != null) t.groupId = groupId;
+    _dirty = true;
+    changed();
+    final nameChanged = t.name != oldName;
+    final colorChanged = t.color != oldColor;
+    if (nameChanged || colorChanged) {
+      _propagateTag(
+        oldName,
+        newTitle: nameChanged ? t.name : null,
+        newColor: colorChanged ? t.color : null,
+      );
+    }
+  }
+
+  void deleteTag(String id) {
+    final t = tag(id);
+    if (t == null) return;
+    final oldName = t.name;
+    tags.removeWhere((x) => x.id == id);
+    for (final b in entries.values) {
+      for (final m in b.values) {
+        m.tags.remove(id);
+      }
+      b.removeWhere((_, m) => m.isEmpty);
+    }
+    _dirty = true;
+    changed();
+    _propagateTag(oldName, remove: true);
+  }
+
+  void _propagateTag(
+    String oldTitle, {
+    String? newTitle,
+    int? newColor,
+    bool remove = false,
+  }) {
+    final prev = _propagation ?? Future<void>.value();
+    late final Future<void> mine;
+    mine = prev.then((_) async {
+      await save(); // sidecars pendentes primeiro
+      final oldLower = oldTitle.trim().toLowerCase();
+      for (final l in List<FilesLocation>.of(locations)) {
+        await _walkTs(l, (rel) async {
+          final dirAbs = rel.isEmpty ? l.path : '${l.path}/$rel';
+          await _migrateLegacyDir(dirAbs);
+          final ts = Directory('$dirAbs/$sidecarDirName');
+          if (!await ts.exists()) return;
+          await for (final e in ts.list(followLinks: false).handleError((_) {})) {
+            if (e is! File || !e.path.endsWith('.yaml')) continue;
+            final fe = e;
+            await CcLocks.run(fe.path, () async {
+              final j = await _readYaml(fe);
+              final list = j?['tags'];
+              if (j == null || list is! List) return;
+              var touched = false;
+              final out = <dynamic>[];
+              for (final t in list) {
+                final title = (t is Map ? t['title'] : t)?.toString() ?? '';
+                if (title.trim().toLowerCase() != oldLower) {
+                  out.add(t);
+                  continue;
+                }
+                touched = true;
+                if (remove) continue;
+                final nt = t is Map
+                    ? Map<String, dynamic>.from(t)
+                    : <String, dynamic>{'title': title};
+                if (newTitle != null) nt['title'] = newTitle;
+                if (newColor != null) {
+                  nt['color'] = _hex(newColor);
+                  nt['textcolor'] = _textHex(newColor);
+                }
+                out.add(nt);
+              }
+              if (!touched) return;
+              try {
+                if (out.isEmpty) {
+                  j.remove('tags');
+                } else {
+                  j['tags'] = out;
+                }
+                final hasContent = j.containsKey('tags') ||
+                    (j['description'] ?? '').toString().isNotEmpty ||
+                    j['color'] != null ||
+                    j.entries.any(
+                      (x) => !_cosmeticKeys.contains(x.key) && _hasValue(x.value),
+                    );
+                if (!hasContent) {
+                  await fe.delete();
+                } else {
+                  j['updated'] = DateTime.now().toUtc().toIso8601String();
+                  await _writeYamlFile(fe, j);
+                }
+              } catch (err) {
+                debugPrint('FilesMetaStore._propagateTag: $err');
+              }
+            });
+          }
+          await _pruneTsDir(ts);
+        });
+      }
+    }).catchError((Object e) {
+      debugPrint('FilesMetaStore._propagateTag: $e');
+    }).whenComplete(() {
+      if (identical(_propagation, mine)) _propagation = null;
+    });
+    _propagation = mine;
+  }
+
+  FileTagGroup createGroup(String name) {
+    final g = FileTagGroup(id: _newId('g'), name: name.trim());
+    groups.add(g);
+    _dirty = true;
+    changed();
+    return g;
+  }
+
+  void renameGroup(FileTagGroup g, String name) {
+    g.name = name.trim();
+    _dirty = true;
+    changed();
+  }
+
+  void deleteGroup(String id) {
+    if (id == defaultGroupId) return;
+    for (final t in tags) {
+      if (t.groupId == id) t.groupId = defaultGroupId;
+    }
+    groups.removeWhere((g) => g.id == id);
+    _dirty = true;
+    changed();
+  }
+
+  /// Usos por tag (considera os itens já carregados/indexados).
+  Map<String, int> usageCounts() {
+    final out = <String, int>{};
+    for (final b in entries.values) {
+      for (final m in b.values) {
+        for (final id in m.tags) {
+          out[id] = (out[id] ?? 0) + 1;
+        }
+      }
+    }
+    return out;
+  }
+
+  // ── Locations ──────────────────────────────────────────────────────────────
+
+  FilesLocation addLocation(String name, String path) {
+    final p = _normPath(path);
+    for (final l in locations) {
+      if (l.path == p) return l;
+    }
+    final l = FilesLocation(id: _newId('l'), name: name, path: p);
+    locations.add(l);
+    _dirty = true;
+    changed();
+    return l;
+  }
+
+  void removeLocation(String id) {
+    final l = locations.where((x) => x.id == id).toList();
+    if (l.isEmpty || l.first.builtin) return;
+    locations.removeWhere((x) => x.id == id);
+    entries.remove(id);
+    _indexed.remove(id);
+    _loadedDirs.removeWhere((k) => k.startsWith('$id$_sep'));
+    _dirty = true;
+    changed();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Controller — estado de navegação, filtros, seleção e operações de arquivo
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum FilesViewMode { list, grid }
+
+enum FilesSort { name, modified, size, type }
+
+class FilesController extends ChangeNotifier {
+  FilesController(this.store, {DateTime Function(int ms)? toAppTime})
+      : toAppTime = toAppTime ?? _localTime {
+    store.addListener(_onStore);
+  }
+
+  static DateTime _localTime(int ms) => DateTime.fromMillisecondsSinceEpoch(ms);
+
+  final FilesMetaStore store;
+
+  /// Preenchido pelo app: dado os caminhos a apagar, devolve as relações de
+  /// entrada que ficariam sem alvo (uma linha cada). Só para avisar.
+  Future<List<String>> Function(List<String> absPaths)? onDeleteCheck;
+
+  /// Avisos de exclusão para a seleção atual.
+  Future<List<String>> deletionWarnings() async {
+    final h = onDeleteCheck;
+    if (h == null) return const <String>[];
+    try {
+      return await h([for (final it in selectedItems) abs(it.rel)]);
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  /// Converte unix-ms em horário de exibição (passe `AppClock.fromEpoch`).
+  final DateTime Function(int ms) toAppTime;
+
+  String locId = FilesMetaStore.builtinId;
+  String dir = ''; // pasta atual, relativa à Location ('' = raiz)
+
+  List<FsItem> _raw = [];
+  List<FsItem> items = [];
+  bool loading = false;
+  String? error;
+
+  final Set<String> selected = <String>{};
+  String? _anchor;
+
+  FilesViewMode view = FilesViewMode.list;
+  FilesSort sort = FilesSort.name;
+  bool sortAsc = true;
+  bool showHidden = false;
+  bool propsOpen = true;
+
+  // Busca / filtros
+  String query = '';
+  bool searchSubfolders = false;
+  final Set<String> includeTags = <String>{};
+  final Set<String> excludeTags = <String>{};
+  bool matchAny = false;
+
+  // Árvore de pastas
+  final Set<String> expanded = <String>{};
+  final Map<String, List<String>> treeKids = {};
+
+  // Clipboard interno
+  List<String> _clip = [];
+  String _clipLoc = '';
+  bool _clipCut = false;
+  bool get hasClip => _clip.isNotEmpty;
+
+  bool _disposed = false;
+  bool _lastRecursive = false;
+  int _loadSeq = 0;
+  Timer? _queryTimer;
+
+  // Pastas gerenciadas pelo app: não podem ser renomeadas/apagadas aqui.
+  static const Set<String> _protectedTop = {
+    'projects', 'Inbox', 'generalized', 'vault',
+  };
+
+  bool isProtected(String locationId, String rel) =>
+      locationId == FilesMetaStore.builtinId &&
+      !rel.contains('/') &&
+      _protectedTop.contains(rel);
+
+  FilesLocation get loc => store.locations.firstWhere(
+        (l) => l.id == locId,
+        orElse: () => store.locations.first,
+      );
+
+  String abs(String rel) => rel.isEmpty ? loc.path : '${loc.path}/$rel';
+
+  bool get isSearching =>
+      query.trim().isNotEmpty || includeTags.isNotEmpty || excludeTags.isNotEmpty;
+
+  List<FsItem> get selectedItems =>
+      items.where((i) => selected.contains(i.rel)).toList();
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  void _onStore() {
+    _applyFilters();
+    _notify();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _queryTimer?.cancel();
+    store.removeListener(_onStore);
+    store.dispose();
+    super.dispose();
+  }
+
+  // ── Carga / listagem ───────────────────────────────────────────────────────
+
+  Future<void> init() async {
+    await store.load();
+    if (_disposed) return;
+    await refresh();
+    unawaited(store.indexLocation(locId));
+  }
+
+  Future<void> refresh({bool keepSelection = true}) async {
+    final seq = ++_loadSeq;
+    loading = true;
+    error = null;
+    _notify();
+    final recursive = isSearching && searchSubfolders;
+    try {
+      final list = await _scan(dir, recursive: recursive);
+      if (seq != _loadSeq || _disposed) return;
+      await store.ensureLoaded(loc, list, dir); // lê os sidecars .ts/
+      if (seq != _loadSeq || _disposed) return;
+      _raw = list;
+      _lastRecursive = recursive;
+      await _loadTreeChildren('');
+      for (final e in expanded.toList()) {
+        await _loadTreeChildren(e);
+      }
+    } catch (e) {
+      if (seq != _loadSeq) return;
+      error = e.toString();
+      _raw = [];
+    }
+    if (seq != _loadSeq || _disposed) return;
+    loading = false;
+    if (!keepSelection) selected.clear();
+    _applyFilters();
+    _notify();
+  }
+
+  Future<List<FsItem>> _scan(String rel, {required bool recursive}) async {
+    final root = Directory(abs(rel));
+    if (!await root.exists()) throw 'Folder not found: ${abs(rel)}';
+    final out = <FsItem>[];
+    final base = loc.path.length + 1;
+    final stream = root.list(recursive: recursive, followLinks: false)
+        .handleError((_) {});
+    await for (final e in stream) {
+      final p = e.path.replaceAll('\\', '/');
+      if (p.length <= base) continue;
+      final r = p.substring(base);
+      if (!showHidden && r.split('/').any((s) => s.startsWith('.'))) continue;
+      FileStat st;
+      try {
+        st = await e.stat();
+      } catch (_) {
+        continue;
+      }
+      final isDir = st.type == FileSystemEntityType.directory;
+      out.add(FsItem(
+        rel: r,
+        name: _baseName(r),
+        isDir: isDir,
+        size: isDir ? 0 : st.size,
+        modifiedMs: st.modified.millisecondsSinceEpoch,
+      ));
+      if (out.length >= 20000) break;
+    }
+    return out;
+  }
+
+  Future<void> _loadTreeChildren(String rel) async {
+    try {
+      final d = Directory(abs(rel));
+      if (!await d.exists()) {
+        treeKids[rel] = [];
+        return;
+      }
+      final kids = <String>[];
+      final base = loc.path.length + 1;
+      await for (final e
+          in d.list(followLinks: false).handleError((_) {})) {
+        if (e is! Directory) continue;
+        final r = e.path.replaceAll('\\', '/').substring(base);
+        if (!showHidden && _baseName(r).startsWith('.')) continue;
+        kids.add(r);
+      }
+      kids.sort((a, b) => _natural(_baseName(a), _baseName(b)));
+      treeKids[rel] = kids;
+    } catch (_) {
+      treeKids[rel] = [];
+    }
+  }
+
+  Future<void> toggleExpand(String rel) async {
+    if (expanded.contains(rel)) {
+      expanded.remove(rel);
+      _notify();
+    } else {
+      expanded.add(rel);
+      await _loadTreeChildren(rel);
+      _notify();
+    }
+  }
+
+  void _applyFilters() {
+    final q = query.trim().toLowerCase();
+    final list = _raw.where((it) {
+      final meta = store.metaOf(locId, it.rel);
+      if (q.isNotEmpty) {
+        final inName = it.name.toLowerCase().contains(q);
+        final inDesc = (meta?.description ?? '').toLowerCase().contains(q);
+        final inTags =
+            store.tagsOf(meta).any((t) => t.name.toLowerCase().contains(q));
+        if (!inName && !inDesc && !inTags) return false;
+      }
+      final have = meta?.tags ?? const <String>[];
+      if (includeTags.isNotEmpty) {
+        final ok = matchAny
+            ? includeTags.any(have.contains)
+            : includeTags.every(have.contains);
+        if (!ok) return false;
+      }
+      if (excludeTags.isNotEmpty && excludeTags.any(have.contains)) {
+        return false;
+      }
+      return true;
+    }).toList();
+
+    int cmp(FsItem a, FsItem b) {
+      if (a.isDir != b.isDir) return a.isDir ? -1 : 1; // pastas sempre primeiro
+      int r;
+      switch (sort) {
+        case FilesSort.name:
+          r = _natural(a.name, b.name);
+          break;
+        case FilesSort.modified:
+          r = a.modifiedMs.compareTo(b.modifiedMs);
+          break;
+        case FilesSort.size:
+          r = a.size.compareTo(b.size);
+          break;
+        case FilesSort.type:
+          r = a.ext.compareTo(b.ext);
+          if (r == 0) r = _natural(a.name, b.name);
+          break;
+      }
+      return sortAsc ? r : -r;
+    }
+
+    list.sort(cmp);
+    items = list;
+    final vis = <String>{for (final i in items) i.rel};
+    selected.removeWhere((r) => !vis.contains(r));
+  }
+
+  // ── Navegação ──────────────────────────────────────────────────────────────
+
+  Future<void> goTo(String rel, {String? inLoc}) async {
+    if (inLoc != null && inLoc != locId) {
+      locId = inLoc;
+      expanded.clear();
+      treeKids.clear();
+      unawaited(store.indexLocation(inLoc));
+    }
+    dir = rel;
+    final parts = rel.isEmpty ? <String>[] : rel.split('/');
+    var cur = '';
+    for (var i = 0; i < parts.length - 1; i++) {
+      cur = _joinRel(cur, parts[i]);
+      expanded.add(cur);
+    }
+    selected.clear();
+    _anchor = null;
+    await refresh(keepSelection: false);
+  }
+
+  Future<void> up() async {
+    if (dir.isNotEmpty) await goTo(_parentRel(dir));
+  }
+
+  Future<void> setLocation(String id) => goTo('', inLoc: id);
+
+  void toggleView() {
+    view = view == FilesViewMode.list ? FilesViewMode.grid : FilesViewMode.list;
+    _notify();
+  }
+
+  void setSort(FilesSort s) {
+    if (sort == s) {
+      sortAsc = !sortAsc;
+    } else {
+      sort = s;
+      sortAsc = true;
+    }
+    _applyFilters();
+    _notify();
+  }
+
+  Future<void> toggleHidden() async {
+    showHidden = !showHidden;
+    treeKids.clear();
+    await refresh();
+  }
+
+  void togglePanel() {
+    propsOpen = !propsOpen;
+    _notify();
+  }
+
+  // ── Busca / filtros ────────────────────────────────────────────────────────
+
+  void setQuery(String v) {
+    query = v;
+    _queryTimer?.cancel();
+    _queryTimer = Timer(const Duration(milliseconds: 220), _filtersChanged);
+    _notify();
+  }
+
+  void toggleSubfolders() {
+    searchSubfolders = !searchSubfolders;
+    _filtersChanged();
+  }
+
+  void toggleMatchAny() {
+    matchAny = !matchAny;
+    _filtersChanged();
+  }
+
+  void toggleInclude(String tagId) {
+    excludeTags.remove(tagId);
+    if (!includeTags.add(tagId)) includeTags.remove(tagId);
+    _filtersChanged();
+  }
+
+  void toggleExclude(String tagId) {
+    includeTags.remove(tagId);
+    if (!excludeTags.add(tagId)) excludeTags.remove(tagId);
+    _filtersChanged();
+  }
+
+  void clearFilters() {
+    includeTags.clear();
+    excludeTags.clear();
+    query = '';
+    _filtersChanged();
+  }
+
+  void _filtersChanged() {
+    final needRescan = (isSearching && searchSubfolders) != _lastRecursive;
+    if (needRescan) {
+      refresh();
+    } else {
+      _applyFilters();
+      _notify();
+    }
+  }
+
+  // ── Seleção ────────────────────────────────────────────────────────────────
+
+  void tapItem(FsItem it, {bool ctrl = false, bool shift = false}) {
+    if (shift && _anchor != null) {
+      final a = items.indexWhere((x) => x.rel == _anchor);
+      final b = items.indexWhere((x) => x.rel == it.rel);
+      if (a >= 0 && b >= 0) {
+        if (!ctrl) selected.clear();
+        for (var i = math.min(a, b); i <= math.max(a, b); i++) {
+          selected.add(items[i].rel);
+        }
+        _notify();
+        return;
+      }
+    }
+    if (ctrl) {
+      if (!selected.add(it.rel)) selected.remove(it.rel);
+    } else {
+      selected
+        ..clear()
+        ..add(it.rel);
+    }
+    _anchor = it.rel;
+    _notify();
+  }
+
+  void selectAll() {
+    selected
+      ..clear()
+      ..addAll(items.map((i) => i.rel));
+    _notify();
+  }
+
+  void clearSelection() {
+    if (selected.isEmpty) return;
+    selected.clear();
+    _notify();
+  }
+
+  // ── Tags ───────────────────────────────────────────────────────────────────
+
+  void addTag(Iterable<String> rels, String tagId) {
+    final list = rels.toList();
+    store.batch(() {
+      for (final r in list) {
+        store.addTag(locId, r, tagId);
+      }
+    });
+  }
+
+  void removeTag(Iterable<String> rels, String tagId) {
+    final list = rels.toList();
+    store.batch(() {
+      for (final r in list) {
+        store.removeTag(locId, r, tagId);
+      }
+    });
+  }
+
+  /// Soltar uma tag sobre um item: se ele faz parte de uma seleção múltipla,
+  /// aplica a todos os selecionados.
+  void applyTagDrop(FsItem it, String tagId) {
+    final targets = (selected.contains(it.rel) && selected.length > 1)
+        ? selected.toList()
+        : <String>[it.rel];
+    addTag(targets, tagId);
+  }
+
+  void setDescription(String rel, String text) =>
+      store.setDescription(locId, rel, text);
+
+  void setFolderColor(String rel, int? color) =>
+      store.setColor(locId, rel, color);
+
+  /// Relê todos os sidecars `.ts/` da Location atual (útil depois de mexer
+  /// nas pastas fora do app).
+  Future<void> reindex() async {
+    await store.indexLocation(locId, force: true);
+    await refresh();
+  }
+
+  // ── Operações de arquivo (retornam mensagem de erro ou null) ──────────────
+
+  String? _validName(String n) {
+    final s = n.trim();
+    if (s.isEmpty) return 'Name cannot be empty';
+    if (s == '.' || s == '..') return 'Invalid name';
+    if (RegExp(r'[\\/:*?"<>|]').hasMatch(s)) {
+      return 'Name cannot contain \\ / : * ? " < > |';
+    }
+    return null;
+  }
+
+  bool _exists(String absPath) =>
+      FileSystemEntity.typeSync(absPath) != FileSystemEntityType.notFound;
+
+  String _uniqueName(String dirRel, String name, {String suffix = ''}) {
+    final dot = name.lastIndexOf('.');
+    final hasExt = dot > 0;
+    final stem = hasExt ? name.substring(0, dot) : name;
+    final ext = hasExt ? name.substring(dot) : '';
+    var first = '$stem$suffix$ext';
+    if (suffix.isEmpty) first = name;
+    if (!_exists(abs(_joinRel(dirRel, first)))) return first;
+    for (var i = 1; i < 10000; i++) {
+      final cand = '$stem$suffix ($i)$ext';
+      if (!_exists(abs(_joinRel(dirRel, cand)))) return cand;
+    }
+    return first;
+  }
+
+  Future<String?> createFolder(String name) async {
+    final err = _validName(name);
+    if (err != null) return err;
+    final target = abs(_joinRel(dir, name.trim()));
+    if (_exists(target)) return 'Already exists';
+    try {
+      await Directory(target).create();
+    } catch (e) {
+      return '$e';
+    }
+    await refresh();
+    return null;
+  }
+
+  Future<String?> createFile(String name) async {
+    final err = _validName(name);
+    if (err != null) return err;
+    final target = abs(_joinRel(dir, name.trim()));
+    if (_exists(target)) return 'Already exists';
+    try {
+      await File(target).create();
+    } catch (e) {
+      return '$e';
+    }
+    await refresh();
+    return null;
+  }
+
+  Future<String?> rename(FsItem it, String newName) async {
+    if (isProtected(locId, it.rel)) {
+      return 'This folder is managed by the app and cannot be renamed';
+    }
+    final err = _validName(newName);
+    if (err != null) return err;
+    final nn = newName.trim();
+    final newRel = _joinRel(it.parent, nn);
+    if (newRel == it.rel) return null;
+    final sameIgnoringCase = nn.toLowerCase() == it.name.toLowerCase();
+    if (!sameIgnoringCase && _exists(abs(newRel))) return 'Already exists';
+    await store.save(); // sidecars pendentes antes de mexer nos arquivos
+    try {
+      if (it.isDir) {
+        await Directory(abs(it.rel)).rename(abs(newRel));
+      } else {
+        await File(abs(it.rel)).rename(abs(newRel));
+      }
+    } catch (e) {
+      return '$e';
+    }
+    await store.moveMeta(locId, it.rel, locId, newRel, isDir: it.isDir);
+    await refresh();
+    selected.add(newRel);
+    _applyFilters();
+    _notify();
+    return null;
+  }
+
+  Future<String?> deleteSelected() async {
+    final list = selectedItems;
+    if (list.isEmpty) return null;
+    for (final it in list) {
+      if (isProtected(locId, it.rel)) {
+        return '"${it.name}" is managed by the app and cannot be deleted';
+      }
+    }
+    String? firstErr;
+    await store.save();
+    for (final it in list) {
+      try {
+        if (it.isDir) {
+          await Directory(abs(it.rel)).delete(recursive: true);
+        } else {
+          // sidecars do arquivo (por nome, por id, companheiro): antes de
+          // apagar, porque o id da nota está no próprio arquivo
+          await CcData.removeItemSidecar(abs(it.rel));
+          await File(abs(it.rel)).delete();
+        }
+        await store.removeMeta(locId, it.rel, isDir: it.isDir);
+      } catch (e) {
+        firstErr ??= '$e';
+      }
+    }
+    RelationIndex.invalidate();
+    selected.clear();
+    await refresh();
+    return firstErr;
+  }
+
+  void copySelection({bool cut = false}) {
+    _clip = selected.toList();
+    _clipLoc = locId;
+    _clipCut = cut;
+    _notify();
+  }
+
+  Future<String?> paste() async {
+    if (_clip.isEmpty) return null;
+    final from = store.locations.firstWhere(
+      (l) => l.id == _clipLoc,
+      orElse: () => loc,
+    );
+    String? firstErr;
+    await store.save();
+    for (final srcRel in List<String>.of(_clip)) {
+      final srcAbs = '${from.path}/$srcRel';
+      final type = FileSystemEntity.typeSync(srcAbs);
+      if (type == FileSystemEntityType.notFound) continue;
+      final isDir = type == FileSystemEntityType.directory;
+      if (isDir &&
+          _clipLoc == locId &&
+          (dir == srcRel || dir.startsWith('$srcRel/'))) {
+        firstErr ??= 'Cannot paste a folder into itself';
+        continue;
+      }
+      if (_clipCut && isProtected(_clipLoc, srcRel)) {
+        firstErr ??= '"${_baseName(srcRel)}" is managed by the app';
+        continue;
+      }
+      if (_clipCut && _clipLoc == locId && _parentRel(srcRel) == dir) continue;
+      final destName = _uniqueName(dir, _baseName(srcRel));
+      final destRel = _joinRel(dir, destName);
+      final destAbs = abs(destRel);
+      try {
+        if (_clipCut) {
+          try {
+            if (isDir) {
+              await Directory(srcAbs).rename(destAbs);
+            } else {
+              await File(srcAbs).rename(destAbs);
+            }
+          } on FileSystemException {
+            // entre discos/volumes: copia e apaga
+            await _copyEntity(srcAbs, destAbs, isDir);
+            if (isDir) {
+              await Directory(srcAbs).delete(recursive: true);
+            } else {
+              await File(srcAbs).delete();
+            }
+          }
+          await store.moveMeta(_clipLoc, srcRel, locId, destRel, isDir: isDir);
+        } else {
+          await _copyEntity(srcAbs, destAbs, isDir);
+          await store.copyMeta(_clipLoc, srcRel, locId, destRel, isDir: isDir);
+        }
+      } catch (e) {
+        firstErr ??= '$e';
+      }
+    }
+    if (_clipCut) _clip = [];
+    await refresh();
+    return firstErr;
+  }
+
+  Future<String?> duplicate(FsItem it) async {
+    final destName = _uniqueName(it.parent, it.name, suffix: ' - copy');
+    final destRel = _joinRel(it.parent, destName);
+    try {
+      await store.save();
+      await _copyEntity(abs(it.rel), abs(destRel), it.isDir);
+      await store.copyMeta(locId, it.rel, locId, destRel, isDir: it.isDir);
+    } catch (e) {
+      return '$e';
+    }
+    await refresh();
+    return null;
+  }
+
+  Future<String?> importFiles(List<String> paths) async {
+    String? firstErr;
+    for (final p in paths) {
+      try {
+        final name = _uniqueName(dir, _baseName(_normPath(p)));
+        await File(p).copy(abs(_joinRel(dir, name)));
+      } catch (e) {
+        firstErr ??= '$e';
+      }
+    }
+    await refresh();
+    return firstErr;
+  }
+
+  Future<void> _copyEntity(String src, String dst, bool isDir) async {
+    if (!isDir) {
+      await File(src).copy(dst);
+      return;
+    }
+    await Directory(dst).create(recursive: true);
+    await for (final e in Directory(src).list(followLinks: false)) {
+      final n = _baseName(e.path.replaceAll('\\', '/'));
+      if (e is Directory) {
+        await _copyEntity(e.path, '$dst/$n', true);
+      } else if (e is File) {
+        await e.copy('$dst/$n');
+      }
+    }
+  }
+
+  // ── Integração com o SO ────────────────────────────────────────────────────
+
+  Future<void> openExternally(FsItem it) async {
+    final p = abs(it.rel);
+    try {
+      if (Platform.isWindows) {
+        await Process.run('cmd', ['/c', 'start', '', p.replaceAll('/', '\\')]);
+      } else if (Platform.isMacOS) {
+        await Process.run('open', [p]);
+      } else {
+        await Process.run('xdg-open', [p]);
+      }
+    } catch (e) {
+      debugPrint('openExternally: $e');
+    }
+  }
+
+  Future<void> revealInOs(FsItem it) async {
+    final p = abs(it.rel);
+    try {
+      if (Platform.isWindows) {
+        await Process.run('explorer', ['/select,${p.replaceAll('/', '\\')}']);
+      } else if (Platform.isMacOS) {
+        await Process.run('open', ['-R', p]);
+      } else {
+        await Process.run('xdg-open', [it.isDir ? p : abs(it.parent)]);
+      }
+    } catch (e) {
+      debugPrint('revealInOs: $e');
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diálogos e ações compartilhadas (toolbar, menu de contexto, atalhos, painel)
+// ─────────────────────────────────────────────────────────────────────────────
+
+Future<String?> _promptText(
+  BuildContext ctx, {
+  required String title,
+  String initial = '',
+  String hint = '',
+  String ok = 'OK',
+}) {
+  final c = TextEditingController(text: initial);
+  final dot = initial.lastIndexOf('.');
+  c.selection = TextSelection(
+    baseOffset: 0,
+    extentOffset: dot > 0 ? dot : initial.length,
+  );
+  return showDialog<String>(
+    context: ctx,
+    builder: (dctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1E1E1E),
+      title: Text(title,
+          style: const TextStyle(color: Colors.white, fontSize: 15)),
+      content: SizedBox(
+        width: 340,
+        child: TextField(
+          controller: c,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          decoration: _filesDeco(hint),
+          onSubmitted: (v) => Navigator.pop(dctx, v),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(dctx), child: const Text('Cancel')),
+        TextButton(
+            onPressed: () => Navigator.pop(dctx, c.text), child: Text(ok)),
+      ],
+    ),
+  );
+}
+
+Future<bool> _confirm(
+  BuildContext ctx, {
+  required String title,
+  required String message,
+  String ok = 'Delete',
+}) async {
+  final r = await showDialog<bool>(
+    context: ctx,
+    builder: (dctx) => AlertDialog(
+      backgroundColor: const Color(0xFF1E1E1E),
+      title: Text(title,
+          style: const TextStyle(color: Colors.white, fontSize: 15)),
+      content: Text(message,
+          style: const TextStyle(color: Colors.white70, fontSize: 13)),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Cancel')),
+        TextButton(
+          onPressed: () => Navigator.pop(dctx, true),
+          child: Text(ok, style: const TextStyle(color: Colors.redAccent)),
+        ),
+      ],
+    ),
+  );
+  return r == true;
+}
+
+void _snack(ScaffoldMessengerState? sm, String msg) {
+  sm?.showSnackBar(
+    SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+  );
+}
+
+class _Acts {
+  static Future<void> newFolder(BuildContext ctx, FilesController c) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final n = await _promptText(ctx, title: 'New folder', hint: 'Folder name');
+    if (n == null || n.trim().isEmpty) return;
+    final e = await c.createFolder(n);
+    if (e != null) _snack(sm, e);
+  }
+
+  static Future<void> newFile(BuildContext ctx, FilesController c) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final n = await _promptText(ctx,
+        title: 'New file', hint: 'notes.md', initial: 'untitled.md');
+    if (n == null || n.trim().isEmpty) return;
+    final e = await c.createFile(n);
+    if (e != null) _snack(sm, e);
+  }
+
+  static Future<void> importFiles(BuildContext ctx, FilesController c) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final r = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (r == null) return;
+    final paths = r.paths.whereType<String>().toList();
+    if (paths.isEmpty) return;
+    final e = await c.importFiles(paths);
+    _snack(sm, e ?? 'Imported ${paths.length} file(s)');
+  }
+
+  static Future<void> rename(
+      BuildContext ctx, FilesController c, FsItem it) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final n = await _promptText(ctx,
+        title: 'Rename', initial: it.name, hint: 'New name');
+    if (n == null) return;
+    final e = await c.rename(it, n);
+    if (e != null) _snack(sm, e);
+  }
+
+  static Future<void> deleteSel(BuildContext ctx, FilesController c) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final list = c.selectedItems;
+    if (list.isEmpty) return;
+    final what = list.length == 1 ? '"${list.first.name}"' : '${list.length} items';
+    final warn = danglingSummary(await c.deletionWarnings());
+    final ok = await _confirm(ctx,
+        title: 'Delete',
+        message: 'Permanently delete $what? This cannot be undone.'
+            '${warn.isEmpty ? '' : '\n\n$warn'}');
+    if (!ok) return;
+    final e = await c.deleteSelected();
+    if (e != null) _snack(sm, e);
+  }
+
+  static Future<void> paste(BuildContext ctx, FilesController c) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final e = await c.paste();
+    if (e != null) _snack(sm, e);
+  }
+
+  static Future<void> duplicate(
+      BuildContext ctx, FilesController c, FsItem it) async {
+    final sm = ScaffoldMessenger.maybeOf(ctx);
+    final e = await c.duplicate(it);
+    if (e != null) _snack(sm, e);
+  }
+
+  static void open(FilesController c, FsItem it) {
+    if (it.isDir) {
+      c.goTo(it.rel);
+    } else {
+      c.openExternally(it);
+    }
+  }
+
+  static Future<void> addLocation(BuildContext ctx, FilesController c) async {
+    final p = await FilePicker.platform.getDirectoryPath();
+    if (p == null) return;
+    final path = _normPath(p);
+    final name = await _promptText(ctx,
+        title: 'Location name', initial: _baseName(path), hint: 'Name');
+    if (name == null || name.trim().isEmpty) return;
+    final l = c.store.addLocation(name.trim(), path);
+    await c.setLocation(l.id);
+  }
+
+  static Future<void> removeLocation(
+      BuildContext ctx, FilesController c) async {
+    final l = c.loc;
+    if (l.builtin) return;
+    final ok = await _confirm(ctx,
+        title: 'Remove location',
+        message:
+            'Remove "${l.name}" from the list? Files on disk are NOT touched, '
+            'but the tags/descriptions saved for this location are forgotten.',
+        ok: 'Remove');
+    if (!ok) return;
+    final id = l.id;
+    await c.setLocation(FilesMetaStore.builtinId);
+    c.store.removeLocation(id);
+  }
+
+  /// Seletor de tags com busca e "criar tag" — atribui/remove em [rels].
+  static Future<void> tagPicker(
+      BuildContext ctx, FilesController c, List<String> rels) async {
+    if (rels.isEmpty) return;
+    final qc = TextEditingController();
+    await showDialog<void>(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(builder: (sctx, setS) {
+        final q = qc.text.trim().toLowerCase();
+        final list = c.store.tags
+            .where((t) => q.isEmpty || t.name.toLowerCase().contains(q))
+            .toList();
+        final exact = c.store.tagByName(qc.text) != null;
+        int have(FileTagDef t) => rels
+            .where((r) => c.store.metaOf(c.locId, r)?.tags.contains(t.id) ?? false)
+            .length;
+        void toggle(FileTagDef t) {
+          if (have(t) == rels.length) {
+            c.removeTag(rels, t.id);
+          } else {
+            c.addTag(rels, t.id);
+          }
+          setS(() {});
+        }
+
+        void createAndAdd() {
+          if (qc.text.trim().isEmpty) return;
+          final t = c.store.createTag(qc.text);
+          c.addTag(rels, t.id);
+          qc.clear();
+          setS(() {});
+        }
+
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: Text(
+            rels.length == 1 ? 'Tags' : 'Tags for ${rels.length} items',
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          content: SizedBox(
+            width: 400,
+            height: 340,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              TextField(
+                controller: qc,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: _filesDeco('Search or type a new tag…'),
+                onChanged: (_) => setS(() {}),
+                onSubmitted: (_) {
+                  if (!exact && qc.text.trim().isNotEmpty) {
+                    createAndAdd();
+                  } else if (list.isNotEmpty) {
+                    toggle(list.first);
+                  }
+                },
+              ),
+              const SizedBox(height: 10),
+              if (q.isNotEmpty && !exact)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: createAndAdd,
+                    icon: const Icon(Icons.add_rounded, size: 16),
+                    label: Text('Create tag "${qc.text.trim()}"'),
+                  ),
+                ),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Wrap(spacing: 6, runSpacing: 6, children: [
+                    for (final t in list)
+                      GestureDetector(
+                        onTap: () => toggle(t),
+                        child: Stack(clipBehavior: Clip.none, children: [
+                          _TagPill(
+                            tag: t,
+                            state: have(t) == rels.length
+                                ? 1
+                                : 0,
+                          ),
+                          if (have(t) > 0 && have(t) < rels.length)
+                            const Positioned(
+                              right: -3,
+                              top: -3,
+                              child: Icon(Icons.remove_circle,
+                                  size: 12, color: Colors.white70),
+                            ),
+                        ]),
+                      ),
+                  ]),
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dctx), child: const Text('Done')),
+          ],
+        );
+      }),
+    );
+  }
+
+  /// Criar/editar tag: nome, cor e grupo.
+  static Future<void> editTag(
+    BuildContext ctx,
+    FilesMetaStore store, {
+    FileTagDef? tag,
+    String? groupId,
+  }) async {
+    final nameC = TextEditingController(text: tag?.name ?? '');
+    var color = tag?.color ?? _FC.tagPalette[store.tags.length % _FC.tagPalette.length];
+    var gid = tag?.groupId ?? groupId ?? FilesMetaStore.defaultGroupId;
+    String? err;
+    await showDialog<void>(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(builder: (sctx, setS) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: Text(tag == null ? 'New tag' : 'Edit tag',
+              style: const TextStyle(color: Colors.white, fontSize: 15)),
+          content: SizedBox(
+            width: 340,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              TextField(
+                controller: nameC,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: _filesDeco('Tag name'),
+              ),
+              if (err != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(err!,
+                      style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+                ),
+              const SizedBox(height: 12),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (final cv in _FC.tagPalette)
+                  GestureDetector(
+                    onTap: () => setS(() => color = cv),
+                    child: Container(
+                      width: 24,
+                      height: 24,
+                      decoration: BoxDecoration(
+                        color: Color(cv),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: color == cv ? Colors.white : Colors.transparent,
+                          width: 2,
+                        ),
+                      ),
+                    ),
+                  ),
+              ]),
+              const SizedBox(height: 12),
+              DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: store.groups.any((g) => g.id == gid)
+                      ? gid
+                      : FilesMetaStore.defaultGroupId,
+                  isExpanded: true,
+                  dropdownColor: _FC.menu,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  items: [
+                    for (final g in store.groups)
+                      DropdownMenuItem<String>(value: g.id, child: Text(g.name)),
+                  ],
+                  onChanged: (v) => setS(() => gid = v ?? gid),
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dctx),
+                child: const Text('Cancel')),
+            TextButton(
+              onPressed: () {
+                final n = nameC.text.trim();
+                if (n.isEmpty) {
+                  setS(() => err = 'Name cannot be empty');
+                  return;
+                }
+                final clash = store.tagByName(n);
+                if (clash != null && clash.id != tag?.id) {
+                  setS(() => err = 'A tag with this name already exists');
+                  return;
+                }
+                if (tag == null) {
+                  store.createTag(n, color: color, groupId: gid);
+                } else {
+                  store.updateTag(tag, name: n, color: color, groupId: gid);
+                }
+                Navigator.pop(dctx);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      }),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Widgets pequenos
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// state: 0 = normal, 1 = incluído no filtro/selecionado, 2 = excluído (NOT)
+class _TagPill extends StatelessWidget {
+  const _TagPill({
+    required this.tag,
+    this.state = 0,
+    this.count,
+    this.onRemove,
+    this.small = false,
+  });
+  final FileTagDef tag;
+  final int state;
+  final int? count;
+  final VoidCallback? onRemove;
+  final bool small;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = Color(tag.color);
+    final fg = base.computeLuminance() > 0.55 ? Colors.black87 : Colors.white;
+    final excluded = state == 2;
+    return Container(
+      padding: EdgeInsets.symmetric(
+          horizontal: small ? 6 : 8, vertical: small ? 1 : 3),
+      decoration: BoxDecoration(
+        color: excluded ? base.withOpacity(0.22) : base,
+        borderRadius: BorderRadius.circular(10),
+        border: state == 0
+            ? null
+            : Border.all(
+                color: excluded ? Colors.redAccent : Colors.white, width: 1.4),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        if (excluded)
+          const Padding(
+            padding: EdgeInsets.only(right: 3),
+            child: Icon(Icons.block, size: 10, color: Colors.redAccent),
+          ),
+        Text(
+          tag.name,
+          style: TextStyle(
+            fontSize: small ? 10 : 11.5,
+            fontWeight: FontWeight.w600,
+            color: excluded ? Colors.white54 : fg,
+            decoration: excluded ? TextDecoration.lineThrough : null,
+          ),
+        ),
+        if (count != null)
+          Padding(
+            padding: const EdgeInsets.only(left: 5),
+            child: Text('$count',
+                style: TextStyle(
+                    fontSize: 9.5,
+                    color: (excluded ? Colors.white38 : fg).withOpacity(0.7))),
+          ),
+        if (onRemove != null)
+          GestureDetector(
+            onTap: onRemove,
+            child: Padding(
+              padding: const EdgeInsets.only(left: 4),
+              child: Icon(Icons.close_rounded,
+                  size: 12, color: fg.withOpacity(0.8)),
+            ),
+          ),
+      ]),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIDEBAR — Folders / Tags
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FilesNavPanel extends StatefulWidget {
+  const FilesNavPanel({super.key, required this.controller});
+  final FilesController controller;
+
+  @override
+  State<FilesNavPanel> createState() => _FilesNavPanelState();
+}
+
+class _FilesNavPanelState extends State<FilesNavPanel> {
+  int _tab = 0; // 0 = Folders, 1 = Tags
+  String _tagQuery = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.controller;
+    return AnimatedBuilder(
+      animation: c,
+      builder: (context, _) {
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            _tabBtn(0, Icons.folder_outlined, 'Folders'),
+            _tabBtn(1, Icons.sell_outlined, 'Tags'),
+          ]),
+          const Divider(height: 1, color: Colors.white10),
+          Expanded(
+            child: !c.store.loaded
+                ? const Center(
+                    child: SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2)))
+                : (_tab == 0 ? _folders(c) : _tags(c)),
+          ),
+        ]);
+      },
+    );
+  }
+
+  Widget _tabBtn(int i, IconData icon, String label) {
+    final on = _tab == i;
+    return Expanded(
+      child: InkWell(
+        onTap: () => setState(() => _tab = i),
+        child: Container(
+          height: 34,
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                  color: on ? _FC.accent : Colors.transparent, width: 2),
+            ),
+          ),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(icon, size: 14, color: on ? _FC.accent : Colors.white38),
+            const SizedBox(width: 6),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: on ? Colors.white : Colors.white38)),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // ── Folders ────────────────────────────────────────────────────────────────
+
+  Widget _folders(FilesController c) {
+    final locs = c.store.locations;
+    final rows = <Widget>[_treeRow(c, '', 0)];
+    void walk(String rel, int depth) {
+      final kids = c.treeKids[rel];
+      if (kids == null) return;
+      for (final k in kids) {
+        rows.add(_treeRow(c, k, depth));
+        if (c.expanded.contains(k)) walk(k, depth + 1);
+      }
+    }
+
+    walk('', 1);
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(10, 6, 4, 4),
+        child: Row(children: [
+          Expanded(
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: locs.any((l) => l.id == c.locId) ? c.locId : null,
+                isExpanded: true,
+                isDense: true,
+                dropdownColor: _FC.menu,
+                style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                items: [
+                  for (final l in locs)
+                    DropdownMenuItem<String>(
+                      value: l.id,
+                      child: Row(children: [
+                        Icon(
+                            l.builtin
+                                ? Icons.inventory_2_outlined
+                                : Icons.folder_special_outlined,
+                            size: 14,
+                            color: Colors.white54),
+                        const SizedBox(width: 6),
+                        Expanded(
+                            child: Text(l.name, overflow: TextOverflow.ellipsis)),
+                      ]),
+                    ),
+                ],
+                onChanged: (v) {
+                  if (v != null) c.setLocation(v);
+                },
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Add location (any folder on disk)',
+            iconSize: 17,
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.add_circle_outline_rounded,
+                color: Colors.white54),
+            onPressed: () => _Acts.addLocation(context, c),
+          ),
+          if (!c.loc.builtin)
+            IconButton(
+              tooltip: 'Remove this location',
+              iconSize: 17,
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.remove_circle_outline_rounded,
+                  color: Colors.white38),
+              onPressed: () => _Acts.removeLocation(context, c),
+            ),
+        ]),
+      ),
+      Expanded(child: ListView(padding: const EdgeInsets.only(bottom: 12), children: rows)),
+    ]);
+  }
+
+  Widget _treeRow(FilesController c, String rel, int depth) {
+    final isRoot = rel.isEmpty;
+    final name = isRoot ? c.loc.name : _baseName(rel);
+    final selected = c.dir == rel;
+    final kids = c.treeKids[rel];
+    final hasKids = kids == null || kids.isNotEmpty;
+    final open = isRoot ? true : c.expanded.contains(rel);
+    final meta = c.store.metaOf(c.locId, rel);
+    final fColor = meta?.color != null ? Color(meta!.color!) : _FC.folder;
+    final tags = c.store.tagsOf(meta);
+    return DragTarget<String>(
+      onAccept: (tagId) => c.addTag([rel], tagId),
+      builder: (ctx, cand, rej) => InkWell(
+        onTap: () => c.goTo(rel),
+        child: Container(
+          height: 28,
+          padding: EdgeInsets.only(left: 6 + depth * 14.0, right: 8),
+          color: cand.isNotEmpty
+              ? _FC.accent.withOpacity(0.2)
+              : selected
+                  ? _FC.accent.withOpacity(0.12)
+                  : Colors.transparent,
+          child: Row(children: [
+            SizedBox(
+              width: 18,
+              child: (hasKids && !isRoot)
+                  ? InkWell(
+                      onTap: () => c.toggleExpand(rel),
+                      child: Icon(
+                          open
+                              ? Icons.keyboard_arrow_down_rounded
+                              : Icons.keyboard_arrow_right_rounded,
+                          size: 16,
+                          color: Colors.white38),
+                    )
+                  : null,
+            ),
+            Icon(
+                isRoot
+                    ? Icons.inventory_2_outlined
+                    : (open ? Icons.folder_open_rounded : Icons.folder_rounded),
+                size: 15,
+                color: fColor),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(name,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 12.5,
+                      color: selected ? Colors.white : Colors.white70,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400)),
+            ),
+            for (final t in tags.take(3))
+              Padding(
+                padding: const EdgeInsets.only(left: 2),
+                child: Container(
+                  width: 7,
+                  height: 7,
+                  decoration:
+                      BoxDecoration(color: Color(t.color), shape: BoxShape.circle),
+                ),
+              ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // ── Tags ───────────────────────────────────────────────────────────────────
+
+  Widget _tags(FilesController c) {
+    final store = c.store;
+    final usage = store.usageCounts();
+    final q = _tagQuery.trim().toLowerCase();
+    final active = c.includeTags.isNotEmpty || c.excludeTags.isNotEmpty;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+        child: SizedBox(
+          height: 34,
+          child: TextField(
+            style: const TextStyle(color: Colors.white, fontSize: 12.5),
+            decoration: _filesDeco('Filter tags…',
+                prefix: const Icon(Icons.search_rounded,
+                    size: 15, color: Colors.white38)),
+            onChanged: (v) => setState(() => _tagQuery = v),
+          ),
+        ),
+      ),
+      if (active)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
+          child: Row(children: [
+            const Icon(Icons.filter_alt_rounded, size: 13, color: _FC.accent),
+            const SizedBox(width: 4),
+            const Expanded(
+              child: Text('Filtering files by tags',
+                  style: TextStyle(color: Colors.white54, fontSize: 11.5)),
+            ),
+            InkWell(
+              onTap: c.clearFilters,
+              child: const Text('Clear',
+                  style: TextStyle(color: _FC.accent, fontSize: 11.5)),
+            ),
+          ]),
+        ),
+      Expanded(
+        child: ListView(padding: const EdgeInsets.fromLTRB(10, 0, 10, 12), children: [
+          for (final g in store.groups) ..._groupBlock(c, g, usage, q),
+        ]),
+      ),
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: const BoxDecoration(
+            border: Border(top: BorderSide(color: Colors.white10))),
+        child: Row(children: [
+          Expanded(
+            child: TextButton.icon(
+              onPressed: () => _Acts.editTag(context, store),
+              icon: const Icon(Icons.add_rounded, size: 15),
+              label: const Text('New tag', style: TextStyle(fontSize: 12)),
+            ),
+          ),
+          Expanded(
+            child: TextButton.icon(
+              onPressed: () async {
+                final n = await _promptText(context,
+                    title: 'New tag group', hint: 'Group name');
+                if (n != null && n.trim().isNotEmpty) store.createGroup(n);
+              },
+              icon: const Icon(Icons.create_new_folder_outlined, size: 15),
+              label: const Text('New group', style: TextStyle(fontSize: 12)),
+            ),
+          ),
+        ]),
+      ),
+    ]);
+  }
+
+  List<Widget> _groupBlock(
+      FilesController c, FileTagGroup g, Map<String, int> usage, String q) {
+    final store = c.store;
+    final list = store.tags
+        .where((t) =>
+            t.groupId == g.id && (q.isEmpty || t.name.toLowerCase().contains(q)))
+        .toList();
+    if (q.isNotEmpty && list.isEmpty) return const <Widget>[];
+    return [
+      InkWell(
+        onTap: () {
+          g.expanded = !g.expanded;
+          store.libraryChanged();
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Row(children: [
+            Icon(
+                g.expanded
+                    ? Icons.keyboard_arrow_down_rounded
+                    : Icons.keyboard_arrow_right_rounded,
+                size: 16,
+                color: Colors.white38),
+            Expanded(
+              child: Text(g.name.toUpperCase(),
+                  style: const TextStyle(
+                      fontSize: 10.5,
+                      letterSpacing: 0.8,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white38)),
+            ),
+            PopupMenuButton<String>(
+              tooltip: 'Group options',
+              color: _FC.menu,
+              padding: EdgeInsets.zero,
+              iconSize: 15,
+              icon: const Icon(Icons.more_horiz_rounded, color: Colors.white38),
+              onSelected: (v) async {
+                if (v == 'add') {
+                  _Acts.editTag(context, store, groupId: g.id);
+                } else if (v == 'rename') {
+                  final n = await _promptText(context,
+                      title: 'Rename group', initial: g.name);
+                  if (n != null && n.trim().isNotEmpty) store.renameGroup(g, n);
+                } else if (v == 'delete') {
+                  final ok = await _confirm(context,
+                      title: 'Delete group',
+                      message:
+                          'Delete "${g.name}"? Its tags move to the default group.');
+                  if (ok) store.deleteGroup(g.id);
+                }
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(value: 'add', child: Text('Add tag here')),
+                const PopupMenuItem(value: 'rename', child: Text('Rename group')),
+                if (g.id != FilesMetaStore.defaultGroupId)
+                  const PopupMenuItem(value: 'delete', child: Text('Delete group')),
+              ],
+            ),
+          ]),
+        ),
+      ),
+      if (g.expanded)
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: list.isEmpty
+              ? const Text('No tags yet',
+                  style: TextStyle(color: Colors.white24, fontSize: 11.5))
+              : Wrap(spacing: 5, runSpacing: 5, children: [
+                  for (final t in list) _tagChip(c, t, usage[t.id] ?? 0),
+                ]),
+        ),
+    ];
+  }
+
+  Widget _tagChip(FilesController c, FileTagDef t, int count) {
+    final state =
+        c.includeTags.contains(t.id) ? 1 : (c.excludeTags.contains(t.id) ? 2 : 0);
+    final pill = _TagPill(tag: t, state: state, count: count);
+    return Draggable<String>(
+      data: t.id,
+      feedback: Material(color: Colors.transparent, child: _TagPill(tag: t)),
+      childWhenDragging: Opacity(opacity: 0.4, child: pill),
+      child: GestureDetector(
+        onTap: () => c.toggleInclude(t.id),
+        onSecondaryTapUp: (d) => _tagMenu(c, t, d.globalPosition),
+        onLongPress: () {
+          final box = context.findRenderObject() as RenderBox?;
+          final o = box?.localToGlobal(Offset.zero) ?? Offset.zero;
+          _tagMenu(c, t, o + const Offset(40, 80));
+        },
+        child: pill,
+      ),
+    );
+  }
+
+  Future<void> _tagMenu(FilesController c, FileTagDef t, Offset pos) async {
+    final v = await showMenu<String>(
+      context: context,
+      color: _FC.menu,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      items: const [
+        PopupMenuItem(value: 'inc', child: Text('Show files with this tag')),
+        PopupMenuItem(value: 'exc', child: Text('Hide files with this tag')),
+        PopupMenuItem(value: 'edit', child: Text('Edit tag…')),
+        PopupMenuItem(value: 'del', child: Text('Delete tag')),
+      ],
+    );
+    if (v == null || !mounted) return;
+    if (v == 'inc') {
+      c.toggleInclude(t.id);
+    } else if (v == 'exc') {
+      c.toggleExclude(t.id);
+    } else if (v == 'edit') {
+      await _Acts.editTag(context, c.store, tag: t);
+    } else if (v == 'del') {
+      final ok = await _confirm(context,
+          title: 'Delete tag',
+          message:
+              'Delete "${t.name}"? It is removed from every file it was on '
+              '(the files themselves are not touched).');
+      if (ok) c.store.deleteTag(t.id);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ÁREA PRINCIPAL — toolbar, busca, lista/grade, painel de propriedades
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FilesMainArea extends StatefulWidget {
+  const FilesMainArea({super.key, required this.controller});
+  final FilesController controller;
+
+  @override
+  State<FilesMainArea> createState() => _FilesMainAreaState();
+}
+
+class _FilesMainAreaState extends State<FilesMainArea> {
+  final FocusNode _focus = FocusNode(debugLabel: 'FilesMainArea');
+  final TextEditingController _qCtrl = TextEditingController();
+  DateTime _lastTapAt = DateTime.fromMillisecondsSinceEpoch(0);
+  String _lastTapRel = '';
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    _qCtrl.dispose();
+    super.dispose();
+  }
+
+  FilesController get c => widget.controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: c,
+      builder: (context, _) {
+        if (_qCtrl.text != c.query) _qCtrl.text = c.query;
+        final showProps = c.propsOpen && c.selected.isNotEmpty;
+        return Focus(
+          focusNode: _focus,
+          onKeyEvent: (n, e) => _onKey(e),
+          child: Container(
+            color: _FC.bg,
+            child: Column(children: [
+              _toolbar(),
+              _searchBar(),
+              const Divider(height: 1, color: Colors.white10),
+              Expanded(
+                child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Expanded(child: _body()),
+                  if (showProps) ...[
+                    const VerticalDivider(width: 1, color: Colors.white10),
+                    SizedBox(
+                      width: 320,
+                      child: c.selected.length == 1
+                          ? FilesPropsPanel(
+                              key: ValueKey('${c.locId}|${c.selected.first}'),
+                              controller: c,
+                            )
+                          : FilesPropsPanel(
+                              key: const ValueKey('multi'),
+                              controller: c,
+                            ),
+                    ),
+                  ],
+                ]),
+              ),
+              _statusBar(),
+            ]),
+          ),
+        );
+      },
+    );
+  }
+
+  // ── Teclado ────────────────────────────────────────────────────────────────
+
+  KeyEventResult _onKey(KeyEvent e) {
+    if (e is! KeyDownEvent) return KeyEventResult.ignored;
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary?.context?.widget is EditableText) return KeyEventResult.ignored;
+    final hk = HardwareKeyboard.instance;
+    final ctrl = hk.isControlPressed || hk.isMetaPressed;
+    final k = e.logicalKey;
+    if (ctrl && k == LogicalKeyboardKey.keyA) {
+      c.selectAll();
+      return KeyEventResult.handled;
+    }
+    if (ctrl && k == LogicalKeyboardKey.keyC) {
+      c.copySelection();
+      return KeyEventResult.handled;
+    }
+    if (ctrl && k == LogicalKeyboardKey.keyX) {
+      c.copySelection(cut: true);
+      return KeyEventResult.handled;
+    }
+    if (ctrl && k == LogicalKeyboardKey.keyV) {
+      _Acts.paste(context, c);
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.delete && c.selected.isNotEmpty) {
+      _Acts.deleteSel(context, c);
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.f2 && c.selected.length == 1) {
+      _Acts.rename(context, c, c.selectedItems.first);
+      return KeyEventResult.handled;
+    }
+    if ((k == LogicalKeyboardKey.enter || k == LogicalKeyboardKey.numpadEnter) &&
+        c.selected.length == 1) {
+      _Acts.open(c, c.selectedItems.first);
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.escape) {
+      c.clearSelection();
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.backspace) {
+      c.up();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  // ── Barras ─────────────────────────────────────────────────────────────────
+
+  Widget _tb(IconData icon, String tip, VoidCallback? onTap) => IconButton(
+        tooltip: tip,
+        iconSize: 18,
+        visualDensity: VisualDensity.compact,
+        icon: Icon(icon, color: onTap == null ? Colors.white12 : Colors.white54),
+        onPressed: onTap,
+      );
+
+  Widget _toolbar() {
+    return Container(
+      height: 40,
+      color: _FC.bar,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Row(children: [
+        _tb(Icons.arrow_upward_rounded, 'Up (Backspace)',
+            c.dir.isEmpty ? null : c.up),
+        _tb(Icons.refresh_rounded, 'Refresh', c.refresh),
+        const SizedBox(width: 6),
+        Expanded(child: _breadcrumb()),
+        _tb(Icons.create_new_folder_outlined, 'New folder',
+            () => _Acts.newFolder(context, c)),
+        _tb(Icons.note_add_outlined, 'New file', () => _Acts.newFile(context, c)),
+        _tb(Icons.upload_file_outlined, 'Import files into this folder',
+            () => _Acts.importFiles(context, c)),
+        if (c.hasClip)
+          _tb(Icons.content_paste_rounded, 'Paste here (Ctrl+V)',
+              () => _Acts.paste(context, c)),
+        const SizedBox(width: 4),
+        const SizedBox(height: 20, child: VerticalDivider(color: Colors.white12)),
+        _tb(
+            c.view == FilesViewMode.list
+                ? Icons.grid_view_rounded
+                : Icons.view_list_rounded,
+            c.view == FilesViewMode.list ? 'Grid view' : 'List view',
+            c.toggleView),
+        PopupMenuButton<FilesSort>(
+          tooltip: 'Sort',
+          color: _FC.menu,
+          icon: const Icon(Icons.sort_rounded, size: 18, color: Colors.white54),
+          onSelected: c.setSort,
+          itemBuilder: (_) => [
+            for (final s in FilesSort.values)
+              PopupMenuItem(
+                value: s,
+                child: Row(children: [
+                  SizedBox(
+                    width: 18,
+                    child: c.sort == s
+                        ? Icon(
+                            c.sortAsc
+                                ? Icons.arrow_upward_rounded
+                                : Icons.arrow_downward_rounded,
+                            size: 14)
+                        : null,
+                  ),
+                  Text(const {
+                    FilesSort.name: 'Name',
+                    FilesSort.modified: 'Date modified',
+                    FilesSort.size: 'Size',
+                    FilesSort.type: 'Type',
+                  }[s]!),
+                ]),
+              ),
+          ],
+        ),
+        PopupMenuButton<String>(
+          tooltip: 'More',
+          color: _FC.menu,
+          icon: const Icon(Icons.more_vert_rounded, size: 18, color: Colors.white54),
+          onSelected: (v) async {
+            final sm = ScaffoldMessenger.maybeOf(context);
+            if (v == 'hidden') {
+              await c.toggleHidden();
+            } else if (v == 'props') {
+              c.togglePanel();
+            } else if (v == 'reindex') {
+              await c.reindex();
+              _snack(sm, 'Tags re-read from the .ts folders');
+            }
+          },
+          itemBuilder: (_) => [
+            CheckedPopupMenuItem(
+                value: 'hidden',
+                checked: c.showHidden,
+                child: const Text('Show hidden files')),
+            CheckedPopupMenuItem(
+                value: 'props',
+                checked: c.propsOpen,
+                child: const Text('Properties panel')),
+            const PopupMenuItem(
+                value: 'reindex', child: Text('Re-read tags from folders (.ts)')),
+          ],
+        ),
+      ]),
+    );
+  }
+
+  Widget _breadcrumb() {
+    final parts = c.dir.isEmpty ? <String>[] : c.dir.split('/');
+    Widget seg(String label, String rel, {bool last = false}) => InkWell(
+          onTap: last ? null : () => c.goTo(rel),
+          borderRadius: BorderRadius.circular(4),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+            child: Text(label,
+                style: TextStyle(
+                    fontSize: 12.5,
+                    color: last ? Colors.white : Colors.white54,
+                    fontWeight: last ? FontWeight.w600 : FontWeight.w400)),
+          ),
+        );
+    var cur = '';
+    final children = <Widget>[seg(c.loc.name, '', last: parts.isEmpty)];
+    for (var i = 0; i < parts.length; i++) {
+      cur = _joinRel(cur, parts[i]);
+      children.add(const Icon(Icons.chevron_right_rounded,
+          size: 15, color: Colors.white24));
+      children.add(seg(parts[i], cur, last: i == parts.length - 1));
+    }
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      reverse: true,
+      child: Row(children: children),
+    );
+  }
+
+  Widget _searchBar() {
+    final inc = [for (final id in c.includeTags) c.store.tag(id)].whereType<FileTagDef>();
+    final exc = [for (final id in c.excludeTags) c.store.tag(id)].whereType<FileTagDef>();
+    return Container(
+      color: _FC.panel,
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(
+            child: SizedBox(
+              height: 34,
+              child: TextField(
+                controller: _qCtrl,
+                onChanged: c.setQuery,
+                style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                decoration: _filesDeco(
+                  'Search name, tag or description…',
+                  prefix: const Icon(Icons.search_rounded,
+                      size: 16, color: Colors.white38),
+                  suffix: c.query.isEmpty
+                      ? null
+                      : InkWell(
+                          onTap: () => c.setQuery(''),
+                          child: const Icon(Icons.close_rounded,
+                              size: 15, color: Colors.white38),
+                        ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _toggleChip('Subfolders', c.searchSubfolders, c.toggleSubfolders),
+          if (c.includeTags.length > 1) ...[
+            const SizedBox(width: 6),
+            _toggleChip(c.matchAny ? 'Any tag' : 'All tags', true, c.toggleMatchAny),
+          ],
+        ]),
+        if (c.includeTags.isNotEmpty || c.excludeTags.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Wrap(spacing: 5, runSpacing: 5, crossAxisAlignment: WrapCrossAlignment.center, children: [
+              for (final t in inc)
+                _TagPill(tag: t, state: 1, onRemove: () => c.toggleInclude(t.id)),
+              for (final t in exc)
+                _TagPill(tag: t, state: 2, onRemove: () => c.toggleExclude(t.id)),
+              InkWell(
+                onTap: c.clearFilters,
+                child: const Text('Clear all',
+                    style: TextStyle(color: _FC.accent, fontSize: 11.5)),
+              ),
+            ]),
+          ),
+      ]),
+    );
+  }
+
+  Widget _toggleChip(String label, bool on, VoidCallback onTap) => InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: on ? _FC.accent.withOpacity(0.15) : Colors.transparent,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: on ? _FC.accent : Colors.white12),
+          ),
+          child: Text(label,
+              style: TextStyle(
+                  fontSize: 11.5, color: on ? _FC.accent : Colors.white54)),
+        ),
+      );
+
+  Widget _statusBar() {
+    final sel = c.selectedItems;
+    final selSize = sel.fold<int>(0, (a, b) => a + b.size);
+    return Container(
+      height: 26,
+      color: _FC.bar,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(children: [
+        Text('${c.items.length} item(s)',
+            style: const TextStyle(color: Colors.white38, fontSize: 11)),
+        if (sel.isNotEmpty) ...[
+          const SizedBox(width: 12),
+          Text('${sel.length} selected${selSize > 0 ? ' · ${_fmtSize(selSize)}' : ''}',
+              style: const TextStyle(color: Colors.white54, fontSize: 11)),
+        ],
+        const Spacer(),
+        if (c.loading)
+          const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 1.5)),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Text(c.abs(c.dir),
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white24, fontSize: 10.5)),
+        ),
+      ]),
+    );
+  }
+
+  // ── Corpo ──────────────────────────────────────────────────────────────────
+
+  Widget _body() {
+    Widget inner;
+    if (!c.store.loaded || (c.loading && c.items.isEmpty)) {
+      inner = const Center(
+          child: SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2)));
+    } else if (c.error != null) {
+      inner = Center(
+          child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Text(c.error!,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.redAccent, fontSize: 12.5)),
+      ));
+    } else if (c.items.isEmpty) {
+      inner = Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(c.isSearching ? Icons.search_off_rounded : Icons.folder_open_rounded,
+              size: 44, color: Colors.white10),
+          const SizedBox(height: 10),
+          Text(c.isSearching ? 'No matches in this folder' : 'Empty folder',
+              style: const TextStyle(color: Colors.white24, fontSize: 13)),
+          if (c.isSearching && !c.searchSubfolders)
+            TextButton(
+                onPressed: c.toggleSubfolders,
+                child: const Text('Search subfolders too')),
+        ]),
+      );
+    } else {
+      inner = c.view == FilesViewMode.list ? _list() : _grid();
+    }
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        _focus.requestFocus();
+        c.clearSelection();
+      },
+      child: Container(color: _FC.bg, child: inner),
+    );
+  }
+
+  Widget _headerCell(String label, FilesSort s, {double? width}) {
+    final on = c.sort == s;
+    final cell = InkWell(
+      onTap: () => c.setSort(s),
+      child: Row(children: [
+        Text(label,
+            style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: on ? Colors.white70 : Colors.white30)),
+        if (on)
+          Icon(c.sortAsc ? Icons.arrow_drop_up_rounded : Icons.arrow_drop_down_rounded,
+              size: 16, color: Colors.white54),
+      ]),
+    );
+    return width == null ? Expanded(child: cell) : SizedBox(width: width, child: cell);
+  }
+
+  Widget _list() {
+    return Column(children: [
+      Container(
+        height: 26,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: const BoxDecoration(
+            border: Border(bottom: BorderSide(color: Colors.white10))),
+        child: Row(children: [
+          const SizedBox(width: 28),
+          _headerCell('Name', FilesSort.name),
+          _headerCell('Size', FilesSort.size, width: 80),
+          _headerCell('Modified', FilesSort.modified, width: 130),
+        ]),
+      ),
+      Expanded(
+        child: ListView.builder(
+          itemExtent: 34,
+          itemCount: c.items.length,
+          itemBuilder: (_, i) => _row(c.items[i]),
+        ),
+      ),
+    ]);
+  }
+
+  void _tap(FsItem it) {
+    _focus.requestFocus();
+    final now = DateTime.now();
+    final dbl = _lastTapRel == it.rel &&
+        now.difference(_lastTapAt).inMilliseconds < 350;
+    _lastTapAt = now;
+    _lastTapRel = it.rel;
+    if (dbl) {
+      _Acts.open(c, it);
+      return;
+    }
+    final hk = HardwareKeyboard.instance;
+    c.tapItem(it,
+        ctrl: hk.isControlPressed || hk.isMetaPressed, shift: hk.isShiftPressed);
+  }
+
+  Future<void> _ctxMenu(FsItem it, Offset pos) async {
+    if (!c.selected.contains(it.rel)) c.tapItem(it);
+    final multi = c.selected.length > 1;
+    final v = await showMenu<String>(
+      context: context,
+      color: _FC.menu,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      items: [
+        if (!multi)
+          PopupMenuItem(value: 'open', child: Text(it.isDir ? 'Open folder' : 'Open')),
+        if (!multi) const PopupMenuItem(value: 'reveal', child: Text('Show in file explorer')),
+        const PopupMenuItem(value: 'tags', child: Text('Edit tags…')),
+        if (!multi) const PopupMenuItem(value: 'rename', child: Text('Rename (F2)')),
+        if (!multi) const PopupMenuItem(value: 'dup', child: Text('Duplicate')),
+        const PopupMenuItem(value: 'copy', child: Text('Copy')),
+        const PopupMenuItem(value: 'cut', child: Text('Cut')),
+        if (c.hasClip) const PopupMenuItem(value: 'paste', child: Text('Paste')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+            value: 'del',
+            child: Text('Delete', style: TextStyle(color: Colors.redAccent))),
+      ],
+    );
+    if (v == null || !mounted) return;
+    switch (v) {
+      case 'open':
+        _Acts.open(c, it);
+        break;
+      case 'reveal':
+        c.revealInOs(it);
+        break;
+      case 'tags':
+        _Acts.tagPicker(context, c, c.selected.toList());
+        break;
+      case 'rename':
+        _Acts.rename(context, c, it);
+        break;
+      case 'dup':
+        _Acts.duplicate(context, c, it);
+        break;
+      case 'copy':
+        c.copySelection();
+        break;
+      case 'cut':
+        c.copySelection(cut: true);
+        break;
+      case 'paste':
+        _Acts.paste(context, c);
+        break;
+      case 'del':
+        _Acts.deleteSel(context, c);
+        break;
+    }
+  }
+
+  Color _rowBg(bool sel, bool hover) => hover
+      ? _FC.accent.withOpacity(0.2)
+      : sel
+          ? _FC.accent.withOpacity(0.14)
+          : Colors.transparent;
+
+  Widget _row(FsItem it) {
+    final sel = c.selected.contains(it.rel);
+    final meta = c.store.metaOf(c.locId, it.rel);
+    final tags = c.store.tagsOf(meta);
+    final fColor = it.isDir
+        ? (meta?.color != null ? Color(meta!.color!) : _FC.folder)
+        : Colors.white54;
+    return DragTarget<String>(
+      onAccept: (tagId) => c.applyTagDrop(it, tagId),
+      builder: (ctx, cand, rej) => GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _tap(it),
+        onSecondaryTapUp: (d) => _ctxMenu(it, d.globalPosition),
+        child: Container(
+          color: _rowBg(sel, cand.isNotEmpty),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(children: [
+            SizedBox(width: 28, child: Icon(_iconFor(it), size: 18, color: fColor)),
+            Expanded(
+              flex: 3,
+              child: Text(
+                // em busca recursiva mostra o caminho para desambiguar
+                c.isSearching && c.searchSubfolders && it.parent.isNotEmpty
+                    ? '${it.name}   · ${it.parent}'
+                    : it.name,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 12.5,
+                    color: Colors.white,
+                    fontWeight: it.isDir ? FontWeight.w600 : FontWeight.w400),
+              ),
+            ),
+            if (tags.isNotEmpty)
+              Expanded(
+                flex: 2,
+                child: ClipRect(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    physics: const NeverScrollableScrollPhysics(),
+                    child: Row(children: [
+                      for (final t in tags)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 4),
+                          child: _TagPill(tag: t, small: true),
+                        ),
+                    ]),
+                  ),
+                ),
+              ),
+            SizedBox(
+              width: 80,
+              child: Text(it.isDir ? '—' : _fmtSize(it.size),
+                  style: const TextStyle(color: Colors.white38, fontSize: 11.5)),
+            ),
+            SizedBox(
+              width: 130,
+              child: Text(_fmtDate(c.toAppTime(it.modifiedMs)),
+                  style: const TextStyle(color: Colors.white38, fontSize: 11.5)),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _grid() {
+    return GridView.builder(
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 150,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        childAspectRatio: 0.82,
+      ),
+      itemCount: c.items.length,
+      itemBuilder: (_, i) => _card(c.items[i]),
+    );
+  }
+
+  Widget _card(FsItem it) {
+    final sel = c.selected.contains(it.rel);
+    final meta = c.store.metaOf(c.locId, it.rel);
+    final tags = c.store.tagsOf(meta);
+    final fColor = it.isDir
+        ? (meta?.color != null ? Color(meta!.color!) : _FC.folder)
+        : Colors.white38;
+    Widget thumb;
+    if (!it.isDir && _imgExt.contains(it.ext) && it.size < 15 * 1024 * 1024) {
+      thumb = ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Image.file(
+          File(c.abs(it.rel)),
+          fit: BoxFit.cover,
+          cacheWidth: 300,
+          errorBuilder: (_, __, ___) =>
+              Icon(_iconFor(it), size: 40, color: fColor),
+        ),
+      );
+    } else {
+      thumb = Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+        Icon(_iconFor(it), size: 44, color: fColor),
+        if (!it.isDir && it.ext.isNotEmpty)
+          Text(it.ext.toUpperCase(),
+              style: const TextStyle(
+                  color: Colors.white24, fontSize: 10, fontWeight: FontWeight.w700)),
+      ]);
+    }
+    return DragTarget<String>(
+      onAccept: (tagId) => c.applyTagDrop(it, tagId),
+      builder: (ctx, cand, rej) => GestureDetector(
+        onTap: () => _tap(it),
+        onSecondaryTapUp: (d) => _ctxMenu(it, d.globalPosition),
+        child: Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: _rowBg(sel, cand.isNotEmpty).withOpacity(sel || cand.isNotEmpty ? 0.2 : 0.0),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: sel ? _FC.accent : Colors.white10),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Expanded(child: Center(child: thumb)),
+            const SizedBox(height: 4),
+            Text(it.name,
+                maxLines: 2,
+                textAlign: TextAlign.center,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white, fontSize: 11.5)),
+            const SizedBox(height: 4),
+            SizedBox(
+              height: 8,
+              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                for (final t in tags.take(6))
+                  Container(
+                    width: 8,
+                    height: 8,
+                    margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                    decoration:
+                        BoxDecoration(color: Color(t.color), shape: BoxShape.circle),
+                  ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAINEL DE PROPRIEDADES (direita)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FilesPropsPanel extends StatefulWidget {
+  const FilesPropsPanel({super.key, required this.controller});
+  final FilesController controller;
+
+  @override
+  State<FilesPropsPanel> createState() => _FilesPropsPanelState();
+}
+
+class _FilesPropsPanelState extends State<FilesPropsPanel> {
+  final TextEditingController _desc = TextEditingController();
+  Timer? _timer;
+  String? _boundRel;
+  String _pendingText = '';
+  bool _dirty = false;
+
+  FilesController get c => widget.controller;
+
+  @override
+  void initState() {
+    super.initState();
+    if (c.selected.length == 1) {
+      _boundRel = c.selected.first;
+      _desc.text = c.store.metaOf(c.locId, _boundRel!)?.description ?? '';
+    }
+  }
+
+  void _onDescChanged(String v) {
+    _pendingText = v;
+    _dirty = true;
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 500), _flush);
+  }
+
+  void _flush() {
+    _timer?.cancel();
+    final rel = _boundRel;
+    if (_dirty && rel != null) {
+      _dirty = false;
+      c.setDescription(rel, _pendingText);
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    final rel = _boundRel;
+    if (_dirty && rel != null) {
+      final text = _pendingText;
+      final ctrl = c;
+      // fora do ciclo de build/dispose: notificar listeners aqui causaria erro
+      scheduleMicrotask(() => ctrl.setDescription(rel, text));
+    }
+    _desc.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: _FC.panel,
+      child: AnimatedBuilder(
+        animation: c,
+        builder: (context, _) {
+          final sel = c.selectedItems;
+          if (sel.isEmpty) return const SizedBox.shrink();
+          return sel.length == 1 ? _single(sel.first) : _multi(sel);
+        },
+      ),
+    );
+  }
+
+  Widget _section(String t) => Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 6),
+        child: Text(t.toUpperCase(),
+            style: const TextStyle(
+                fontSize: 10.5,
+                letterSpacing: 0.8,
+                fontWeight: FontWeight.w700,
+                color: Colors.white38)),
+      );
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(
+              width: 64,
+              child: Text(k,
+                  style: const TextStyle(color: Colors.white38, fontSize: 11.5))),
+          Expanded(
+              child: SelectableText(v,
+                  style: const TextStyle(color: Colors.white70, fontSize: 11.5))),
+        ]),
+      );
+
+  Widget _header(Widget icon, String title) => Row(children: [
+        icon,
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700)),
+        ),
+        IconButton(
+          tooltip: 'Close panel',
+          iconSize: 16,
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.close_rounded, color: Colors.white38),
+          onPressed: c.togglePanel,
+        ),
+      ]);
+
+  Widget _single(FsItem it) {
+    final meta = c.store.metaOf(c.locId, it.rel);
+    final tags = c.store.tagsOf(meta);
+    final fColor = it.isDir
+        ? (meta?.color != null ? Color(meta!.color!) : _FC.folder)
+        : Colors.white54;
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      _header(Icon(_iconFor(it), size: 22, color: fColor), it.name),
+      const SizedBox(height: 8),
+      _kv('Type', it.isDir ? 'Folder' : (it.ext.isEmpty ? 'File' : '${it.ext.toUpperCase()} file')),
+      if (!it.isDir) _kv('Size', '${_fmtSize(it.size)} (${it.size} bytes)'),
+      _kv('Modified', _fmtDate(c.toAppTime(it.modifiedMs))),
+      _kv('Path', it.rel),
+      _section('Tags'),
+      Wrap(spacing: 5, runSpacing: 5, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        for (final t in tags)
+          _TagPill(tag: t, onRemove: () => c.removeTag([it.rel], t.id)),
+        InkWell(
+          onTap: () => _Acts.tagPicker(context, c, [it.rel]),
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.add_rounded, size: 12, color: Colors.white54),
+              SizedBox(width: 3),
+              Text('Add tag',
+                  style: TextStyle(color: Colors.white54, fontSize: 11.5)),
+            ]),
+          ),
+        ),
+      ]),
+      if (it.isDir) ...[
+        _section('Folder color'),
+        Wrap(spacing: 7, runSpacing: 7, children: [
+          InkWell(
+            onTap: () => c.setFolderColor(it.rel, null),
+            child: Container(
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(
+                color: _FC.folder,
+                shape: BoxShape.circle,
+                border: Border.all(
+                    color: meta?.color == null ? Colors.white : Colors.transparent,
+                    width: 2),
+              ),
+            ),
+          ),
+          for (final cv in _FC.tagPalette)
+            InkWell(
+              onTap: () => c.setFolderColor(it.rel, cv),
+              child: Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: Color(cv),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                      color: meta?.color == cv ? Colors.white : Colors.transparent,
+                      width: 2),
+                ),
+              ),
+            ),
+        ]),
+      ],
+      _section('Description'),
+      TextField(
+        controller: _desc,
+        onChanged: _onDescChanged,
+        minLines: 3,
+        maxLines: 8,
+        style: const TextStyle(color: Colors.white, fontSize: 12.5),
+        decoration: _filesDeco('Notes about this ${it.isDir ? 'folder' : 'file'}…'),
+      ),
+      if (!it.isDir &&
+          (_imgExt.contains(it.ext) || _textExt.contains(it.ext))) ...[
+        _section('Preview'),
+        _PreviewBox(
+          key: ValueKey('${it.rel}|${it.modifiedMs}'),
+          path: c.abs(it.rel),
+          ext: it.ext,
+          size: it.size,
+        ),
+      ],
+      const SizedBox(height: 16),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton.icon(
+          onPressed: () => _Acts.open(c, it),
+          icon: Icon(it.isDir ? Icons.folder_open_rounded : Icons.open_in_new_rounded,
+              size: 15),
+          label: Text(it.isDir ? 'Open' : 'Open with default app'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => c.revealInOs(it),
+          icon: const Icon(Icons.travel_explore_rounded, size: 15),
+          label: const Text('Show in explorer'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => _Acts.rename(context, c, it),
+          icon: const Icon(Icons.drive_file_rename_outline_rounded, size: 15),
+          label: const Text('Rename'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => _Acts.deleteSel(context, c),
+          icon: const Icon(Icons.delete_outline_rounded,
+              size: 15, color: Colors.redAccent),
+          label: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
+        ),
+      ]),
+    ]);
+  }
+
+  Widget _multi(List<FsItem> sel) {
+    final counts = <String, int>{};
+    for (final it in sel) {
+      for (final id in c.store.metaOf(c.locId, it.rel)?.tags ?? const <String>[]) {
+        counts[id] = (counts[id] ?? 0) + 1;
+      }
+    }
+    final rels = sel.map((e) => e.rel).toList();
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      _header(const Icon(Icons.checklist_rounded, size: 22, color: Colors.white54),
+          '${sel.length} items selected'),
+      _section('Tags on selection'),
+      Wrap(spacing: 5, runSpacing: 5, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        for (final e in counts.entries)
+          if (c.store.tag(e.key) != null)
+            _TagPill(
+              tag: c.store.tag(e.key)!,
+              count: e.value,
+              onRemove: () => c.removeTag(rels, e.key),
+            ),
+        InkWell(
+          onTap: () => _Acts.tagPicker(context, c, rels),
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.add_rounded, size: 12, color: Colors.white54),
+              SizedBox(width: 3),
+              Text('Add tag to all',
+                  style: TextStyle(color: Colors.white54, fontSize: 11.5)),
+            ]),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      const Text('The number on a tag is how many of the selected items have it.',
+          style: TextStyle(color: Colors.white24, fontSize: 10.5)),
+      const SizedBox(height: 16),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton.icon(
+          onPressed: () => c.copySelection(),
+          icon: const Icon(Icons.copy_rounded, size: 15),
+          label: const Text('Copy'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => c.copySelection(cut: true),
+          icon: const Icon(Icons.content_cut_rounded, size: 15),
+          label: const Text('Cut'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => _Acts.deleteSel(context, c),
+          icon: const Icon(Icons.delete_outline_rounded,
+              size: 15, color: Colors.redAccent),
+          label: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
+        ),
+      ]),
+    ]);
+  }
+}
+
+class _PreviewBox extends StatefulWidget {
+  const _PreviewBox({
+    super.key,
+    required this.path,
+    required this.ext,
+    required this.size,
+  });
+  final String path;
+  final String ext;
+  final int size;
+
+  @override
+  State<_PreviewBox> createState() => _PreviewBoxState();
+}
+
+class _PreviewBoxState extends State<_PreviewBox> {
+  Future<String>? _text;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_textExt.contains(widget.ext) && widget.size < 4 * 1024 * 1024) {
+      _text = _readHead(widget.path);
+    }
+  }
+
+  static Future<String> _readHead(String p) async {
+    final raf = await File(p).open();
+    try {
+      final b = await raf.read(6000);
+      return utf8.decode(b, allowMalformed: true);
+    } finally {
+      await raf.close();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_imgExt.contains(widget.ext)) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          color: Colors.black,
+          constraints: const BoxConstraints(maxHeight: 200),
+          child: Image.file(
+            File(widget.path),
+            fit: BoxFit.contain,
+            cacheWidth: 600,
+            errorBuilder: (_, __, ___) => const SizedBox(
+              height: 60,
+              child: Center(
+                  child: Icon(Icons.broken_image_outlined, color: Colors.white24)),
+            ),
+          ),
+        ),
+      );
+    }
+    if (_text != null) {
+      return FutureBuilder<String>(
+        future: _text,
+        builder: (_, s) {
+          if (!s.hasData) return const SizedBox.shrink();
+          return Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            constraints: const BoxConstraints(maxHeight: 220),
+            decoration: BoxDecoration(
+              color: const Color(0xFF111113),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: SingleChildScrollView(
+              child: Text(s.data!,
+                  style: const TextStyle(
+                      color: Colors.white60,
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                      height: 1.35)),
+            ),
+          );
+        },
+      );
+    }
+    return const SizedBox.shrink();
   }
 }
