@@ -5769,6 +5769,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
   Future<void> _loadAttachedWorkspaces() async {
     if (_workspaceId.isEmpty) return;
     try {
+      await PendingRelations.instance.load(_wsRoot(_workspaceId));
       await AttachedWorkspaces.instance.load(
         _wsRoot(_workspaceId),
         _workspaceId,
@@ -5777,9 +5778,762 @@ class _ResizableScreenState extends State<ResizableScreen> {
         _attachedHooked = true;
         AttachedWorkspaces.instance.revision.addListener(_onAttachedChanged);
       }
+      unawaited(_applyPendingRelations());
       unawaited(_refreshEntityRefs(force: true));
     } catch (e) {
       debugPrint('_loadAttachedWorkspaces ERROR: $e');
+    }
+  }
+
+  // ── Workspace duplicado / ids duplicados (fase 6) ──────────────────────────
+
+  WorkspaceAuditReport _audit = WorkspaceAuditReport.empty;
+  String _auditShownSig = '';
+  DateTime _auditAt = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _auditBusy = false;
+
+  /// Procura o mesmo `workspace_id` em dois caminhos e o mesmo id em dois
+  /// workspaces. Avisa uma vez por conjunto de achados.
+  Future<void> _runWorkspaceAudit({bool force = false}) async {
+    if (_workspaceId.isEmpty || _auditBusy) return;
+    if (!force && DateTime.now().difference(_auditAt).inSeconds < 60) return;
+    _auditBusy = true;
+    try {
+      final saved = <({String label, String path})>[
+        for (final w in _savedWorkspaces)
+          (label: (w['name'] ?? w['id'] ?? '').toString(), path: (w['basePath'] ?? '').toString()),
+      ];
+      final report = await WorkspaceAudit.run(
+        localId: _workspaceId,
+        localLabel: _workspaceName.isEmpty ? 'este workspace' : _workspaceName,
+        localRoot: _wsRoot(_workspaceId),
+        saved: saved,
+      );
+      _auditAt = DateTime.now();
+      _audit = report;
+      if (!mounted || report.isEmpty || report.signature == _auditShownSig) return;
+      _auditShownSig = report.signature;
+      final parts = <String>[
+        if (report.workspaces.isNotEmpty)
+          '${report.workspaces.length} workspace(s) duplicado(s)',
+        if (report.ids.isNotEmpty) '${report.ids.length} id(s) em mais de um workspace',
+      ];
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+        content: Text('Duplicidade detectada: ${parts.join(' · ')}'),
+        duration: const Duration(seconds: 15),
+        action: SnackBarAction(label: 'Ver', onPressed: _showWorkspaceAuditDialog),
+      ));
+    } catch (e) {
+      debugPrint('_runWorkspaceAudit ERROR: $e');
+    } finally {
+      _auditBusy = false;
+    }
+  }
+
+  Future<void> _showWorkspaceAuditDialog() async {
+    await _runWorkspaceAudit(force: true);
+    if (!mounted) return;
+    final r = _audit;
+    Widget h(String t) => Padding(
+          padding: const EdgeInsets.only(top: 10, bottom: 4),
+          child: Text(t,
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+        );
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2124),
+        title: const Text('Duplicidades',
+            style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 520,
+          child: r.isEmpty
+              ? const Text('Nada duplicado.',
+                  style: TextStyle(color: Colors.white70, fontSize: 13))
+              : SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (r.workspaces.isNotEmpty) ...[
+                        h('Mesmo workspace_id em mais de um caminho'),
+                        const Text(
+                          'Os dois lados vão divergir em silêncio. Use só um, ou dê '
+                          'outro workspace_id à cópia (.cc/workspace.yaml).',
+                          style: TextStyle(color: Colors.white54, fontSize: 12),
+                        ),
+                        for (final w in r.workspaces) ...[
+                          const SizedBox(height: 6),
+                          Text(w.workspaceId,
+                              style: const TextStyle(color: _RC.warn, fontSize: 12)),
+                          for (var i = 0; i < w.paths.length; i++)
+                            Text('  • ${w.labels[i]} — ${w.paths[i]}',
+                                style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                        ],
+                      ],
+                      if (r.ids.isNotEmpty) ...[
+                        h('Mesmo id em mais de um workspace'),
+                        for (final d in r.ids) ...[
+                          const SizedBox(height: 6),
+                          Text(d.id,
+                              style: const TextStyle(color: _RC.warn, fontSize: 12)),
+                          for (final o in d.where)
+                            Row(children: [
+                              Expanded(
+                                child: Text(
+                                  '  • ${o.wsLabel} — ${o.title} (${o.type})',
+                                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                                ),
+                              ),
+                              if (o.local)
+                                TextButton(
+                                  onPressed: () async {
+                                    Navigator.of(ctx).pop();
+                                    await _newIdForLocalEntity(d.id);
+                                    await _runWorkspaceAudit(force: true);
+                                  },
+                                  child: const Text('New id', style: TextStyle(fontSize: 12)),
+                                ),
+                            ]),
+                        ],
+                      ],
+                    ],
+                  ),
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// "New id" para a entidade deste workspace com id [id] (clona o sidecar).
+  Future<void> _newIdForLocalEntity(String id) async {
+    try {
+      final idx = await EntityIndex.build(_entityLocator);
+      final e = idx.byId(id);
+      if (e == null) return;
+      await _regenerateEntityId(RefTarget(
+        id: e.id,
+        title: e.name,
+        kind: RefKind.entity,
+        rel: e.rel,
+        anchorPath: e.anchorPath,
+      ));
+    } catch (err) {
+      debugPrint('_newIdForLocalEntity ERROR: $err');
+    }
+  }
+
+  // ── Anexos e registros (fase 6) ────────────────────────────────────────────
+
+  String _attachError(String code) {
+    switch (code) {
+      case 'path_missing':
+        return 'A pasta não existe.';
+      case 'not_a_workspace':
+        return 'A pasta não é um workspace (falta .cc/workspace.yaml).';
+      case 'self':
+        return 'Esse é este próprio workspace (mesmo workspace_id): nada a anexar.';
+      case 'nested':
+        return 'A pasta contém, ou está dentro da pasta deste workspace.';
+      case 'invalid_yaml':
+        return 'O attached.yaml não é um YAML válido; nada foi gravado.';
+      case 'no_root':
+        return 'A pasta deste workspace não está acessível.';
+      default:
+        return 'Não foi possível anexar ($code).';
+    }
+  }
+
+  Future<void> _showAttachedWorkspacesDialog() async {
+    if (_workspaceId.isEmpty) return;
+    String modeText(String m) =>
+        m == 'mapped' ? 'mapeados' : (m == 'imported' ? 'importados' : 'separados');
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2124),
+        title: const Text('Attached workspaces',
+            style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 580,
+          child: ValueListenableBuilder<int>(
+            valueListenable: AttachedWorkspaces.instance.revision,
+            builder: (_, __, ___) {
+              final att = AttachedWorkspaces.instance;
+              return SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Anexos não são transitivos: os anexos de um workspace anexado '
+                      'não entram aqui, e cada workspace_id é anexado uma só vez. '
+                      'Os registros (predicados, tags, propriedades) são separados '
+                      'por padrão.',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    const SizedBox(height: 8),
+                    if (att.all.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text('Nenhum workspace anexado.',
+                            style: TextStyle(color: Colors.white38, fontSize: 13)),
+                      ),
+                    for (final a in att.all)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(children: [
+                          Icon(
+                            att.isOnline(a.workspaceId)
+                                ? Icons.cloud_queue_rounded
+                                : Icons.cloud_off_outlined,
+                            size: 16,
+                            color: att.isOnline(a.workspaceId)
+                                ? _RC.link
+                                : _RC.offline,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${a.label}  ·  ${a.mode}'
+                                  '${att.isOnline(a.workspaceId) ? '' : '  ·  workspace offline'}',
+                                  style: TextStyle(
+                                    color: att.isOnline(a.workspaceId)
+                                        ? Colors.white
+                                        : _RC.offline,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                Text(
+                                  '${a.path}  ·  registros ${modeText(att.registryMode(a.workspaceId))}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(color: Colors.white38, fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Comparar registros',
+                            icon: const Icon(Icons.compare_arrows_rounded, size: 18),
+                            color: Colors.white54,
+                            onPressed: att.isOnline(a.workspaceId)
+                                ? () => _showRegistryCompareDialog(a.workspaceId)
+                                : null,
+                          ),
+                          IconButton(
+                            tooltip: 'Desanexar',
+                            icon: const Icon(Icons.link_off_rounded, size: 18),
+                            color: Colors.white54,
+                            onPressed: () async {
+                              try {
+                                await att.detach(a.workspaceId);
+                              } catch (e) {
+                                debugPrint('detach ERROR: $e');
+                              }
+                              RelationIndex.touch();
+                              if (mounted) setState(() => _entityTabRefresh++);
+                            },
+                          ),
+                        ]),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton.icon(
+            onPressed: () async {
+              final dir = await FilePicker.platform.getDirectoryPath(
+                dialogTitle: 'Pasta do workspace a anexar',
+              );
+              if (dir == null || !mounted) return;
+              await _attachWorkspaceFlow(dir);
+            },
+            icon: const Icon(Icons.add_link_rounded, size: 16),
+            label: const Text('Attach workspace…'),
+          ),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
+  /// Anexa [dir] e, em seguida, compara os registros e oferece as opções.
+  Future<void> _attachWorkspaceFlow(String dir) async {
+    final att = AttachedWorkspaces.instance;
+    final insp = await att.inspect(dir);
+    final r = await att.attach(dir);
+    if (!mounted) return;
+    if (!r.ok) {
+      ScaffoldMessenger.maybeOf(context)
+          ?.showSnackBar(SnackBar(content: Text(_attachError(r.code))));
+      return;
+    }
+    RelationIndex.touch();
+    unawaited(_refreshEntityRefs(force: true));
+    await _showRegistryCompareDialog(r.item!.workspaceId, graph: insp);
+  }
+
+  /// Compara os registros daqui com os do anexo [wsId] e oferece: manter
+  /// separado (padrão), mapear equivalentes ou importar o que falta.
+  Future<void> _showRegistryCompareDialog(
+    String wsId, {
+    ({List<AttachedWorkspace> theirs, bool attachesUs, List<String> alsoOurs})? graph,
+  }) async {
+    final att = AttachedWorkspaces.instance;
+    final a = att.byId(wsId);
+    final root = att.rootIfOnline(wsId);
+    void snack(String m) =>
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(content: Text(m)));
+    if (a == null || root == null) {
+      snack('Workspace offline: não dá para comparar os registros agora.');
+      return;
+    }
+    final diff = await RegistryDiff.compute(
+      hereRoot: _wsRoot(_workspaceId),
+      thereRoot: root,
+    );
+    if (!mounted) return;
+    if (diff == null) {
+      snack('Um dos registros não é um YAML válido; nada foi comparado.');
+      return;
+    }
+    var mode = 'separate';
+    Widget line(String t, {Color c = Colors.white60}) => Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(t, style: TextStyle(color: c, fontSize: 12)),
+        );
+    String names(Iterable<String> l) {
+      final x = l.take(6).join(', ');
+      return l.length > 6 ? '$x…' : x;
+    }
+
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E2124),
+          title: Text('Registros de "${a.label}"',
+              style: const TextStyle(color: Colors.white, fontSize: 15)),
+          content: SizedBox(
+            width: 540,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (graph != null && graph.theirs.isNotEmpty)
+                    line(
+                        'Ele anexa ${graph.theirs.length} outro(s) workspace(s). Anexos não '
+                        'são transitivos: eles NÃO entram aqui'
+                        '${graph.alsoOurs.isEmpty ? '' : ' (${graph.alsoOurs.length} já está(ão) anexado(s) aqui; cada workspace_id vale uma vez)'}.',
+                        c: Colors.white54),
+                  if (graph != null && graph.attachesUs)
+                    line('Ele anexa este workspace (ciclo): ignorado, deduplicado por workspace_id.',
+                        c: Colors.white54),
+                  const SizedBox(height: 6),
+                  if (diff.identical)
+                    line('Os registros são compatíveis: nada a mapear nem importar.')
+                  else ...[
+                    line('Predicados: ${diff.predShared} em comum · ${diff.predOnlyThere.length} só no anexo'
+                        '${diff.predOnlyThere.isEmpty ? '' : ' (${names(diff.predOnlyThere.map((d) => d.id))})'}'
+                        ' · ${diff.predEquivalent.length} equivalente(s)'),
+                    if (diff.predEquivalent.isNotEmpty)
+                      line('   ${names(diff.predEquivalent.map((e) => '${e.$1.id} ≈ ${e.$2.id}'))}',
+                          c: Colors.white38),
+                    line('Tags: ${diff.tagShared} em comum · ${diff.tagOnlyThere.length} só no anexo'
+                        '${diff.tagOnlyThere.isEmpty ? '' : ' (${names(diff.tagOnlyThere.map((t) => (t['name'] ?? '').toString()))})'}'),
+                    line('Propriedades: ${diff.propShared} em comum · ${diff.propOnlyThere.length} só no anexo'
+                        '${diff.propOnlyThere.isEmpty ? '' : ' (${names(diff.propOnlyThere.map((d) => d.id))})'}'
+                        ' · ${diff.propEquivalent.length} equivalente(s)'),
+                    if (diff.propEquivalent.isNotEmpty)
+                      line('   ${names(diff.propEquivalent.map((e) => '${e.$1.id} ≈ ${e.$2.id}'))}',
+                          c: Colors.white38),
+                  ],
+                  const SizedBox(height: 10),
+                  RadioListTile<String>(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: 'separate',
+                    groupValue: mode,
+                    onChanged: (v) => setD(() => mode = v ?? mode),
+                    title: const Text('Manter separado (padrão)',
+                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                    subtitle: const Text(
+                        'Cada workspace usa os seus. Relações do anexo mostram o nome gravado.',
+                        style: TextStyle(color: Colors.white38, fontSize: 11)),
+                  ),
+                  RadioListTile<String>(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: 'map',
+                    groupValue: mode,
+                    onChanged: diff.hasEquivalents ? (v) => setD(() => mode = v ?? mode) : null,
+                    title: const Text('Mapear equivalentes',
+                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                    subtitle: const Text(
+                        'Ids diferentes com o mesmo rótulo passam a valer como um só '
+                        '(no índice e ao mover itens).',
+                        style: TextStyle(color: Colors.white38, fontSize: 11)),
+                  ),
+                  RadioListTile<String>(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: 'import',
+                    groupValue: mode,
+                    onChanged: diff.hasMissing ? (v) => setD(() => mode = v ?? mode) : null,
+                    title: const Text('Importar o que falta',
+                        style: TextStyle(color: Colors.white70, fontSize: 13)),
+                    subtitle: const Text(
+                        'Copia para cá os predicados, tags e propriedades que só o anexo tem '
+                        '(nunca sobrescreve os daqui; equivalentes ficam mapeados).',
+                        style: TextStyle(color: Colors.white38, fontSize: 11)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Later')),
+            TextButton(onPressed: () => Navigator.of(ctx).pop(mode), child: const Text('Apply')),
+          ],
+        );
+      }),
+    );
+    if (choice == null || !mounted) return;
+    final now = DateTime.now().toUtc().toIso8601String();
+    final eqPred = <String, String>{for (final e in diff.predEquivalent) e.$1.id: e.$2.id};
+    final eqProp = <String, String>{for (final e in diff.propEquivalent) e.$1.id: e.$2.id};
+    try {
+      switch (choice) {
+        case 'map':
+          await att.setRegistryChoice(wsId, <String, dynamic>{
+            'mode': 'mapped',
+            'predicates': eqPred,
+            'properties': eqProp,
+            'at': now,
+          });
+          snack('Mapeados: ${eqPred.length} predicado(s), ${eqProp.length} propriedade(s).');
+        case 'import':
+          final n = await _importRegistries(diff);
+          await att.setRegistryChoice(wsId, <String, dynamic>{
+            'mode': 'imported',
+            'predicates': eqPred,
+            'properties': eqProp,
+            'imported': <String, dynamic>{
+              'predicates': n.predicates,
+              'tags': n.tags,
+              'properties': n.properties,
+            },
+            'at': now,
+          });
+          snack('Importados: ${n.predicates} predicado(s), ${n.tags} tag(s), '
+              '${n.properties} propriedade(s).');
+        default:
+          await att.setRegistryChoice(wsId, <String, dynamic>{'mode': 'separate', 'at': now});
+          snack('Registros mantidos separados.');
+      }
+    } catch (e) {
+      debugPrint('registry choice ERROR: $e');
+      snack('Não foi possível gravar a escolha: $e');
+    }
+    RelationIndex.touch();
+    if (mounted) setState(() => _entityTabRefresh++);
+  }
+
+  /// Copia para este workspace o que só o anexo tem. Nunca sobrescreve.
+  Future<({int predicates, int tags, int properties})> _importRegistries(
+    RegistryDiff d,
+  ) async {
+    var np = 0;
+    var nt = 0;
+    var npr = 0;
+    for (final def in d.predOnlyThere) {
+      if (PredicateRegistry.instance.isDefined(def.id)) continue;
+      await PredicateRegistry.instance.upsert(def);
+      np++;
+    }
+    for (final def in d.propOnlyThere) {
+      if (PropertyRegistry.instance.isDefined(def.id)) continue;
+      await PropertyRegistry.instance.upsert(def);
+      npr++;
+    }
+    final store = _ensureFilesController()?.store;
+    if (store != null) {
+      for (final t in d.tagOnlyThere) {
+        final name = (t['name'] ?? '').toString().trim();
+        if (name.isEmpty || store.tagByName(name) != null) continue;
+        final gname = (d.thereGroups[(t['group'] ?? '').toString()] ?? '').trim();
+        String? gid;
+        if (gname.isNotEmpty) {
+          for (final g in store.groups) {
+            if (g.name.toLowerCase() == gname.toLowerCase()) gid = g.id;
+          }
+          gid ??= store.createGroup(gname).id;
+        }
+        store.createTag(name, color: FilesMetaStore._parseColor(t['color']), groupId: gid);
+        nt++;
+      }
+    }
+    return (predicates: np, tags: nt, properties: npr);
+  }
+
+  // ── Mover entre workspaces (fase 6) ────────────────────────────────────────
+
+  Future<void> _moveToWorkspace(String absPath) async {
+    if (_workspaceId.isEmpty) return;
+    final att = AttachedWorkspaces.instance;
+    final targets = <AttachedWorkspace>[
+      for (final a in att.all)
+        if (att.canWrite(a.workspaceId)) a,
+    ];
+    void snack(String m) =>
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(content: Text(m)));
+    if (targets.isEmpty) {
+      snack('Nenhum workspace anexado está online e de escrita.');
+      return;
+    }
+    AttachedWorkspace? dest = targets.first;
+    if (targets.length > 1) {
+      dest = await showDialog<AttachedWorkspace>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          backgroundColor: const Color(0xFF1E2124),
+          title: const Text('Move to workspace',
+              style: TextStyle(color: Colors.white, fontSize: 15)),
+          children: [
+            for (final a in targets)
+              SimpleDialogOption(
+                onPressed: () => Navigator.of(ctx).pop(a),
+                child: Text(a.label, style: const TextStyle(color: Colors.white70)),
+              ),
+          ],
+        ),
+      );
+    }
+    if (dest == null || !mounted) return;
+
+    final plan = await WorkspaceMove.plan(
+      srcPath: absPath,
+      srcFilesDir: _wsFilesDir(_workspaceId),
+      srcWsId: _workspaceId,
+      dest: dest,
+      srcStore: _filesController?.store,
+    );
+    if (!mounted) return;
+    if (plan.blocker != null) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF1E2124),
+          title: const Text('Não é possível mover',
+              style: TextStyle(color: Colors.white, fontSize: 15)),
+          content: Text(plan.blocker!,
+              style: const TextStyle(color: Colors.white70, fontSize: 13)),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('OK')),
+          ],
+        ),
+      );
+      return;
+    }
+    final dangling = await _danglingIncomingLines([absPath]);
+    if (!mounted) return;
+    final choice = await _showMoveConfirmDialog(plan, dangling);
+    if (choice == null || !mounted) return;
+
+    final step = ValueNotifier<String>('Preparando…');
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2124),
+        content: Row(children: [
+          const SizedBox(
+              width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+          const SizedBox(width: 14),
+          ValueListenableBuilder<String>(
+            valueListenable: step,
+            builder: (_, v, __) =>
+                Text(v, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+          ),
+        ]),
+      ),
+    ));
+    final res = await WorkspaceMove.execute(
+      plan,
+      destName: choice.name,
+      regenerateIds: choice.newIds,
+      progress: (v) => step.value = v,
+    );
+    if (mounted) Navigator.of(context, rootNavigator: true).pop(); // progresso
+
+    RelationIndex.invalidate();
+    _entityTabFutures.clear();
+    _entityBadges.clear();
+    if (mounted) {
+      setState(() {
+        _entityTabRefresh++;
+        if (res.sourceRemoved) {
+          _visualizerSelectedPath = '';
+          _visualizerMdContent = '';
+        }
+      });
+    }
+    unawaited(_refreshEntityRefs(force: true));
+    await _loadVisualizerChildren();
+    if (!mounted) return;
+    if (res.ok && res.notes.isEmpty) {
+      snack(res.message);
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2124),
+        title: Text(res.ok ? res.message : 'Não foi movido',
+            style: const TextStyle(color: Colors.white, fontSize: 15)),
+        content: SizedBox(
+          width: 480,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (!res.ok)
+                  Text(res.message,
+                      style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                for (final n in res.notes)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text('• $n',
+                        style: const TextStyle(color: Colors.white60, fontSize: 12)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
+  /// Confirmação: o que será importado, ids em colisão, nome (renomear se já
+  /// existir) e as relações de entrada que ficariam sem alvo.
+  Future<({String name, bool newIds})?> _showMoveConfirmDialog(
+    MovePlan plan,
+    List<String> dangling,
+  ) {
+    final ctrl = TextEditingController(
+      text: plan.collision ? plan.suggestedName : plan.name,
+    );
+    bool newIds = plan.idClashes.isNotEmpty;
+    return showDialog<({String name, bool newIds})>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) {
+        final err = WorkspaceMove.nameError(plan, ctrl.text);
+        Widget line(String t, {Color c = Colors.white60}) => Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(t, style: TextStyle(color: c, fontSize: 12)),
+            );
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E2124),
+          title: Text('Mover "${plan.name}" para "${plan.destWsLabel}"',
+              style: const TextStyle(color: Colors.white, fontSize: 15)),
+          content: SizedBox(
+            width: 500,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  line('${plan.files} arquivo(s), ${(plan.bytes / 1024).toStringAsFixed(1)} KB. '
+                      'Copia, confere, grava e só então apaga a origem.'),
+                  if (plan.collision)
+                    line('Já existe "${plan.name}" no destino. Renomeie para continuar.',
+                        c: _RC.warn),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: ctrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    decoration: InputDecoration(
+                      labelText: 'Nome no destino',
+                      errorText: err,
+                      isDense: true,
+                    ),
+                    onChanged: (_) => setD(() {}),
+                  ),
+                  if (plan.missingPredicates.isNotEmpty)
+                    line('Predicados a importar: ${plan.missingPredicates.join(', ')}'),
+                  if (plan.missingTags.isNotEmpty)
+                    line('Tags a importar: ${plan.missingTags.join(', ')}'),
+                  if (plan.idClashes.isNotEmpty) ...[
+                    line(
+                        '${plan.idClashes.length} id(s) já existem no destino '
+                        '(${plan.idClashes.take(3).map((c) => c.id).join(', ')}'
+                        '${plan.idClashes.length > 3 ? '…' : ''}). '
+                        'O item movido receberá ids novos.',
+                        c: _RC.warn),
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: newIds,
+                      onChanged: null, // obrigatório com colisão
+                      title: const Text('Gerar ids novos',
+                          style: TextStyle(color: Colors.white70, fontSize: 12)),
+                    ),
+                  ],
+                  if (dangling.isNotEmpty)
+                    line(
+                        danglingSummary(dangling) +
+                            '\n(as relações de entrada não são reescritas)',
+                        c: _RC.warn),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            TextButton(
+              onPressed: err != null
+                  ? null
+                  : () => Navigator.of(ctx).pop((name: ctrl.text.trim(), newIds: newIds)),
+              child: const Text('Move'),
+            ),
+          ],
+        );
+      }),
+    );
+  }
+
+  /// Aplica a fila `.cc/pending/` aos workspaces que estão online (e de
+  /// escrita). Um workspace que acabou de conectar recebe o que esperava.
+  Future<void> _applyPendingRelations() async {
+    try {
+      final r = await PendingRelations.instance.applyOnline();
+      if (r.applied == 0 && r.notApplicable == 0) return;
+      RelationIndex.touch();
+      if (!mounted) return;
+      setState(() => _entityTabRefresh++);
+      final parts = <String>[
+        if (r.applied > 0) '${r.applied} relação(ões) pendente(s) aplicada(s)',
+        if (r.notApplicable > 0) '${r.notApplicable} não aplicável(is)',
+      ];
+      ScaffoldMessenger.maybeOf(context)
+          ?.showSnackBar(SnackBar(content: Text(parts.join(' · '))));
+      unawaited(_refreshEntityRefs(force: true));
+    } catch (e) {
+      debugPrint('_applyPendingRelations ERROR: $e');
     }
   }
 
@@ -5790,6 +6544,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
     if (!mounted) return;
     RelationIndex.touch();
     setState(() => _entityTabRefresh++);
+    unawaited(_applyPendingRelations());
     unawaited(_refreshEntityRefs(force: true));
   }
 
@@ -33058,6 +33813,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
           height: 36,
           child: _vizFileMenuRow(Icons.delete_outline_rounded, 'Delete', Colors.redAccent),
         ),
+        PopupMenuItem<String>(
+          value: 'move_ws',
+          height: 36,
+          child: _vizFileMenuRow(
+              Icons.drive_file_move_outline, 'Move to workspace…', Colors.white70),
+        ),
         const PopupMenuDivider(height: 1),
         PopupMenuItem<String>(
           value: 'reveal',
@@ -33099,6 +33860,9 @@ class _ResizableScreenState extends State<ResizableScreen> {
         break;
       case 'delete':
         await _confirmDeleteVisualizerEntry(cat, name, isDir, absPath);
+        break;
+      case 'move_ws':
+        await _moveToWorkspace(absPath);
         break;
       case 'reveal':
         _revealInFileManager(isDir ? absPath : '$filesRoot/$cat');
@@ -33174,6 +33938,12 @@ class _ResizableScreenState extends State<ResizableScreen> {
             child: _vizFileMenuRow(
                 Icons.delete_outline_rounded, 'Delete', Colors.redAccent),
           ),
+          PopupMenuItem<String>(
+            value: 'move_ws',
+            height: 36,
+            child: _vizFileMenuRow(
+                Icons.drive_file_move_outline, 'Move to workspace…', Colors.white70),
+          ),
         ],
         const PopupMenuDivider(height: 1),
         PopupMenuItem<String>(
@@ -33200,6 +33970,8 @@ class _ResizableScreenState extends State<ResizableScreen> {
         await _loadVisualizerChildren();
       case 'rename':
         _startInlineRename(path, name);
+      case 'move_ws':
+        await _moveToWorkspace(absPath);
       case 'delete':
         await _confirmDeleteVisualizerEntry(cat, name, true, absPath);
       case 'reveal':
@@ -34376,6 +35148,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
       }
       _refsEntitiesAt = DateTime.now();
       if (mounted) _refs.setEntityDocs(docs);
+      unawaited(_runWorkspaceAudit());
     } catch (e) {
       debugPrint('_refreshEntityRefs ERROR: $e');
     } finally {
@@ -35291,7 +36064,10 @@ class _ResizableScreenState extends State<ResizableScreen> {
                 includeForeign: true,
               );
         final hasMentions = mentionId != null && idx.mentionedIn(mentionId).isNotEmpty;
-        if (list.isEmpty && !hasMentions) {
+        final naItems = mentionId == null
+            ? const <PendingItem>[]
+            : PendingRelations.instance.notApplicableFor(mentionId);
+        if (list.isEmpty && !hasMentions && naItems.isEmpty) {
           return _entityTabEmpty(Icons.hub_outlined, emptyMsg);
         }
         return ListView(children: [
@@ -35308,6 +36084,7 @@ class _ResizableScreenState extends State<ResizableScreen> {
               ]),
             ),
           for (final v in list) _relationRow(v),
+          for (final it in naItems) _pendingNotApplicableRow(it),
           if (mentionId != null)
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 8, 12, 12),
@@ -35370,13 +36147,40 @@ class _ResizableScreenState extends State<ResizableScreen> {
       subtitle: subtitle,
       titleColor: titleColor,
       subtitleColor: subtitleColor,
-      badge: v.label,
+      badge: v.source == RelSource.pending ? 'pendente · ${v.label}' : v.label,
       trailing: Icon(
         v.incoming ? Icons.call_received_rounded : Icons.call_made_rounded,
         size: 14,
         color: Colors.white30,
       ),
       onTap: otherRel == null ? null : () => _navigateToEntity(otherRel),
+    );
+  }
+
+  /// Entradas da fila que a interface mostra como "não aplicável": o dono
+  /// sumiu do workspace de destino. Ficam guardadas até o usuário descartar.
+  Widget _pendingNotApplicableRow(PendingItem it) {
+    final ws = it.owner.ws;
+    final wsLabel = AttachedWorkspaces.instance.byId(ws)?.label ?? ws;
+    final reg = PredicateRegistry.instance;
+    return _entityListRow(
+      icon: Icons.warning_amber_rounded,
+      title: '${reg.label(it.rel.pred, fallback: it.rel.predName)} · dono ${it.owner.id}',
+      subtitle: 'não aplicável: o dono não existe mais em $wsLabel',
+      titleColor: _RC.warn,
+      subtitleColor: _RC.warn,
+      badge: 'pendente',
+      trailing: InkWell(
+        onTap: () async {
+          await PendingRelations.instance.discard(it.key);
+          RelationIndex.touch();
+          if (mounted) setState(() => _entityTabRefresh++);
+        },
+        child: const Padding(
+          padding: EdgeInsets.all(4),
+          child: Icon(Icons.close_rounded, size: 15, color: Colors.white30),
+        ),
+      ),
     );
   }
 
@@ -39680,6 +40484,17 @@ class _ResizableScreenState extends State<ResizableScreen> {
                   _saveWorkspace();
                   _saveGeneral();
                 },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _workspaceId.isEmpty ? null : _showAttachedWorkspacesDialog,
+                  icon: const Icon(Icons.link_rounded, size: 16),
+                  label: const Text('Attached workspaces…'),
+                ),
               ),
             ),
           ],
@@ -85763,6 +86578,10 @@ enum RelSource {
 
   /// Relação de saída lida do cache local de outro workspace (fase 6).
   cache,
+
+  /// Relação na fila `.cc/pending/`: o dono está num workspace offline e ela
+  /// só será gravada lá quando ele conectar.
+  pending,
 }
 
 /// Uma aresta como foi gravada: de [fromKey] para [rel].ref.
@@ -86178,9 +86997,17 @@ class RelationIndex {
     void Function(String, CcRelation, RelSource) addEdge,
   ) async {
     if (CcData.workspaceId.isEmpty) return;
+    // Relações na fila (dono offline): aparecem como saídas do dono em cache.
+    final queued = <PendingItem>[
+      for (final it in PendingRelations.instance.all)
+        if (it.applicable) it,
+    ];
     for (final a in AttachedWorkspaces.instance.all) {
       final snap = await WorkspaceIndexCache.load(a.workspaceId);
       if (snap == null) continue;
+      // Registros separados por padrão; com "mapear", o predicado do anexo
+      // vira o equivalente daqui (rótulo e inverso passam a valer).
+      final pmap = AttachedWorkspaces.instance.predicateMap(a.workspaceId);
       for (final e in snap.entries) {
         final key = 'ws:${a.workspaceId}:${e.id}';
         nodes.putIfAbsent(
@@ -86198,7 +87025,7 @@ class RelationIndex {
           addEdge(
             key,
             CcRelation(
-              pred: r.pred,
+              pred: pmap[r.pred] ?? r.pred,
               predName: r.predName,
               ref: CcRef(r.id, r.ws),
               status: r.status,
@@ -86208,6 +87035,10 @@ class RelationIndex {
           );
         }
       }
+    }
+    for (final it in queued) {
+      final key = 'ws:${it.owner.ws}:${it.owner.id}';
+      if (nodes.containsKey(key)) addEdge(key, it.rel, RelSource.pending);
     }
   }
 
@@ -93182,6 +94013,13 @@ class CcData {
     );
   }
 
+  /// Entidade: sidecar por id (`.cc/<id>.yaml`) ao lado da âncora.
+  static CcTarget forEntity(String anchorPath, String id, String name) =>
+      CcTarget(
+        idKeyedFile(_dirOf(anchorPath), id),
+        <String, dynamic>{'title': name, 'kind': 'entity', 'bind': 'id', 'id': id},
+      );
+
   /// Nota .md: sidecar por id (`.cc/<id>.yaml`). Com [create], um .md sem id
   /// ganha um (gravado no frontmatter) e absorve o sidecar por nome que já
   /// tivesse (tags etc.). Sem [create] e sem id, devolve o alvo por nome.
@@ -94182,6 +95020,1483 @@ class WorkspaceIndexCache {
     if (s == null) return load(a.workspaceId);
     await save(s);
     return s;
+  }
+}
+
+// ── Fase 6: fila de relações pendentes — `.cc/pending/<workspace_dono>.yaml` ─
+//
+//   schema: 1
+//   owner_ws: "<workspace do dono>"
+//   items: [ { key, owner: {id, ws}, relation: {pred, ref: {id, ws}, ...},
+//              created, updated, status: pending | nao_aplicavel, reason } ]
+//
+// Uma relação mora no sidecar do DONO. Se o dono está num workspace anexado
+// que não está montado, a relação não pode ser gravada lá: fica aqui, no
+// workspace que a originou (viaja com ele), e é aplicada quando o outro
+// workspace conecta. A aplicação é por relação (`CcData.addRelation` troca só
+// a aresta de mesmo predicado+alvo; o resto do sidecar não é tocado). Se o
+// dono sumiu do workspace de destino, a entrada vira `nao_aplicavel` e
+// continua guardada: só o usuário a descarta.
+
+class PendingItem {
+  static const String stPending = 'pending';
+  static const String stNotApplicable = 'nao_aplicavel';
+
+  final String key;
+  final CcRef owner;
+  final CcRelation rel;
+  final String created;
+  String updated;
+  String status;
+  String reason;
+
+  PendingItem({
+    required this.key,
+    required this.owner,
+    required this.rel,
+    required this.created,
+    String? updated,
+    this.status = stPending,
+    this.reason = '',
+  }) : updated = updated ?? created;
+
+  bool get applicable => status != stNotApplicable;
+
+  /// Identidade da aresta (dono + predicado + alvo): é a chave de merge.
+  static String keyOf(CcRef owner, CcRelation r) =>
+      '${owner.ws}|${owner.id}|${r.pred}|${r.ref.ws}|${r.ref.id}';
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'key': key,
+        'owner': owner.toJson(),
+        'relation': rel.toJson(),
+        'created': created,
+        'updated': updated,
+        'status': status,
+        if (reason.isNotEmpty) 'reason': reason,
+      };
+
+  static PendingItem? fromJson(Object? v) {
+    if (v is! Map) return null;
+    final owner = CcRef.parse(v['owner']);
+    final rel = CcRelation.parse(v['relation']);
+    if (owner == null || rel == null || owner.ws.isEmpty) return null;
+    final created = (v['created'] ?? '').toString();
+    final st = (v['status'] ?? stPending).toString();
+    return PendingItem(
+      key: keyOf(owner, rel),
+      owner: owner,
+      rel: rel,
+      created: created,
+      updated: (v['updated'] ?? '').toString().isEmpty ? created : v['updated'].toString(),
+      status: st == stNotApplicable ? stNotApplicable : stPending,
+      reason: (v['reason'] ?? '').toString(),
+    );
+  }
+}
+
+enum PendingSubmit {
+  /// O workspace do dono estava online: gravada direto.
+  applied,
+
+  /// Offline: guardada na fila.
+  queued,
+
+  /// Online, mas o dono não existe lá: nada foi gravado nem guardado.
+  ownerMissing,
+
+  /// Online, mas anexado como somente leitura.
+  readOnly,
+
+  /// O workspace do dono não está anexado a este.
+  notAttached,
+}
+
+class PendingApplyReport {
+  int applied = 0;
+  int notApplicable = 0;
+}
+
+class PendingRelations {
+  PendingRelations._();
+  static final PendingRelations instance = PendingRelations._();
+
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+  String _root = '';
+  final Map<String, List<PendingItem>> _byWs = <String, List<PendingItem>>{};
+  final Set<String> _invalid = <String>{};
+  bool _applying = false;
+
+  void _bump() => revision.value++;
+
+  File _fileFor(String ws) =>
+      File('$_root/${CcData.dirName}/pending/${CcData.safeId(ws)}.yaml');
+
+  List<PendingItem> get all => <PendingItem>[
+        for (final l in _byWs.values) ...l,
+      ];
+
+  List<PendingItem> forOwnerWs(String ws) =>
+      List<PendingItem>.unmodifiable(_byWs[ws] ?? const <PendingItem>[]);
+
+  /// Entradas "não aplicáveis" cujo alvo é a entidade [entityId] deste workspace.
+  List<PendingItem> notApplicableFor(String entityId) => <PendingItem>[
+        for (final it in all)
+          if (!it.applicable &&
+              it.rel.ref.id == entityId &&
+              (it.rel.ref.ws.isEmpty || it.rel.ref.ws == CcData.workspaceId))
+            it,
+      ];
+
+  /// Junta por relação: a mesma aresta (dono+predicado+alvo) fica uma vez, com
+  /// a versão mais recente (`updated`).
+  static List<PendingItem> merge(Iterable<PendingItem> a, Iterable<PendingItem> b) {
+    final m = <String, PendingItem>{};
+    for (final it in [...a, ...b]) {
+      final prev = m[it.key];
+      if (prev == null || it.updated.compareTo(prev.updated) >= 0) m[it.key] = it;
+    }
+    return m.values.toList();
+  }
+
+  static List<PendingItem> _parse(Map<String, dynamic> m) {
+    final list = m['items'];
+    return <PendingItem>[
+      if (list is List)
+        for (final x in list)
+          if (PendingItem.fromJson(x) != null) PendingItem.fromJson(x)!,
+    ];
+  }
+
+  /// Lê `.cc/pending/*.yaml` do workspace [root]. Não cria nada.
+  Future<void> load(String root) async {
+    _root = root;
+    _byWs.clear();
+    _invalid.clear();
+    try {
+      final d = Directory('$root/${CcData.dirName}/pending');
+      if (await d.exists()) {
+        await for (final e in d.list(followLinks: false)) {
+          if (e is! File || !e.path.endsWith('.yaml')) continue;
+          final m = await CcData.readYamlOrNull(e);
+          if (m == null) {
+            _invalid.add(e.path); // nada é gravado por cima
+            continue;
+          }
+          final ws = (m['owner_ws'] ?? '').toString();
+          final items = _parse(m).where((i) => i.owner.ws == ws || ws.isEmpty);
+          for (final it in items) {
+            _byWs[it.owner.ws] = merge(_byWs[it.owner.ws] ?? const <PendingItem>[], [it]);
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('PendingRelations.load: $e');
+    }
+    _bump();
+  }
+
+  /// Lê o arquivo do disco, aplica [edit] e regrava (sob lock). O disco é a
+  /// fonte da verdade: outra máquina pode ter mudado o arquivo.
+  Future<void> _mutate(String ws, void Function(List<PendingItem> l) edit) async {
+    if (_root.isEmpty) throw StateError('PendingRelations: workspace não carregado');
+    final f = _fileFor(ws);
+    if (_invalid.contains(f.path)) throw CcInvalidYamlException(f.path);
+    await CcLocks.run(f.path, () async {
+      var list = <PendingItem>[];
+      if (await f.exists()) {
+        final m = await CcData.readYamlOrNull(f);
+        if (m == null) {
+          _invalid.add(f.path);
+          throw CcInvalidYamlException(f.path);
+        }
+        list = merge(_parse(m), const <PendingItem>[]);
+      }
+      edit(list);
+      if (list.isEmpty) {
+        if (await f.exists()) {
+          await f.delete();
+          await CcData.pruneDir(f.parent);
+        }
+        _byWs.remove(ws);
+      } else {
+        await CcData.writeYaml(f, <String, dynamic>{
+          'schema': 1,
+          'owner_ws': ws,
+          'items': [for (final i in list) i.toJson()],
+        });
+        _byWs[ws] = list;
+      }
+    });
+    _bump();
+  }
+
+  /// Dono (entidade) → alvo do sidecar, no workspace [root] anexado. `null`
+  /// se o registro de tipos de lá não carregou (não dá para afirmar que o
+  /// dono sumiu).
+  static Future<Map<String, CcTarget>?> _ownerTargets(String root) async {
+    try {
+      final gen = '$root/files/generalized';
+      final reg = await EntityTypeRegistry.load('$gen/.types');
+      if (reg.rootTypes.isEmpty) return null;
+      final idx = await EntityIndex.build(EntityLocator(reg, gen));
+      return <String, CcTarget>{
+        for (final e in idx.entries) e.id: CcData.forEntity(e.anchorPath, e.id, e.name),
+      };
+    } catch (e) {
+      debugPrint('PendingRelations._ownerTargets: $e');
+      return null;
+    }
+  }
+
+  /// Grava [rel] como relação de saída do dono [owner], que mora em outro
+  /// workspace. Online (e de escrita): grava lá. Offline: entra na fila.
+  Future<PendingSubmit> submit(CcRef owner, CcRelation rel) async {
+    if (owner.ws.isEmpty || owner.ws == CcData.workspaceId) {
+      throw ArgumentError('dono deste workspace não usa a fila');
+    }
+    final att = AttachedWorkspaces.instance;
+    if (att.byId(owner.ws) == null) return PendingSubmit.notAttached;
+    final root = att.rootIfOnline(owner.ws);
+    if (root != null) {
+      if (!att.canWrite(owner.ws)) return PendingSubmit.readOnly;
+      final targets = await _ownerTargets(root);
+      final t = targets?[owner.id];
+      if (t == null) return PendingSubmit.ownerMissing;
+      await CcData.addRelation(t, rel, validate: false);
+      RelationIndex.touch();
+      return PendingSubmit.applied;
+    }
+    final now = DateTime.now().toUtc().toIso8601String();
+    final key = PendingItem.keyOf(owner, rel);
+    await _mutate(owner.ws, (l) {
+      l.removeWhere((i) => i.key == key);
+      l.add(PendingItem(key: key, owner: owner, rel: rel, created: now));
+    });
+    RelationIndex.touch();
+    return PendingSubmit.queued;
+  }
+
+  /// Aplica a fila dos workspaces online e de escrita. Relação a relação: o
+  /// que foi gravado sai da fila; dono ausente marca `nao_aplicavel` (sem
+  /// apagar); erro de gravação mantém a entrada para a próxima conexão.
+  Future<PendingApplyReport> applyOnline() async {
+    final rep = PendingApplyReport();
+    if (_applying) return rep;
+    _applying = true;
+    try {
+      final att = AttachedWorkspaces.instance;
+      for (final ws in _byWs.keys.toList()) {
+        final root = att.rootIfOnline(ws);
+        if (root == null || !att.canWrite(ws)) continue;
+        final items = List<PendingItem>.of(_byWs[ws] ?? const <PendingItem>[]);
+        if (items.isEmpty) continue;
+        final targets = await _ownerTargets(root);
+        if (targets == null) continue;
+        final done = <String>{};
+        final gone = <String>{};
+        for (final it in items) {
+          final t = targets[it.owner.id];
+          if (t == null) {
+            if (it.applicable) gone.add(it.key);
+            continue;
+          }
+          try {
+            await CcData.addRelation(t, it.rel, validate: false);
+            done.add(it.key);
+          } catch (e) {
+            debugPrint('PendingRelations.apply(${it.key}): $e');
+          }
+        }
+        if (done.isEmpty && gone.isEmpty) continue;
+        final now = DateTime.now().toUtc().toIso8601String();
+        await _mutate(ws, (l) {
+          l.removeWhere((i) => done.contains(i.key));
+          for (final i in l) {
+            if (gone.contains(i.key)) {
+              i.status = PendingItem.stNotApplicable;
+              i.reason = 'dono_ausente';
+              i.updated = now;
+            }
+          }
+        });
+        rep.applied += done.length;
+        rep.notApplicable += gone.length;
+      }
+    } finally {
+      _applying = false;
+    }
+    return rep;
+  }
+
+  /// O usuário descarta uma entrada (única forma de apagar da fila).
+  Future<void> discard(String key) async {
+    for (final ws in _byWs.keys.toList()) {
+      if ((_byWs[ws] ?? const <PendingItem>[]).any((i) => i.key == key)) {
+        await _mutate(ws, (l) => l.removeWhere((i) => i.key == key));
+        return;
+      }
+    }
+  }
+}
+
+// ── Fase 6: workspace duplicado e ids duplicados entre workspaces ───────────
+//
+//  • Workspace duplicado: o mesmo `workspace_id` (`.cc/workspace.yaml`) em
+//    dois caminhos (pasta copiada, anexo apontando para uma cópia, HD clonado).
+//    Dois caminhos com o mesmo id divergem em silêncio: o app só avisa, nunca
+//    mexe no manifesto de nenhum deles.
+//  • Ids duplicados: a mesma entidade (id) em dois workspaces. Vem do cache
+//    local do índice, então vale também com o outro workspace offline.
+
+class DuplicateWorkspaceFinding {
+  final String workspaceId;
+  final List<String> paths;
+  final List<String> labels;
+  const DuplicateWorkspaceFinding(this.workspaceId, this.paths, this.labels);
+}
+
+class DupIdOccurrence {
+  final String wsId, wsLabel, title, type;
+  final bool local;
+  const DupIdOccurrence({
+    required this.wsId,
+    required this.wsLabel,
+    required this.title,
+    required this.type,
+    required this.local,
+  });
+}
+
+class DuplicateIdFinding {
+  final String id;
+  final List<DupIdOccurrence> where;
+  const DuplicateIdFinding(this.id, this.where);
+}
+
+class WorkspaceAuditReport {
+  final List<DuplicateWorkspaceFinding> workspaces;
+  final List<DuplicateIdFinding> ids;
+  const WorkspaceAuditReport(this.workspaces, this.ids);
+  static const WorkspaceAuditReport empty = WorkspaceAuditReport(
+    <DuplicateWorkspaceFinding>[],
+    <DuplicateIdFinding>[],
+  );
+  bool get isEmpty => workspaces.isEmpty && ids.isEmpty;
+
+  /// Muda quando o conjunto de achados muda (para não repetir o aviso).
+  String get signature =>
+      '${workspaces.map((w) => '${w.workspaceId}:${w.paths.join(',')}').join(';')}'
+      '|${ids.map((i) => i.id).join(',')}';
+}
+
+class WorkspaceAudit {
+  static String _canon(String p) {
+    var s = AttachedWorkspaces.normPath(p);
+    try {
+      s = Directory(s).resolveSymbolicLinksSync().replaceAll('\\', '/');
+    } catch (_) {}
+    return s;
+  }
+
+  /// Caminhos (rótulo + raiz) cujo manifesto declara o mesmo `workspace_id`.
+  /// Só lê manifestos; nunca cria nada.
+  static Future<List<DuplicateWorkspaceFinding>> duplicateWorkspaces(
+    List<({String label, String path})> candidates,
+  ) async {
+    final byId = <String, Map<String, String>>{};
+    for (final c in candidates) {
+      if (c.path.trim().isEmpty) continue;
+      final mf = await WorkspaceManifest.read(c.path);
+      if (mf == null) continue;
+      (byId[mf.id] ??= <String, String>{})[_canon(c.path)] = c.label;
+    }
+    return <DuplicateWorkspaceFinding>[
+      for (final e in byId.entries)
+        if (e.value.length > 1)
+          DuplicateWorkspaceFinding(
+            e.key,
+            e.value.keys.toList(),
+            e.value.values.toList(),
+          ),
+    ];
+  }
+
+  /// Ids de entidade presentes em mais de um workspace (este + anexados),
+  /// segundo o cache local do índice.
+  static Future<List<DuplicateIdFinding>> duplicateIds(
+    String localId,
+    String localLabel,
+  ) async {
+    final seen = <String, List<DupIdOccurrence>>{};
+    void add(WorkspaceIndexSnapshot s, String label, bool local) {
+      for (final e in s.entries) {
+        (seen[e.id] ??= <DupIdOccurrence>[]).add(DupIdOccurrence(
+          wsId: s.wsId,
+          wsLabel: label,
+          title: e.title,
+          type: e.typeLabel.isNotEmpty ? e.typeLabel : e.type,
+          local: local,
+        ));
+      }
+    }
+
+    if (localId.isNotEmpty) {
+      final own = await WorkspaceIndexCache.load(localId);
+      if (own != null) add(own, localLabel, true);
+    }
+    for (final a in AttachedWorkspaces.instance.all) {
+      if (a.workspaceId == localId) continue;
+      final snap = await WorkspaceIndexCache.load(a.workspaceId);
+      if (snap != null) add(snap, a.label, false);
+    }
+    final out = <DuplicateIdFinding>[];
+    for (final e in seen.entries) {
+      final wss = <String>{for (final o in e.value) o.wsId};
+      if (wss.length > 1) out.add(DuplicateIdFinding(e.key, e.value));
+    }
+    out.sort((a, b) => a.id.compareTo(b.id));
+    return out;
+  }
+
+  static Future<WorkspaceAuditReport> run({
+    required String localId,
+    required String localLabel,
+    required String localRoot,
+    required List<({String label, String path})> saved,
+  }) async {
+    final att = AttachedWorkspaces.instance;
+    final cands = <({String label, String path})>[
+      (label: localLabel, path: localRoot),
+      ...saved,
+      for (final a in att.all)
+        if (att.mountOf(a.workspaceId).online ||
+            att.mountOf(a.workspaceId).reason == 'id_mismatch')
+          (label: a.label, path: a.path),
+    ];
+    final ws = await duplicateWorkspaces(cands);
+    final ids = await duplicateIds(localId, localLabel);
+    return WorkspaceAuditReport(ws, ids);
+  }
+}
+
+// ── Fase 6: comparar registros na anexação ──────────────────────────────────
+//
+// Registros (predicados, tags, propriedades) são SEPARADOS por padrão. Ao
+// anexar, compara-se o registro daqui com o do anexo:
+//   • em comum        — mesmo id (tags: mesmo nome);
+//   • só no anexo     — ids que não existem aqui;
+//   • equivalentes    — ids diferentes com o mesmo rótulo (predicados e
+//                       propriedades): candidatos a mapeamento.
+
+class RegistryDiff {
+  final List<PredicateDef> predOnlyThere;
+  final int predShared;
+  final List<(PredicateDef, PredicateDef)> predEquivalent; // (anexo, daqui)
+  final List<PropertyDef> propOnlyThere;
+  final int propShared;
+  final List<(PropertyDef, PropertyDef)> propEquivalent; // (anexo, daqui)
+  final List<Map<String, dynamic>> tagOnlyThere;
+  final int tagShared;
+  final Map<String, String> thereGroups; // id do grupo → nome, no anexo
+
+  const RegistryDiff({
+    required this.predOnlyThere,
+    required this.predShared,
+    required this.predEquivalent,
+    required this.propOnlyThere,
+    required this.propShared,
+    required this.propEquivalent,
+    required this.tagOnlyThere,
+    required this.tagShared,
+    required this.thereGroups,
+  });
+
+  bool get hasEquivalents => predEquivalent.isNotEmpty || propEquivalent.isNotEmpty;
+  bool get hasMissing =>
+      predOnlyThere.isNotEmpty || propOnlyThere.isNotEmpty || tagOnlyThere.isNotEmpty;
+  bool get identical => !hasEquivalents && !hasMissing;
+
+  static ({List<T> onlyThere, int shared, List<(T, T)> equiv}) _cmp<T>(
+    List<T> there,
+    List<T> here,
+    String Function(T) id,
+    String Function(T) label,
+  ) {
+    final hereIds = <String>{for (final h in here) id(h)};
+    final thereIds = <String>{for (final t in there) id(t)};
+    final byLabel = <String, List<T>>{};
+    for (final h in here) {
+      (byLabel[normTitle(label(h))] ??= <T>[]).add(h);
+    }
+    var shared = 0;
+    final only = <T>[];
+    final equiv = <(T, T)>[];
+    final claimed = <String>{};
+    for (final t in there) {
+      if (hereIds.contains(id(t))) {
+        shared++;
+        continue;
+      }
+      T? eq;
+      final cands = byLabel[normTitle(label(t))] ?? <T>[];
+      for (final h in cands) {
+        if (!thereIds.contains(id(h)) && !claimed.contains(id(h))) {
+          eq = h;
+          break;
+        }
+      }
+      if (eq != null) {
+        claimed.add(id(eq));
+        equiv.add((t, eq));
+      } else {
+        only.add(t);
+      }
+    }
+    return (onlyThere: only, shared: shared, equiv: equiv);
+  }
+
+  /// Compara os registros de [hereRoot] (aberto) com os de [thereRoot] (anexo).
+  /// Só lê. `null` se algum YAML não parseia.
+  static Future<RegistryDiff?> compute({
+    required String hereRoot,
+    required String thereRoot,
+  }) async {
+    // predicados
+    List<PredicateDef> therePreds;
+    final pf = File('$thereRoot/.cc/registry/predicates.yaml');
+    if (!await pf.exists()) {
+      therePreds = PredicateRegistry.defaults;
+    } else {
+      final m = await CcData.readYamlOrNull(pf);
+      if (m == null) return null;
+      final x = m['predicates'];
+      therePreds = <PredicateDef>[
+        if (x is Map)
+          for (final e in x.entries)
+            if (e.value is Map) PredicateDef.fromMap(e.key.toString(), e.value as Map),
+      ];
+    }
+    final preds = _cmp<PredicateDef>(
+      therePreds,
+      PredicateRegistry.instance.all,
+      (d) => d.id,
+      (d) => d.label,
+    );
+
+    // propriedades
+    var thereProps = <PropertyDef>[];
+    final rf = File('$thereRoot/.cc/registry/properties.yaml');
+    if (await rf.exists()) {
+      final m = await CcData.readYamlOrNull(rf);
+      if (m == null) return null;
+      final x = m['properties'];
+      thereProps = <PropertyDef>[
+        if (x is Map)
+          for (final e in x.entries)
+            if (e.value is Map) PropertyDef.fromMap(e.key.toString(), e.value as Map),
+      ];
+    }
+    final props = _cmp<PropertyDef>(
+      thereProps,
+      PropertyRegistry.instance.all,
+      (d) => d.id,
+      (d) => d.label,
+    );
+
+    // tags (por nome)
+    final thereLib = await WorkspaceMove._readTagLib(thereRoot);
+    final hereLib = await WorkspaceMove._readTagLib(hereRoot);
+    if (thereLib == null || hereLib == null) return null;
+    final hereNames = <String>{
+      for (final t in hereLib.tags) (t['name'] ?? '').toString().toLowerCase(),
+    };
+    var tagShared = 0;
+    final tagOnly = <Map<String, dynamic>>[];
+    for (final t in thereLib.tags) {
+      final n = (t['name'] ?? '').toString();
+      if (n.trim().isEmpty) continue;
+      if (hereNames.contains(n.toLowerCase())) {
+        tagShared++;
+      } else {
+        tagOnly.add(t);
+      }
+    }
+
+    return RegistryDiff(
+      predOnlyThere: preds.onlyThere,
+      predShared: preds.shared,
+      predEquivalent: preds.equiv,
+      propOnlyThere: props.onlyThere,
+      propShared: props.shared,
+      propEquivalent: props.equiv,
+      tagOnlyThere: tagOnly,
+      tagShared: tagShared,
+      thereGroups: thereLib.groups,
+    );
+  }
+}
+
+// ── Fase 6: mover entre workspaces ──────────────────────────────────────────
+//
+// Mover um item (entidade ou arquivo/pasta do Vault) do workspace aberto para
+// um workspace anexado, online e de escrita. Transacional:
+//
+//   1. copiar   → para uma pasta temporária oculta DENTRO do destino
+//                 (`.cc-move-…`, mesmo disco: o último passo é um rename);
+//   2. verificar→ cada arquivo copiado confere com a origem (tamanho + bytes);
+//   3. ajustar  → só na cópia: referências `{id, ws}` entre os itens movidos
+//                 passam a apontar para o workspace de destino; ids novos se
+//                 houver colisão; título/âncora se for renomeado;
+//   4. gravar   → importa as definições de predicado e de tag que faltam no
+//                 destino e põe a cópia no lugar (rename);
+//   5. só então apaga a origem.
+//
+// Qualquer falha antes do passo 5 apaga a cópia temporária e deixa a origem
+// intacta. Se só a exclusão da origem falhar, a cópia fica (nada se perde) e o
+// aviso de ids duplicados cobre a sobra.
+//
+// Não faz: reescrever relações de ENTRADA (de outros itens da origem para o
+// item movido): o diálogo as lista antes, como na exclusão.
+
+class MoveIdClash {
+  final String id;
+  final String destPath; // '' = só no cache do índice
+  final String destTitle;
+  const MoveIdClash(this.id, this.destPath, this.destTitle);
+}
+
+class MovePlan {
+  final String srcPath, srcFilesDir, srcWsId;
+  final String destWsId, destWsLabel, destRoot, destFilesDir;
+  final String relPath, parentRel, name;
+  final bool isDir;
+
+  MovePlan({
+    required this.srcPath,
+    required this.srcFilesDir,
+    required this.srcWsId,
+    required this.destWsId,
+    required this.destWsLabel,
+    required this.destRoot,
+    required this.relPath,
+    required this.parentRel,
+    required this.name,
+    required this.isDir,
+  }) : destFilesDir = '$destRoot/files';
+
+  bool get isEntity => relPath.startsWith('generalized/');
+  String get destParentAbs =>
+      parentRel.isEmpty ? destFilesDir : '$destFilesDir/$parentRel';
+
+  /// Impede a operação (mensagem para o usuário).
+  String? blocker;
+
+  /// Já existe um item com esse nome no destino: o usuário precisa renomear.
+  bool collision = false;
+  String suggestedName = '';
+
+  List<String> missingPredicates = <String>[];
+  List<String> missingTags = <String>[];
+  Map<String, ({String color, String groupId, String groupName})> tagImports =
+      <String, ({String color, String groupId, String groupName})>{};
+  Map<String, String> idsMoving = <String, String>{};
+  List<MoveIdClash> idClashes = <MoveIdClash>[];
+  List<File> extraSidecars = <File>[]; // item-arquivo: sidecars fora do item
+
+  /// Equivalentes escolhidos na anexação (daqui → do destino).
+  Map<String, String> predRemap = <String, String>{};
+  Map<String, String> propRemap = <String, String>{};
+  int files = 0;
+  int bytes = 0;
+}
+
+class MoveResult {
+  final bool ok;
+  final bool sourceRemoved;
+  final String message;
+  final List<String> notes;
+  final String? destPath;
+  const MoveResult(
+    this.ok,
+    this.message, {
+    this.sourceRemoved = false,
+    this.notes = const <String>[],
+    this.destPath,
+  });
+}
+
+class _MoveAbort implements Exception {
+  final String message;
+  const _MoveAbort(this.message);
+  @override
+  String toString() => message;
+}
+
+class WorkspaceMove {
+  static const String _stagePrefix = '.cc-move-';
+
+  static String _norm(String p) => AttachedWorkspaces.normPath(p);
+
+  /// `Nome (2)`, `Nome (3)`… livre em [parentAbs] (a extensão fica no fim).
+  static String suggestName(String parentAbs, String name, bool isDir) {
+    var stem = name;
+    var ext = '';
+    if (!isDir) {
+      final i = name.lastIndexOf('.');
+      if (i > 0) {
+        stem = name.substring(0, i);
+        ext = name.substring(i);
+      }
+    }
+    for (var n = 2;; n++) {
+      final c = '$stem ($n)$ext';
+      if (FileSystemEntity.typeSync('$parentAbs/$c') ==
+          FileSystemEntityType.notFound) {
+        return c;
+      }
+    }
+  }
+
+  /// `null` se [name] serve como nome do item no destino.
+  static String? nameError(MovePlan p, String name) {
+    final n = name.trim();
+    if (n.isEmpty) return 'Informe um nome.';
+    if (n.contains('/') || n.contains('\\')) return 'O nome não pode ter barras.';
+    if (n.startsWith('.')) return 'O nome não pode começar com ponto.';
+    if (FileSystemEntity.typeSync('${p.destParentAbs}/$n') !=
+        FileSystemEntityType.notFound) {
+      return 'Já existe "$n" em ${p.destWsLabel}.';
+    }
+    return null;
+  }
+
+  static String _baseOf(String p) {
+    final s = _norm(p);
+    final i = s.lastIndexOf('/');
+    return i < 0 ? s : s.substring(i + 1);
+  }
+
+  static Future<({List<File> files, bool hasLink})> _walkFiles(String dir) async {
+    final files = <File>[];
+    var link = false;
+    await for (final e in Directory(dir).list(recursive: true, followLinks: false)) {
+      if (e is Link) {
+        link = true;
+      } else if (e is File) {
+        files.add(e);
+      }
+    }
+    return (files: files, hasLink: link);
+  }
+
+  /// Sidecars de um item-arquivo, que ficam fora dele (`.cc/` da pasta pai).
+  static Future<List<File>> _fileSidecars(String abs) async {
+    final dir = File(abs).parent.path;
+    final name = _baseOf(abs);
+    final out = <File>[];
+    final named = File('$dir/.cc/$name.yaml');
+    if (await named.exists()) out.add(named);
+    if (CcData.isMd(abs)) {
+      final id = await CcData.mdId(abs);
+      if (id != null) {
+        final f = CcData.idKeyedFile(dir, id);
+        if (await f.exists() && f.path != named.path) out.add(f);
+      }
+    }
+    return out;
+  }
+
+  static Future<Set<String>?> _destPredicateIds(String root) async {
+    final f = File('$root/.cc/registry/predicates.yaml');
+    if (!await f.exists()) {
+      return <String>{for (final d in PredicateRegistry.defaults) d.id};
+    }
+    final m = await CcData.readYamlOrNull(f);
+    if (m == null) return null;
+    final p = m['predicates'];
+    return p is Map ? <String>{for (final k in p.keys) k.toString()} : <String>{};
+  }
+
+  static Future<({Map<String, String> groups, List<Map<String, dynamic>> tags, Map<String, dynamic> extra})?>
+      _readTagLib(String root) async {
+    final f = File('$root/.cc/registry/tags.yaml');
+    if (!await f.exists()) {
+      return (
+        groups: <String, String>{},
+        tags: <Map<String, dynamic>>[],
+        extra: <String, dynamic>{},
+      );
+    }
+    final m = await CcData.readYamlOrNull(f);
+    if (m == null) return null;
+    final groups = <String, String>{};
+    final g = m['groups'];
+    if (g is Map) {
+      for (final e in g.entries) {
+        final v = e.value;
+        groups[e.key.toString()] = (v is Map ? v['name'] : v)?.toString() ?? e.key.toString();
+      }
+    }
+    final tags = <Map<String, dynamic>>[];
+    final t = m['tags'];
+    if (t is List) {
+      for (final x in t) {
+        if (x is Map) tags.add(Map<String, dynamic>.from(x));
+      }
+    }
+    return (
+      groups: groups,
+      tags: tags,
+      extra: <String, dynamic>{
+        for (final e in m.entries)
+          if (e.key != 'schema' && e.key != 'groups' && e.key != 'tags') e.key.toString(): e.value,
+      },
+    );
+  }
+
+  static Future<void> _writeTagLib(
+    String root,
+    Map<String, String> groups,
+    List<Map<String, dynamic>> tags,
+    Map<String, dynamic> extra,
+  ) async {
+    final b = StringBuffer()
+      ..writeln('# Biblioteca de tags do workspace (pode ser editada à mão).')
+      ..writeln('# Nos arquivos, as tags vão pelo título; aqui ficam cor e grupo.')
+      ..writeln('schema: 1');
+    extra.forEach((k, v) => b.writeln('${_ccKey(k)}: ${jsonEncode(v)}'));
+    if (groups.isEmpty) {
+      b.writeln('groups: {}');
+    } else {
+      b.writeln('groups:');
+      groups.forEach((id, name) {
+        b.writeln('  ${_ccKey(id)}:');
+        b.writeln('    name: ${jsonEncode(name)}');
+      });
+    }
+    if (tags.isEmpty) {
+      b.writeln('tags: []');
+    } else {
+      b.writeln('tags:');
+      for (final t in tags) {
+        b.writeln('  - ${jsonEncode(t)}');
+      }
+    }
+    final f = File('$root/.cc/registry/tags.yaml');
+    await CcLocks.run(f.path, () => _ccWriteText(f, b.toString()));
+  }
+
+  // ── Plano (só lê) ───────────────────────────────────────────────────────────
+
+  static Future<MovePlan> plan({
+    required String srcPath,
+    required String srcFilesDir,
+    required String srcWsId,
+    required AttachedWorkspace dest,
+    FilesMetaStore? srcStore,
+  }) async {
+    final att = AttachedWorkspaces.instance;
+    final destRoot = att.rootIfOnline(dest.workspaceId) ?? '';
+    final src = _norm(srcPath);
+    final sf = _norm(srcFilesDir);
+    final isDir = FileSystemEntity.typeSync(src) == FileSystemEntityType.directory;
+    final rel = src.startsWith('$sf/') ? src.substring(sf.length + 1) : '';
+    final i = rel.lastIndexOf('/');
+    final p = MovePlan(
+      srcPath: src,
+      srcFilesDir: sf,
+      srcWsId: srcWsId,
+      destWsId: dest.workspaceId,
+      destWsLabel: dest.label,
+      destRoot: destRoot,
+      relPath: rel,
+      parentRel: i < 0 ? '' : rel.substring(0, i),
+      name: i < 0 ? rel : rel.substring(i + 1),
+      isDir: isDir,
+    );
+
+    if (destRoot.isEmpty || !att.canWrite(dest.workspaceId)) {
+      p.blocker = 'O workspace "${dest.label}" não está online e de escrita.';
+      return p;
+    }
+    if (FileSystemEntity.typeSync(src) == FileSystemEntityType.notFound) {
+      p.blocker = 'O item de origem não existe mais.';
+      return p;
+    }
+    final segs = rel.split('/').where((x) => x.isNotEmpty).toList();
+    if (rel.isEmpty ||
+        segs.length < 3 ||
+        (segs[0] != 'generalized' && segs[0] != 'vault')) {
+      p.blocker = 'Só entidades e itens do Vault (works, personal_memory) podem ser movidos.';
+      return p;
+    }
+    if (!await Directory(p.destFilesDir).exists()) {
+      p.blocker = '"${dest.label}" não tem a pasta files/.';
+      return p;
+    }
+    if (segs[0] == 'generalized') {
+      final reg = await EntityTypeRegistry.load('${p.destFilesDir}/generalized/.types');
+      if (reg.rootByFolder(segs[1]) == null) {
+        p.blocker = 'O tipo de entidade "${segs[1]}" não existe em "${dest.label}". '
+            'Defina-o lá antes de mover.';
+        return p;
+      }
+    }
+    if (!await Directory(p.destParentAbs).exists() && segs.length != 3) {
+      p.blocker = 'A pasta de destino (${p.parentRel}) não existe em "${dest.label}": '
+          'mova primeiro o item que a contém.';
+      return p;
+    }
+
+    // Arquivos do item (e links simbólicos, que não são copiados).
+    final files = <File>[];
+    final sidecars = <File>[];
+    if (isDir) {
+      final w = await _walkFiles(src);
+      if (w.hasLink) {
+        p.blocker = 'O item contém links simbólicos, que não são movidos.';
+        return p;
+      }
+      files.addAll(w.files);
+      for (final f in w.files) {
+        if (f.path.endsWith('.yaml') && f.parent.path.endsWith('/.cc')) sidecars.add(f);
+      }
+    } else {
+      if (FileSystemEntity.isLinkSync(src)) {
+        p.blocker = 'O item é um link simbólico, que não é movido.';
+        return p;
+      }
+      files.add(File(src));
+      p.extraSidecars = await _fileSidecars(src);
+    }
+    p.files = files.length + p.extraSidecars.length;
+    for (final f in [...files, ...p.extraSidecars]) {
+      try {
+        p.bytes += await f.length();
+      } catch (_) {}
+    }
+
+    // Nome.
+    if (FileSystemEntity.typeSync('${p.destParentAbs}/${p.name}') !=
+        FileSystemEntityType.notFound) {
+      p.collision = true;
+      p.suggestedName = suggestName(p.destParentAbs, p.name, isDir);
+    }
+
+    // Definições usadas pelos sidecars do item.
+    final preds = <String>{};
+    final tagInfo = <String, ({String color, String groupId, String groupName})>{};
+    for (final f in [...sidecars, ...p.extraSidecars]) {
+      final m = await CcData.readYamlOrNull(f);
+      if (m == null) continue;
+      for (final x in _asList(m['relations'])) {
+        final r = CcRelation.parse(x);
+        if (r != null) preds.add(r.pred);
+      }
+      for (final t in _asList(m['tags'])) {
+        final title = (t is Map ? t['title'] : t)?.toString().trim() ?? '';
+        if (title.isEmpty) continue;
+        final def = srcStore?.tagByName(title);
+        final gid = def?.groupId ?? FilesMetaStore.defaultGroupId;
+        var gname = '';
+        for (final g in srcStore?.groups ?? const <FileTagGroup>[]) {
+          if (g.id == gid) gname = g.name;
+        }
+        var color = t is Map ? (t['color'] ?? '').toString() : '';
+        if (color.isEmpty) {
+          color = def != null ? FilesMetaStore._hex(def.color) : '#4FC3F7';
+        }
+        tagInfo.putIfAbsent(title, () => (color: color, groupId: gid, groupName: gname));
+      }
+    }
+    final destPreds = await _destPredicateIds(destRoot);
+    if (destPreds == null) {
+      p.blocker = 'O predicates.yaml de "${dest.label}" não é um YAML válido.';
+      return p;
+    }
+    // "Mapear equivalentes": o predicado/propriedade daqui vira o de lá, em
+    // vez de ser importado.
+    final att2 = AttachedWorkspaces.instance;
+    for (final e in att2.predicateMap(dest.workspaceId).entries) {
+      if (destPreds.contains(e.key)) p.predRemap[e.value] = e.key;
+    }
+    for (final e in att2.propertyMap(dest.workspaceId).entries) {
+      p.propRemap[e.value] = e.key;
+    }
+    p.missingPredicates = <String>[
+      for (final id in preds)
+        if (!destPreds.contains(id) &&
+            !p.predRemap.containsKey(id) &&
+            PredicateRegistry.instance.isDefined(id))
+          id,
+    ]..sort();
+    final lib = await _readTagLib(destRoot);
+    if (lib == null) {
+      p.blocker = 'O tags.yaml de "${dest.label}" não é um YAML válido.';
+      return p;
+    }
+    final have = <String>{
+      for (final t in lib.tags) (t['name'] ?? '').toString().toLowerCase(),
+    };
+    p.missingTags = <String>[
+      for (final t in tagInfo.keys)
+        if (!have.contains(t.toLowerCase())) t,
+    ]..sort();
+    p.tagImports = tagInfo;
+
+    // Ids do item que já existem no destino.
+    p.idsMoving = await CcData.idsUnder(src);
+    if (p.idsMoving.isNotEmpty) {
+      final destIds = await CcData.idsUnder(p.destFilesDir);
+      final snap = WorkspaceIndexCache.peek(dest.workspaceId);
+      for (final id in p.idsMoving.keys) {
+        final hit = destIds[id];
+        final cached = snap?.byId[id];
+        if (hit != null || cached != null) {
+          p.idClashes.add(MoveIdClash(id, hit ?? '', cached?.title ?? ''));
+        }
+      }
+    }
+    return p;
+  }
+
+  // ── Execução ────────────────────────────────────────────────────────────────
+
+  static Future<void> _copyFile(File a, File b) async {
+    await b.parent.create(recursive: true);
+    await a.copy(b.path);
+    try {
+      await b.setLastModified(await a.lastModified()); // sidecars guardam mtime
+    } catch (_) {}
+  }
+
+  static Future<void> _copyTree(
+    Directory a,
+    Directory b,
+    List<(File, File)> pairs,
+  ) async {
+    await b.create(recursive: true);
+    await for (final e in a.list(followLinks: false)) {
+      final n = _baseOf(e.path);
+      if (e is Link) throw _MoveAbort('Link simbólico encontrado: ${e.path}');
+      if (e is Directory) {
+        await _copyTree(e, Directory('${b.path}/$n'), pairs);
+      } else if (e is File) {
+        final dst = File('${b.path}/$n');
+        await _copyFile(e, dst);
+        pairs.add((e, dst));
+      }
+    }
+  }
+
+  static Future<bool> _sameBytes(File a, File b) async {
+    if (await a.length() != await b.length()) return false;
+    final fa = await a.open();
+    final fb = await b.open();
+    try {
+      while (true) {
+        final x = await fa.read(65536);
+        final y = await fb.read(65536);
+        if (x.length != y.length) return false;
+        if (x.isEmpty) return true;
+        for (var k = 0; k < x.length; k++) {
+          if (x[k] != y[k]) return false;
+        }
+      }
+    } finally {
+      await fa.close();
+      await fb.close();
+    }
+  }
+
+  static Future<String?> _verify(List<(File, File)> pairs, String? stagedDir) async {
+    for (final (a, b) in pairs) {
+      if (!await b.exists()) return 'Faltou na cópia: ${b.path}';
+      if (!await _sameBytes(a, b)) return 'A cópia difere da origem: ${_baseOf(a.path)}';
+    }
+    if (stagedDir != null) {
+      final w = await _walkFiles(stagedDir);
+      if (w.files.length != pairs.length) {
+        return 'A cópia tem ${w.files.length} arquivos; a origem tinha ${pairs.length}.';
+      }
+    }
+    return null;
+  }
+
+  /// Ajustes só na cópia. Devolve os sidecars de item-arquivo (podem ter sido
+  /// renomeados) e quantas relações apontam de volta para a origem.
+  static Future<({List<File> extras, int external})> _transform(
+    MovePlan p,
+    String stagedMain,
+    String name,
+    List<File> extraStaged,
+    Map<String, String> remap,
+  ) async {
+    final movedIds = p.idsMoving.keys.toSet();
+    final renamed = name != p.name;
+    var external = 0;
+    final toDo = <File>[];
+    if (p.isDir) {
+      final w = await _walkFiles(stagedMain);
+      for (final f in w.files) {
+        if (f.path.endsWith('.yaml') && f.parent.path.endsWith('/.cc')) toDo.add(f);
+      }
+    }
+    toDo.addAll(extraStaged);
+    final extrasOut = <File>[];
+    for (final f in toDo) {
+      final isExtra = extraStaged.contains(f);
+      var out = f;
+      final doc = await CcData.readYamlOrNull(f);
+      if (doc != null) {
+        var changed = false;
+        final rels = _asList(doc['relations']);
+        if (rels.isNotEmpty) {
+          final nl = <dynamic>[];
+          for (final x in rels) {
+            final r = CcRelation.parse(x);
+            if (r == null) {
+              nl.add(x);
+              continue;
+            }
+            final movesRef = r.ref.ws == p.srcWsId && movedIds.contains(r.ref.id);
+            final newPred = p.predRemap[r.pred] ?? r.pred;
+            if (!movesRef && r.ref.ws == p.srcWsId) external++;
+            if (movesRef || newPred != r.pred) {
+              nl.add(CcRelation(
+                pred: newPred,
+                predName: r.predName,
+                ref: movesRef
+                    ? CcRef(remap[r.ref.id] ?? r.ref.id, p.destWsId)
+                    : r.ref,
+                origem: r.origem,
+                status: r.status,
+                nota: r.nota,
+                trecho: r.trecho,
+                em: r.em,
+                extra: r.extra,
+              ).toJson());
+              changed = true;
+            } else {
+              nl.add(x);
+            }
+          }
+          if (changed) doc['relations'] = nl;
+        }
+        final props = doc['props'];
+        if (p.propRemap.isNotEmpty && props is Map) {
+          final pr = Map<String, dynamic>.from(props);
+          final np = <String, dynamic>{};
+          var pc = false;
+          pr.forEach((k, v) {
+            final nk = p.propRemap[k];
+            if (nk != null && !pr.containsKey(nk)) {
+              np[nk] = v;
+              pc = true;
+            } else {
+              np[k] = v;
+            }
+          });
+          if (pc) {
+            doc['props'] = np;
+            changed = true;
+          }
+        }
+        final did = doc['id']?.toString();
+        final newDid = did == null ? null : remap[did];
+        if (newDid != null) {
+          doc['id'] = newDid;
+          changed = true;
+        }
+        final isTop = isExtra || f.path == '$stagedMain/.cc/${CcData.folderFileName}';
+        if (renamed && isTop && doc.containsKey('title')) {
+          doc['title'] = name;
+          changed = true;
+        }
+        if (changed) {
+          await CcData.writeYaml(f, CcData._ordered(doc));
+          if (await CcData.readYamlOrNull(f) == null) {
+            throw _MoveAbort('Sidecar ajustado não parseia: ${f.path}');
+          }
+          if (newDid != null) {
+            final to = File('${f.parent.path}/${CcData.safeId(newDid)}.yaml');
+            await f.rename(to.path);
+            out = to;
+          }
+        }
+      }
+      if (isExtra) extrasOut.add(out);
+    }
+
+    // ids no frontmatter e links no texto das notas copiadas
+    if (remap.isNotEmpty) {
+      final mds = <File>[];
+      if (p.isDir) {
+        final w = await _walkFiles(stagedMain);
+        for (final f in w.files) {
+          final rel = f.path.substring(stagedMain.length + 1);
+          if (CcData.isMd(f.path) && !rel.split('/').any((x) => x.startsWith('.'))) mds.add(f);
+        }
+      } else if (CcData.isMd(stagedMain)) {
+        mds.add(File(stagedMain));
+      }
+      for (final f in mds) {
+        final id = await CcData.mdId(f.path);
+        if (id != null && remap.containsKey(id)) {
+          await updateFrontmatterKey(f.path, 'id', remap[id]);
+        }
+        var text = await f.readAsString();
+        var t2 = text;
+        remap.forEach((o, n) => t2 = t2.replaceAll('[[$o', '[[$n'));
+        if (t2 != text) await f.writeAsString(t2);
+      }
+    }
+
+    // entidade renomeada: a âncora leva o nome da pasta
+    if (renamed && p.isDir && p.isEntity) {
+      await for (final e in Directory(stagedMain).list(followLinks: false)) {
+        if (e is! File) continue;
+        final b = _baseOf(e.path);
+        final dot = b.lastIndexOf('.');
+        final stem = dot > 0 ? b.substring(0, dot) : b;
+        if (stem == p.name) {
+          await e.rename('$stagedMain/$name${dot > 0 ? b.substring(dot) : ''}');
+        }
+      }
+    }
+    return (extras: extrasOut, external: external);
+  }
+
+  static Future<void> _importDefinitions(MovePlan p, List<String> notes) async {
+    if (p.missingPredicates.isNotEmpty) {
+      final r = PredicateRegistry._();
+      await r.load(p.destRoot);
+      if (r.invalid) throw const _MoveAbort('O predicates.yaml do destino é inválido.');
+      final src = PredicateRegistry.instance;
+      var n = 0;
+      for (final id in p.missingPredicates) {
+        final d = src.defOf(id);
+        if (d == null) continue;
+        if (!r.isDefined(id)) {
+          await r.upsert(d);
+          n++;
+        }
+        final inv = d.inverse;
+        if (inv != null && !r.isDefined(inv)) {
+          final di = src.defOf(inv);
+          if (di != null) {
+            await r.upsert(di);
+            n++;
+          }
+        }
+      }
+      if (n > 0) notes.add('$n predicado(s) importado(s) para ${p.destWsLabel}.');
+    }
+    if (p.missingTags.isNotEmpty) {
+      final lib = await _readTagLib(p.destRoot);
+      if (lib == null) throw const _MoveAbort('O tags.yaml do destino é inválido.');
+      final groups = Map<String, String>.from(lib.groups);
+      final tags = List<Map<String, dynamic>>.of(lib.tags);
+      final have = <String>{
+        for (final t in tags) (t['name'] ?? '').toString().toLowerCase(),
+      };
+      var n = 0;
+      for (final title in p.missingTags) {
+        if (!have.add(title.toLowerCase())) continue;
+        final info = p.tagImports[title];
+        final gid = info?.groupId ?? FilesMetaStore.defaultGroupId;
+        if (!groups.containsKey(gid)) {
+          final gn = info?.groupName ?? '';
+          groups[gid] = gn.isNotEmpty ? gn : (gid == FilesMetaStore.defaultGroupId ? 'Tags' : gid);
+        }
+        tags.add(<String, dynamic>{
+          'id': CcData.newId('t'),
+          'name': title,
+          'color': info?.color ?? '#4FC3F7',
+          'group': gid,
+        });
+        n++;
+      }
+      if (n > 0) {
+        await _writeTagLib(p.destRoot, groups, tags, lib.extra);
+        notes.add('$n tag(s) importada(s) para ${p.destWsLabel}.');
+      }
+    }
+  }
+
+  static Future<MoveResult> execute(
+    MovePlan p, {
+    required String destName,
+    bool regenerateIds = false,
+    void Function(String step)? progress,
+  }) async {
+    if (p.blocker != null) return MoveResult(false, p.blocker!);
+    final name = destName.trim();
+    final nameErr = nameError(p, name);
+    if (nameErr != null) return MoveResult(false, nameErr);
+    if (p.idClashes.isNotEmpty && !regenerateIds) {
+      return const MoveResult(
+        false,
+        'Há ids que já existem no destino: escolha gerar ids novos.',
+      );
+    }
+    final att = AttachedWorkspaces.instance;
+    if (att.rootIfOnline(p.destWsId) == null || !att.canWrite(p.destWsId)) {
+      return MoveResult(false, '"${p.destWsLabel}" não está online e de escrita.');
+    }
+
+    final notes = <String>[];
+    final parent = Directory(p.destParentAbs);
+    final createdParent = !await parent.exists();
+    Directory? stage;
+    var definitionsImported = false;
+    try {
+      if (createdParent) await parent.create(recursive: true);
+      stage = Directory('${p.destParentAbs}/$_stagePrefix${DateTime.now().microsecondsSinceEpoch}');
+      await stage.create();
+      final stagedMain = '${stage.path}/$name';
+
+      // 1. copiar
+      progress?.call('Copiando…');
+      final pairs = <(File, File)>[];
+      var extraStaged = <File>[];
+      if (p.isDir) {
+        await _copyTree(Directory(p.srcPath), Directory(stagedMain), pairs);
+      } else {
+        final main = File(stagedMain);
+        await _copyFile(File(p.srcPath), main);
+        pairs.add((File(p.srcPath), main));
+        for (final sc in p.extraSidecars) {
+          final base = _baseOf(sc.path);
+          final out = base == '${p.name}.yaml' ? '$name.yaml' : base;
+          final dst = File('${stage.path}/.cc/$out');
+          await _copyFile(sc, dst);
+          pairs.add((sc, dst));
+          extraStaged.add(dst);
+        }
+      }
+
+      // 2. verificar
+      progress?.call('Verificando…');
+      final verr = await _verify(pairs, p.isDir ? stagedMain : null);
+      if (verr != null) throw _MoveAbort(verr);
+
+      // 3. ajustar (só a cópia)
+      progress?.call('Ajustando referências…');
+      final remap = <String, String>{
+        if (regenerateIds)
+          for (final c in p.idClashes) c.id: newEntityId(),
+      };
+      final tr = await _transform(p, stagedMain, name, extraStaged, remap);
+      extraStaged = tr.extras;
+      if (remap.isNotEmpty) notes.add('${remap.length} id(s) novo(s) gerado(s) por colisão no destino.');
+      if (tr.external > 0) {
+        notes.add('${tr.external} relação(ões) do item apontam para a origem '
+            '({id, ws} preservado; funcionam enquanto "${p.srcWsId}" estiver anexado lá).');
+      }
+
+      // 4. gravar: definições primeiro, depois a cópia no lugar
+      progress?.call('Importando definições…');
+      await _importDefinitions(p, notes);
+      definitionsImported = p.missingPredicates.isNotEmpty || p.missingTags.isNotEmpty;
+      progress?.call('Gravando…');
+      final finalAbs = '${p.destParentAbs}/$name';
+      if (FileSystemEntity.typeSync(finalAbs) != FileSystemEntityType.notFound) {
+        throw _MoveAbort('Já existe "$name" no destino.');
+      }
+      final placed = <File>[];
+      try {
+        if (p.isDir) {
+          await Directory(stagedMain).rename(finalAbs);
+        } else {
+          for (final sc in extraStaged) {
+            final t = File('${p.destParentAbs}/.cc/${_baseOf(sc.path)}');
+            if (await t.exists()) {
+              throw _MoveAbort('Já existe .cc/${_baseOf(sc.path)} no destino.');
+            }
+          }
+          await File(stagedMain).rename(finalAbs);
+          placed.add(File(finalAbs));
+          for (final sc in extraStaged) {
+            final t = File('${p.destParentAbs}/.cc/${_baseOf(sc.path)}');
+            await t.parent.create(recursive: true);
+            await sc.rename(t.path);
+            placed.add(t);
+          }
+        }
+      } catch (_) {
+        for (final f in placed) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+        rethrow;
+      }
+      // conferência final no destino
+      if (p.isDir) {
+        final w = await _walkFiles(finalAbs);
+        if (w.files.length != pairs.length) {
+          // já no lugar: desfaz para não deixar um item incompleto
+          try {
+            await Directory(finalAbs).delete(recursive: true);
+          } catch (_) {}
+          throw const _MoveAbort('Conferência final falhou: o destino não tem todos os arquivos.');
+        }
+      } else if (!await File(finalAbs).exists()) {
+        throw const _MoveAbort('Conferência final falhou: o arquivo não está no destino.');
+      }
+      try {
+        await stage.delete(recursive: true);
+      } catch (_) {}
+      stage = null;
+
+      // 5. só agora, apagar a origem
+      progress?.call('Removendo a origem…');
+      var removed = false;
+      try {
+        if (p.isDir) {
+          await Directory(p.srcPath).delete(recursive: true);
+        } else {
+          await CcData.removeItemSidecar(p.srcPath);
+          await File(p.srcPath).delete();
+        }
+        removed = true;
+      } catch (e) {
+        notes.add('A cópia foi gravada no destino, mas a origem não pôde ser apagada: $e');
+      }
+      RelationIndex.invalidate();
+      final a = att.byId(p.destWsId);
+      if (a != null) {
+        unawaited(WorkspaceIndexCache.refreshAttached(a).then((_) => RelationIndex.touch()));
+      }
+      return MoveResult(
+        true,
+        removed
+            ? 'Movido para "${p.destWsLabel}".'
+            : 'Copiado para "${p.destWsLabel}"; a origem continua aqui.',
+        sourceRemoved: removed,
+        notes: notes,
+        destPath: finalAbs,
+      );
+    } catch (e) {
+      try {
+        await stage?.delete(recursive: true);
+      } catch (_) {}
+      if (createdParent) {
+        try {
+          await parent.delete(); // só se estiver vazia
+        } catch (_) {}
+      }
+      return MoveResult(
+        false,
+        'Não foi movido: $e. A origem não foi alterada.',
+        notes: <String>[
+          if (definitionsImported)
+            'As definições de predicado/tag já importadas para o destino foram mantidas.',
+        ],
+      );
+    }
   }
 }
 
@@ -95282,6 +97597,90 @@ class AttachedWorkspaces {
         mode: mode == null ? null : (mode == 'ro' ? 'ro' : 'rw'),
       );
     });
+  }
+
+  // ── Registros por anexo (fase 6) ────────────────────────────────────────────
+  //
+  // Cada workspace tem os próprios registros (predicados, tags, propriedades):
+  // SEPARADOS POR PADRÃO. Na anexação o app compara e o usuário escolhe manter
+  // separado, mapear equivalentes ou importar. A escolha fica na entrada do
+  // anexo em `attached.yaml`:
+  //
+  //   registries: { mode: separate | mapped | imported,
+  //                 predicates: { <id no anexo>: <id aqui> },
+  //                 properties: { <chave no anexo>: <chave aqui> }, at: ... }
+
+  /// Escolha gravada, ou `null` se o usuário ainda não decidiu (= separado).
+  Map<String, dynamic>? registryChoice(String id) {
+    final r = byId(id)?.extra['registries'];
+    return r is Map ? Map<String, dynamic>.from(r) : null;
+  }
+
+  /// `separate` (padrão), `mapped` ou `imported`.
+  String registryMode(String id) =>
+      (registryChoice(id)?['mode'] ?? 'separate').toString();
+
+  Map<String, String> _regMap(String id, String key) {
+    final m = registryChoice(id)?[key];
+    return m is Map
+        ? <String, String>{
+            for (final e in m.entries) e.key.toString(): e.value.toString(),
+          }
+        : <String, String>{};
+  }
+
+  /// Predicado do anexo → predicado equivalente daqui.
+  Map<String, String> predicateMap(String id) => _regMap(id, 'predicates');
+
+  /// Chave de propriedade do anexo → chave equivalente daqui.
+  Map<String, String> propertyMap(String id) => _regMap(id, 'properties');
+
+  Future<void> setRegistryChoice(String id, Map<String, dynamic> choice) {
+    return _persist(() {
+      final i = _items.indexWhere((a) => a.workspaceId == id);
+      if (i < 0) return;
+      final a = _items[i];
+      _items[i] = AttachedWorkspace(
+        workspaceId: a.workspaceId,
+        name: a.name,
+        alias: a.alias,
+        path: a.path,
+        mode: a.mode,
+        extra: <String, dynamic>{...a.extra, 'registries': choice},
+      );
+    });
+  }
+
+  /// Os anexos DO workspace em [path] (só leitura). Anexos NÃO são
+  /// transitivos: o app nunca segue o `attached.yaml` de um anexo; isto só
+  /// informa. Ciclos (ele anexa este workspace) e repetições (ele anexa algo
+  /// que já está aqui) são deduplicados por `workspace_id`.
+  Future<({List<AttachedWorkspace> theirs, bool attachesUs, List<String> alsoOurs})>
+      inspect(String path) async {
+    final theirs = <AttachedWorkspace>[];
+    try {
+      final f = File('${normPath(path)}/.cc/attached.yaml');
+      if (await f.exists()) {
+        final r = await CcData.readYamlOrNull(f);
+        final l = r?['attached'];
+        if (l is List) {
+          final seen = <String>{};
+          for (final x in l) {
+            final a = AttachedWorkspace.fromMap(x);
+            if (a != null && seen.add(a.workspaceId)) theirs.add(a);
+          }
+        }
+      }
+    } catch (_) {}
+    final ours = <String>{for (final a in _items) a.workspaceId};
+    return (
+      theirs: theirs,
+      attachesUs: theirs.any((a) => a.workspaceId == _wsId),
+      alsoOurs: <String>[
+        for (final a in theirs)
+          if (ours.contains(a.workspaceId)) a.workspaceId,
+      ],
+    );
   }
 
   void _ensureWatching() {
